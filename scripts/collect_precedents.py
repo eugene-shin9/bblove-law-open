@@ -25,6 +25,11 @@ from bblove_law_all import Client, today  # noqa: E402
 from bblove_precedent_collect import collect  # noqa: E402
 
 MIN_SLICE = 120  # do not start a new Client with less than two minutes left
+# The live catalog can change while it is being paged (new decisions are listed first by default).
+# Before any detail of that target is fetched, restarting that one catalog is safe and loses nothing.
+RESETTABLE = {'CATALOG_COUNT_CHANGED', 'CATALOG_DUPLICATE_ID', 'CATALOG_INCOMPLETE'}
+TARGET_ORDER = ('prec', 'ntsCgmExpc', 'ttSpecialDecc')
+MAX_RESETS = 2
 
 
 def outcome(out):
@@ -41,12 +46,34 @@ def outcome(out):
     return 'PASS_DONE'
 
 
+def reset_catalog(out):
+    """Restart the first unfinished catalog if none of its details were fetched. Returns the target or None."""
+    out = Path(out)
+    path = out / 'manifest.json'
+    if not path.exists():
+        return None
+    m = json.loads(path.read_text(encoding='utf-8'))
+    catalogs = m.get('catalogs', {})
+    target = next((t for t in TARGET_ORDER if t in catalogs and not catalogs[t].get('complete')), None)
+    if target is None or any(d.get('target') == target and 'sha256' in d for d in m.get('documents', [])):
+        return None
+    for page in [p for p in m.get('pages', []) if p.get('target') == target]:
+        (out / page['path']).unlink(missing_ok=True)
+    m['pages'] = [p for p in m.get('pages', []) if p.get('target') != target]
+    m['documents'] = [d for d in m.get('documents', []) if d.get('target') != target]
+    catalogs[target] = {'next_page': 1, 'complete': False}
+    m.pop('stop_reason', None)
+    path.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding='utf-8')
+    return target
+
+
 def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect_fn=collect, date=None):
     out = Path(out)
     deadline = clock() + total_seconds
     stop = lambda: 'TIME_BUDGET' if clock() >= deadline else None  # noqa: E731
     date = date or today()
     attempt = out / 'attempt.json'
+    resets = 0
     while True:
         remaining = deadline - clock()
         if remaining < MIN_SLICE:
@@ -55,6 +82,11 @@ def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect
             attempt.unlink()  # only this invocation's failures count
         collect_fn(client_factory(remaining), out, date, scope, stop=stop)
         if attempt.exists():
+            reason = json.loads(attempt.read_text(encoding='utf-8')).get('reason')
+            if reason in RESETTABLE and resets < MAX_RESETS and reset_catalog(out):
+                resets += 1
+                print(f'CATALOG_RESET {reason} ({resets}/{MAX_RESETS})')
+                continue
             return 'FAILED'
         state = outcome(out)
         if state != 'PAUSED':

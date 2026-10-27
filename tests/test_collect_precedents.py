@@ -115,3 +115,47 @@ class LoopTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CatalogResetTests(unittest.TestCase):
+    def test_live_catalog_growth_restarts_that_catalog_once_and_completes(self):
+        class Growing(FakeClient):
+            def __init__(self):
+                super().__init__(count=150)
+                self.grew = False
+
+            def get(self, endpoint, params, **kw):
+                if endpoint == 'lawSearch.do' and params['target'] == 'prec' and params['page'] == 2 and not self.grew:
+                    self.grew = True  # a new decision is published while page 2 is requested
+                    self.rows.append({**self.rows[0], '판례일련번호': '151', '사건번호': '2099두151'})
+                return super().get(endpoint, params, **kw)
+
+        client = Growing()
+        with tempfile.TemporaryDirectory() as t:
+            state = cp.run(t, 'all', 18000, lambda r: client, date=DATE)
+            self.assertEqual(state, 'COMPLETE')
+            m = json.loads(Path(t, 'manifest.json').read_text())
+            self.assertEqual(m['catalogs']['prec']['total'], 151)
+            self.assertEqual(sum(d['target'] == 'prec' for d in m['documents']), 151)
+
+    def test_no_reset_after_details_were_fetched(self):
+        with tempfile.TemporaryDirectory() as t:
+            m = {'schema': 'precedent-summary-v1', 'date': DATE, 'pages': [],
+                 'catalogs': {'prec': {'next_page': 3, 'complete': False}},
+                 'documents': [{'target': 'prec', 'id': '1', 'sha256': 'x', 'path': 'summaries/prec/1.json'}]}
+            Path(t, 'manifest.json').write_text(json.dumps(m))
+            self.assertIsNone(cp.reset_catalog(t))
+
+    def test_persistent_catalog_failure_stops_after_two_resets(self):
+        calls = []
+
+        def failing(client, out, date, scope, stop=None):
+            calls.append(1)
+            Path(out, 'manifest.json').write_text(json.dumps({'schema': 'precedent-summary-v1', 'date': DATE, 'pages': [],
+                'catalogs': {'prec': {'next_page': 2, 'complete': False}}, 'documents': []}))
+            Path(out, 'attempt.json').write_text(json.dumps({'status': 'FAILED', 'reason': 'CATALOG_COUNT_CHANGED'}))
+            return False
+
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(cp.run(t, 'all', 18000, lambda r: object(), collect_fn=failing, date=DATE), 'FAILED')
+        self.assertEqual(len(calls), 3)
