@@ -28,6 +28,15 @@ jobs:
         run: |
           python -I -m unittest discover -s tests
           python -I scripts/repo_guard.py
+      - name: Check the credential is configured (value is never printed)
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: |
+          if [ -z "$LAW_OC" ]; then
+            echo "::error title=LAW_OC missing::Repository Actions secret LAW_OC is not available to this workflow"
+            exit 1
+          fi
+          echo "::notice title=LAW_OC::configured"
       - name: Restore resumable RAW checkpoint
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -119,6 +128,22 @@ jobs:
           r = pathlib.Path('official-assets-report.json')
           if r.exists():
               print('\n### build report\n```'); print(r.read_text()[:3000]); print('```')
+          PY
+          python3 - <<'PY'
+          # Same safe aggregates as annotations, readable through the check-run API.
+          import json, collections, pathlib
+          p = pathlib.Path('auto/official-all/manifest.json')
+          m = json.loads(p.read_text()) if p.exists() else {}
+          docs = m.get('documents', [])
+          st = dict(collections.Counter(d.get('status') for d in docs))
+          rs = collections.Counter(d.get('reason') for d in docs if d.get('status') == 'FAILED').most_common(3)
+          a = pathlib.Path('auto/official-all/attempt.json')
+          att = json.loads(a.read_text()) if a.exists() else {}
+          print(f"::notice title=collection::date={m.get('date')} status={m.get('status')} list={m.get('list_count')} docs={len(docs)} counts={st} top_failed={rs} attempt={att.get('status')}/{att.get('reason')}")
+          r = pathlib.Path('official-assets-report.json')
+          if r.exists():
+              j = json.loads(r.read_text())
+              print(f"::notice title=build::status={j.get('deterministic_status')} reason={j.get('reason')} n_docs={j.get('n_docs')} n_articles={j.get('n_articles')}")
           PY
       - name: Credential scan of diagnostics before artifact upload
         id: scan_artifact
