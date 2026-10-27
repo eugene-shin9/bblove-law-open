@@ -51,13 +51,14 @@ def scan(paths, secret):
 def main(argv):
     secret = os.environ.get('LAW_OC', '')
     if not secret:
-        print('SECRET_SCAN_NO_CREDENTIAL')
+        print(('::error title=secret scan::' if os.environ.get('GITHUB_ACTIONS') == 'true' else '') + 'SECRET_SCAN_NO_CREDENTIAL')
         return 1
     if not argv:
         print('SECRET_SCAN_NO_PATHS')
         return 1
     hits = scan(argv, secret)
-    print(f'SECRET_SCAN files_with_credential={hits}')
+    prefix = ('::error title=secret scan::' if hits else '::notice title=secret scan::') if os.environ.get('GITHUB_ACTIONS') == 'true' else ''
+    print(f'{prefix}SECRET_SCAN files_with_credential={hits}')
     return 1 if hits else 0
 
 
