@@ -119,13 +119,16 @@ def main():
     ap.add_argument('--out', type=Path, default=Path('auto/precedent-collection'))
     ap.add_argument('--scope', choices=('tax', 'all'), default='all')
     ap.add_argument('--seconds', type=float, default=18000)
+    ap.add_argument('--interval', type=float, default=1.0,
+                    help='seconds between requests (sequential collector; >= 0.3)')
     args = ap.parse_args()
     credential = os.environ.get('LAW_OC', '')
     if not credential:
         print('LAW_OC_NOT_AVAILABLE')
         write_outputs('FAILED')
         return 1
-    state = run(args.out, args.scope, args.seconds, lambda remaining: Client(credential, seconds=remaining))
+    state = run(args.out, args.scope, args.seconds,
+                lambda remaining: Client(credential, seconds=remaining, interval=args.interval))
     write_outputs(state)
     print(json.dumps({'outcome': state, **summary(args.out)}, ensure_ascii=False))
     return 1 if state == 'FAILED' else 0

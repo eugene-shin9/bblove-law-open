@@ -159,3 +159,11 @@ class CatalogResetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             self.assertEqual(cp.run(t, 'all', 18000, lambda r: object(), collect_fn=failing, date=DATE), 'FAILED')
         self.assertEqual(len(calls), 3)
+
+
+class PacingTests(unittest.TestCase):
+    def test_client_interval_is_configurable_with_floor(self):
+        from bblove_law_all import Client
+        self.assertEqual(Client('x').interval, .3)
+        self.assertEqual(Client('x', interval=1.0).interval, 1.0)
+        self.assertEqual(Client('x', interval=.01).interval, .3)

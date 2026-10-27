@@ -51,8 +51,10 @@ def collection_category(row):
 
 class Client:
     """Three bounded in-flight requests, per-thread spacing and shared cooldown."""
-    def __init__(self, credential, seconds=3500, transport=None):
+    def __init__(self, credential, seconds=3500, transport=None, interval=.3):
         self.credential = credential
+        # Minimum spacing between request starts per thread (law.go.kr may stop answering heavy callers).
+        self.interval = max(.3, float(interval))
         self.deadline = time.monotonic() + min(seconds, 3500)
         self.transport = transport or measured_transport
         self.calls = 0
@@ -96,7 +98,7 @@ class Client:
             with self.lock:
                 now = time.monotonic()
                 delay = max(0, self.cooldown_until - now,
-                            getattr(self.local, 'last', 0) + .3 - now)
+                            getattr(self.local, 'last', 0) + self.interval - now)
                 if now + delay + 32 >= self.deadline or self.calls >= 30000:
                     raise PilotBlocked('COLLECTION_BUDGET_EXHAUSTED')
                 if delay <= 0:
