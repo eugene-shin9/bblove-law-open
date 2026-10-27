@@ -420,7 +420,8 @@ def main():
     try:
         if args.command == 'collect':
             write_step_output(False)
-            if not 60 <= args.seconds <= 720:
+            # 공개 저장소: Actions 분 제한이 없어 Client 상한(약 58분) 안에서 길게 돈다.
+            if not 60 <= args.seconds <= 3400:
                 raise ValueError('ADMRUL_BUDGET_INVALID')
             credential = os.environ.get('LAW_OC', '')
             if not credential:

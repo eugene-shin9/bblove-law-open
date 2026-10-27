@@ -1,0 +1,119 @@
+name: Collect administrative rules (law.go.kr DRF)
+on:
+  workflow_dispatch:
+  schedule:
+    # 매주 화요일 02:40 KST (월요일 17:40 UTC)
+    - cron: '40 17 * * 1'
+permissions: {}
+concurrency:
+  group: law-go-kr-drf
+  cancel-in-progress: false
+jobs:
+  collect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Offline tests and public-content guard before using credentials
+        run: |
+          python -I -m unittest discover -s tests
+          python -I scripts/repo_guard.py
+      - name: Check the credential is configured (value is never printed)
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: |
+          if [ -z "$LAW_OC" ]; then
+            echo "::error title=LAW_OC missing::Repository Actions secret LAW_OC is not available to this workflow"
+            exit 1
+          fi
+          echo "::notice title=LAW_OC::configured"
+      - name: Restore resumable checkpoint
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: auto/admrul
+          key: admrul-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            admrul-v1-
+      - name: Collect administrative rules (bounded; partial resumes next run)
+        id: collect
+        timeout-minutes: 60
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python src/bblove_admrul.py collect --out auto/admrul --seconds 3300 --partial-ok
+      - name: Credential scan before caching or uploading anything
+        id: scan_raw
+        if: always()
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python -I scripts/secret_scan.py auto/admrul
+      - name: Save checkpoint (only after a clean scan)
+        if: always() && steps.scan_raw.outcome == 'success'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: auto/admrul
+          key: admrul-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Build and verify assets, package with release-info
+        if: steps.collect.outputs.complete == 'true'
+        run: |
+          python src/bblove_admrul.py build --out auto/admrul --dest admrul-assets
+          python src/bblove_admrul.py verify --dest admrul-assets
+          mkdir -p release
+          (cd admrul-assets && zip -q -r ../release/admrul_assets.zip admrul)
+          (cd auto && zip -q -r ../release/admrul-raw.zip admrul)
+          cp auto/admrul/manifest.json release/admrul-manifest.json
+          cp auto/admrul/collection-failures.json release/admrul-failures.json 2>/dev/null || echo '[]' > release/admrul-failures.json
+          python -I scripts/release_info.py --release release --manifest auto/admrul/manifest.json --kind admrul
+          (cd release && sha256sum -- * > SHA256SUMS)
+      - name: Credential scan of the release payload
+        if: steps.collect.outputs.complete == 'true'
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python -I scripts/secret_scan.py release admrul-assets auto/admrul
+      - name: Build provenance attestation
+        if: steps.collect.outputs.complete == 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: release/*
+      - name: Publish an immutable release (draft until every file is uploaded)
+        if: steps.collect.outputs.complete == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="admrul-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
+          gh release create "$tag" --draft --target "$GITHUB_SHA" --latest=false \
+            --title "행정규칙 수집본 $(date -u +%Y-%m-%d)" \
+            --notes "law.go.kr DRF 행정규칙 수집·검증본. release-info.json·SHA256SUMS·attestation으로 검증."
+          gh release upload "$tag" release/*
+          gh release edit "$tag" --draft=false --latest=false
+          echo "Published $tag" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the newest 6 admrul releases
+        if: steps.collect.outputs.complete == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,createdAt,isDraft \
+            --jq '[.[] | select(.tagName | startswith("admrul-")) | select(.isDraft | not)] | sort_by(.createdAt) | reverse | .[6:] | .[].tagName' |
+          while read -r old; do gh release delete "$old" --yes --cleanup-tag; done
+      - name: Progress (annotation; nothing is committed)
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, collections, pathlib
+          p = pathlib.Path('auto/admrul/manifest.json')
+          m = json.loads(p.read_text()) if p.exists() else {}
+          docs = m.get('documents', [])
+          st = dict(collections.Counter(d.get('status') for d in docs))
+          a = pathlib.Path('auto/admrul/attempt.json')
+          att = json.loads(a.read_text()) if a.exists() else {}
+          print(f"::notice title=admrul::date={m.get('date')} status={m.get('status')} docs={len(docs)} counts={st} attempt={att.get('status')}/{att.get('reason')}")
+          PY
