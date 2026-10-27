@@ -1,0 +1,144 @@
+name: Collect current laws (law.go.kr DRF)
+on:
+  workflow_dispatch:
+  schedule:
+    # 매주 월요일 01:20 KST (일요일 16:20 UTC)
+    - cron: '20 16 * * 0'
+permissions: {}
+concurrency:
+  group: collect-law-all
+  cancel-in-progress: false
+jobs:
+  collect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Offline tests and public-content guard before using credentials
+        run: |
+          python -I -m unittest discover -s tests
+          python -I scripts/repo_guard.py
+      - name: Restore resumable RAW checkpoint
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: auto/official-all
+          key: official-all-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            official-all-v1-
+      - name: Diagnose restored RAW without API requests
+        run: python scripts/diagnose_law_collection.py --report collection-diagnostics-before.json
+      - name: Collect current editions (bounded to less than 60 minutes; resumes next run)
+        id: collect
+        timeout-minutes: 60
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python src/bblove_law_all.py --partial-ok
+      - name: Diagnose RAW after collection
+        if: always()
+        run: python scripts/diagnose_law_collection.py --report collection-diagnostics-after.json
+      - name: Credential scan before caching or uploading anything
+        id: scan_raw
+        if: always()
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python -I scripts/secret_scan.py auto/official-all collection-diagnostics-before.json collection-diagnostics-after.json
+      - name: Save checkpoint (only after a clean scan)
+        if: always() && steps.scan_raw.outcome == 'success'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: auto/official-all
+          key: official-all-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Build gate (assets are built only to validate the corpus; not published)
+        if: steps.collect.outputs.complete == 'true'
+        run: python scripts/build_mcp_assets_official.py --out build/assets --report official-assets-report.json
+      - name: Package RAW collection, reports and release-info
+        if: steps.collect.outputs.complete == 'true'
+        run: |
+          mkdir -p release
+          (cd auto && zip -q -r ../release/official-all.zip official-all)
+          cp official-assets-report.json release/
+          cp auto/official-all/manifest.json release/collection-manifest.json
+          cp auto/official-all/collection-failures.json release/collection-failures.json
+          cp collection-diagnostics-before.json collection-diagnostics-after.json release/
+          python -I scripts/release_info.py --release release --manifest auto/official-all/manifest.json --kind official-law-raw
+          (cd release && sha256sum -- * > SHA256SUMS)
+      - name: Credential scan of the release payload
+        if: steps.collect.outputs.complete == 'true'
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python -I scripts/secret_scan.py release auto/official-all
+      - name: Build provenance attestation
+        if: steps.collect.outputs.complete == 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: release/*
+      - name: Publish an immutable release (draft until every file is uploaded)
+        if: steps.collect.outputs.complete == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="law-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
+          gh release create "$tag" --draft --target "$GITHUB_SHA" \
+            --title "현행 법령 수집본 $(date -u +%Y-%m-%d)" \
+            --notes "law.go.kr DRF 수집·검증본. release-info.json·SHA256SUMS·attestation으로 검증. 공식 원문은 국가법령정보센터에서 확인."
+          gh release upload "$tag" release/*
+          gh release edit "$tag" --draft=false --latest
+          echo "Published $tag" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the newest 8 law releases
+        if: steps.collect.outputs.complete == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,createdAt,isDraft \
+            --jq '[.[] | select(.tagName | startswith("law-")) | select(.isDraft | not)] | sort_by(.createdAt) | reverse | .[8:] | .[].tagName' |
+          while read -r old; do gh release delete "$old" --yes --cleanup-tag; done
+      - name: Progress summary (Job Summary only; nothing is committed)
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, collections, pathlib
+          p = pathlib.Path('auto/official-all/manifest.json')
+          m = json.loads(p.read_text()) if p.exists() else {}
+          docs = m.get('documents', [])
+          st = collections.Counter(d.get('status') for d in docs)
+          rs = collections.Counter(d.get('detail', d.get('reason')) for d in docs if d.get('status') == 'FAILED')
+          print(f"## 수집 진행 ({m.get('date')}) status={m.get('status')} list={m.get('list_count')} api_calls={m.get('api_calls')} elapsed={m.get('elapsed_seconds')}s")
+          print(f"- documents: {len(docs)} / SUCCESS {st.get('SUCCESS', 0)} / FAILED {st.get('FAILED', 0)} / PENDING {st.get('PENDING', 0)}")
+          for k, v in rs.most_common(10): print(f"- FAILED[{k}]: {v}")
+          print(f"- reused: {m.get('reused_documents')} / fetched: {m.get('fetched_documents')}")
+          r = pathlib.Path('official-assets-report.json')
+          if r.exists():
+              print('\n### build report\n```'); print(r.read_text()[:3000]); print('```')
+          PY
+      - name: Credential scan of diagnostics before artifact upload
+        id: scan_artifact
+        if: failure()
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: |
+          touch official-assets-report.json
+          python -I scripts/secret_scan.py auto/official-all collection-diagnostics-before.json collection-diagnostics-after.json official-assets-report.json
+      - name: Preserve diagnostics on failure (only after a clean scan)
+        if: failure() && steps.scan_artifact.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: law-diagnostics-${{ github.run_id }}
+          path: |
+            auto/official-all/manifest.json
+            auto/official-all/attempt.json
+            auto/official-all/collection-failures.json
+            collection-diagnostics-before.json
+            collection-diagnostics-after.json
+            official-assets-report.json
+          if-no-files-found: warn
+          retention-days: 14
