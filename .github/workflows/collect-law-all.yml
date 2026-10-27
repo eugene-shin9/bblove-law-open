@@ -6,7 +6,8 @@ on:
     - cron: '20 16 * * 0'
 permissions: {}
 concurrency:
-  group: collect-law-all
+  # 법제처 호출이 겹치지 않도록 모든 수집 워크플로가 같은 그룹을 쓴다.
+  group: law-go-kr-drf
   cancel-in-progress: false
 jobs:
   collect:

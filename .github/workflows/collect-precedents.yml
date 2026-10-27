@@ -1,0 +1,124 @@
+name: Collect precedent, NTS interpretation and tax-tribunal summaries (law.go.kr DRF)
+on:
+  workflow_dispatch:
+  schedule:
+    # 매일 04:10 KST (19:10 UTC). 끝까지 받을 때까지 이어서 수집, 끝나면 게시 1회.
+    - cron: '10 19 * * *'
+permissions: {}
+concurrency:
+  # 법제처 호출이 겹치지 않도록 현행 법령 수집과 같은 그룹을 쓴다.
+  group: law-go-kr-drf
+  cancel-in-progress: false
+jobs:
+  collect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Offline tests and public-content guard before using credentials
+        run: |
+          python -I -m unittest discover -s tests
+          python -I scripts/repo_guard.py
+      - name: Check the credential is configured (value is never printed)
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: |
+          if [ -z "$LAW_OC" ]; then
+            echo "::error title=LAW_OC missing::Repository Actions secret LAW_OC is not available to this workflow"
+            exit 1
+          fi
+          echo "::notice title=LAW_OC::configured"
+      - name: Restore resumable collection
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: auto/precedent-collection
+          key: precedent-summary-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            precedent-summary-v1-
+      - name: Collect (up to 5 hours; resumes next run)
+        id: collect
+        timeout-minutes: 320
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python scripts/collect_precedents.py --out auto/precedent-collection --scope all --seconds 18000
+      - name: Credential scan before caching or uploading anything
+        id: scan_raw
+        if: always()
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python -I scripts/secret_scan.py auto/precedent-collection
+      - name: Save checkpoint (only after a clean scan)
+        if: always() && steps.scan_raw.outcome == 'success'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: auto/precedent-collection
+          key: precedent-summary-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Decide whether this collection is already published
+        id: tag
+        if: steps.collect.outputs.complete == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          date=$(python3 -c "import json;print(json.load(open('auto/precedent-collection/manifest.json'))['date'])")
+          tag="prec-${date}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Package collection in parts under 2 GiB, with release-info
+        if: steps.collect.outputs.complete == 'true' && steps.tag.outputs.exists == 'false'
+        run: |
+          mkdir -p release
+          tar -C auto -czf - precedent-collection | split -b 1900m -d -a 2 - release/precedent-collection.tar.gz.part-
+          cp auto/precedent-collection/manifest.json release/precedent-manifest.json
+          python3 - <<'PY'
+          import json, sys
+          sys.path.insert(0, 'scripts')
+          from collect_precedents import summary
+          json.dump({'outcome': '${{ steps.collect.outputs.outcome }}', **summary('auto/precedent-collection')},
+                    open('release/precedent-summary.json', 'w'), ensure_ascii=False, indent=2)
+          PY
+          python -I scripts/release_info.py --release release --manifest auto/precedent-collection/manifest.json --kind precedent-summary-raw
+          (cd release && sha256sum -- * > SHA256SUMS)
+      - name: Credential scan of the release payload
+        if: steps.collect.outputs.complete == 'true' && steps.tag.outputs.exists == 'false'
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python -I scripts/secret_scan.py release/precedent-manifest.json release/precedent-summary.json release/release-info.json auto/precedent-collection
+      - name: Build provenance attestation
+        if: steps.collect.outputs.complete == 'true' && steps.tag.outputs.exists == 'false'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: release/*
+      - name: Publish an immutable release (draft until every file is uploaded)
+        if: steps.collect.outputs.complete == 'true' && steps.tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          gh release create "$TAG" --draft --target "$GITHUB_SHA" --latest=false \
+            --title "판례·국세청 해석·조세심판원 요지 수집본 ($TAG)" \
+            --notes "law.go.kr DRF 요지 수집본(전문 미포함). 조각 파일을 이어 붙여 풀고(cat part-* | tar -xz), release-info.json·SHA256SUMS·attestation으로 검증."
+          gh release upload "$TAG" release/*
+          gh release edit "$TAG" --draft=false --latest=false
+          echo "Published $TAG" >> "$GITHUB_STEP_SUMMARY"
+      - name: Progress (annotation and Job Summary; nothing is committed)
+        if: always()
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys, pathlib
+          sys.path.insert(0, 'scripts')
+          from collect_precedents import summary
+          s = summary('auto/precedent-collection')
+          a = pathlib.Path('auto/precedent-collection/attempt.json')
+          att = json.loads(a.read_text()) if a.exists() else {}
+          print(f"::notice title=precedents::outcome=${{ steps.collect.outputs.outcome }} {json.dumps(s, ensure_ascii=False)} attempt={att.get('status')}/{att.get('reason')}")
+          PY
