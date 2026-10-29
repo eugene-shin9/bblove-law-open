@@ -22,6 +22,9 @@ def tax_reasons(row, metadata=None):
     title = page_text((row.get('title') or text(metadata, '사건명')).encode('utf-8'))
     refs = page_text((row.get('refs') or text(metadata, '참조조문')).encode('utf-8'))
     reasons = []
+    # 국세법령정보시스템 lists only tax cases; its rows carry no 참조조문 to match on.
+    if text(metadata, '데이터출처명') == '국세법령정보시스템':
+        reasons.append('source')
     if '조세' in kind or '세무' in kind:
         reasons.append('case_kind')
     if TAX_TITLE.search(title):
