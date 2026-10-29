@@ -49,46 +49,56 @@ jobs:
               main()
           PY
           python3 "$RUNNER_TEMP/probe.py"
-      - name: Failure samples (public data)
+      - name: New collector entry pipeline on live samples (codes and counts only)
         env:
           LAW_OC: ${{ secrets.LAW_OC }}
         run: |
-          cat > "$RUNNER_TEMP/fail.py" <<'PY'
-          import json, os, sys, tempfile
+          cat > "$RUNNER_TEMP/live.py" <<'PY'
+          import json, os, sys, tempfile, traceback
+          from collections import Counter
           from pathlib import Path
           sys.path[:0] = [os.path.join(os.environ['GITHUB_WORKSPACE'], 'src')]
           import bblove_precedent_collect as m
           from bblove_law_all import Client, today
-          from bblove_v107_pilot import records, text
-          def short(v):
-              return str(v).replace('\n', ' ')[:60]
+          from bblove_v107_pilot import records, sanitized, text
+          from bblove_storage import strict_json
           def main():
               oc = os.environ['LAW_OC']; d = today()
-              c = Client(oc, seconds=900, interval=1.0)
-              bad = []
-              for extra, page in (({}, 1), ({'datSrcNm': '국세법령정보시스템'}, 250)):
-                  doc, _ = c.get('lawSearch.do', dict(target='prec', display=100, page=page, **extra))
-                  root = [v for v in doc.values() if isinstance(v, dict) and 'totalCnt' in v][0]
-                  for r in records(m.catalog_rows(root, 'prec')):
-                      try:
-                          m.listed({k: r[k] for k in m.FIELDS['prec'] if k in r}, 'prec')
-                      except ValueError as e:
-                          if str(e) == 'CASE_OR_COURT_INVALID':
-                              bad.append({k: short(r.get(k)) for k in ('사건번호', '법원명', '데이터출처명', '사건명')})
-              print('::notice title=fail prec::' + json.dumps(bad[:8], ensure_ascii=False))
-              doc, _ = c.get('lawSearch.do', dict(target='ttSpecialDecc', display=100, page=1))
-              root = [v for v in doc.values() if isinstance(v, dict) and 'totalCnt' in v][0]
-              rows = records(m.catalog_rows(root, 'ttSpecialDecc'))[:12]
-              out = []
-              for r in rows:
-                  sid = text(r, '특별행정심판재결례일련번호')
-                  ddoc, _ = c.get('lawService.do', dict(target='ttSpecialDecc', ID=sid))
-                  svc = next((v for v in ddoc.values() if isinstance(v, dict)), ddoc)
-                  out.append({'id': sid, 'list_date': text(r, '의결일자'), 'list_title': short(r.get('사건명')),
-                              'detail': {k: short(svc.get(k)) for k in ('Law', '사건명', '의결일자', '특별행정심판재결례일련번호', '청구번호', '재결요지', '주문') if k in svc}})
-              for i in range(0, len(out), 4):
-                  print('::notice title=fail tt ' + str(i) + '::' + json.dumps(out[i:i+4], ensure_ascii=False).replace(oc, '***'))
+              c = Client(oc, seconds=1500, interval=1.0)
+              out = Path(tempfile.mkdtemp())
+              sets = [('prec', {}, 1), ('prec', {'datSrcNm': '대법원'}, 1), ('prec', {'datSrcNm': '대법원'}, 400),
+                      ('prec', {'datSrcNm': '국세법령정보시스템'}, 250), ('ntsCgmExpc', {}, 1),
+                      ('ttSpecialDecc', {}, 1), ('ttSpecialDecc', {}, 1400)]
+              for target, extra, page in sets:
+                  res = {'set': f'{target} {extra} p{page}'}
+                  try:
+                      doc, _ = c.get('lawSearch.do', dict(target=target, display=100, page=page, **extra))
+                      root = [v for v in doc.values() if isinstance(v, dict) and 'totalCnt' in v][0]
+                      rows = [{k: r[k] for k in m.FIELDS[target] if k in r} for r in records(m.catalog_rows(root, target))]
+                      _, raw = sanitized({'rows': rows, 'totalCnt': 0}, oc)
+                      rows = strict_json(raw)['rows']
+                      kinds, codes, details = Counter(), Counter(), 0
+                      for r in rows:
+                          e = dict(target=target, id=m.identifier(r, target), row=r, kind=m.default_kind(r, target))
+                          kinds[e['kind']] += 1
+                          if e['kind'] == 'skipped':
+                              continue
+                          if e['kind'] == 'detail':
+                              if details >= 12:
+                                  continue
+                              details += 1
+                          try:
+                              raw = m.store_entry(c, out, e, d)
+                              m.validated(e['row'], strict_json(raw), target, e['kind'])
+                              codes['OK_' + e['kind']] += 1
+                          except Exception as exc:
+                              fr = [f'{os.path.basename(f.filename)}:{f.lineno}' for f in traceback.extract_tb(exc.__traceback__)][-1:]
+                              codes[(str(exc) if str(exc) in m.ERROR_CODES else type(exc).__name__ + '@' + ','.join(fr))] += 1
+                      res.update(rows=len(rows), kinds=dict(kinds), results=dict(codes))
+                  except Exception as exc:
+                      res['error'] = type(exc).__name__ + ':' + (str(exc) if str(exc) in m.ERROR_CODES else '')
+                  print('::notice title=live ' + res['set'] + '::' + json.dumps(res, ensure_ascii=False).replace(oc, '***'))
           if __name__ == '__main__':
               main()
           PY
-          python3 "$RUNNER_TEMP/fail.py"
+          python3 "$RUNNER_TEMP/live.py"
