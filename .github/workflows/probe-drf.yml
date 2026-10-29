@@ -59,11 +59,12 @@ jobs:
           from bblove_law_all import Client, today
           from bblove_v107_pilot import records, text
           oc = os.environ['LAW_OC']; t = today()
-          c = Client(oc, seconds=600, interval=1.0)
           keys = {'prec': ('선고일자', '사건번호', '법원명', '판례일련번호'), 'ntsCgmExpc': ('회신일자', '해석일자', '생산일자', '안건번호', '법령해석례일련번호'),
                   'ttSpecialDecc': ('의결일자', '청구번호', '특별행정심판재결례일련번호')}
           import traceback
-          for target, ks in keys.items():
+          def main():
+           c = Client(oc, seconds=600, interval=1.0)
+           for target, ks in keys.items():
             try:
               hits, n = [], 0
               for page in (1, 2, 3):
@@ -76,10 +77,12 @@ jobs:
                       day = re.sub(r'\D', '', text(r, *ks[:1]) if target != 'ntsCgmExpc' else text(r, '회신일자', '해석일자', '생산일자'))
                       if len(day) == 8 and day > t:
                           hits.append({k: text(r, k) for k in ks if text(r, k)})
-              out = json.dumps({'target': target, 'today': t, 'rows': n, 'future': hits[:10], 'future_count': len(hits)}, ensure_ascii=False)
+              out = json.dumps({'target': target, 'rowkey': lk, 'today': t, 'rows': n, 'future': hits[:10], 'future_count': len(hits)}, ensure_ascii=False)
               print(f'::notice title=future {target}::' + ('REDACTED' if oc in out else out))
             except Exception as e:
               fr = [f'{os.path.basename(f.filename)}:{f.lineno}' for f in traceback.extract_tb(e.__traceback__)]
               print(f'::notice title=future {target} error::' + json.dumps({'exc': type(e).__name__, 'frames': fr[-4:]}))
+          if __name__ == '__main__':
+              main()
           PY
           python3 "$RUNNER_TEMP/future.py"
