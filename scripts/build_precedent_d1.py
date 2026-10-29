@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from bblove_law_all import save
-from bblove_precedent_collect import TARGETS, validated, verify_cache
+from bblove_precedent_collect import SCHEMA, TARGETS, validated, verify_cache
 from bblove_precedent_scope import tax_reasons
 from bblove_storage import digest, strict_json
 
@@ -116,22 +116,25 @@ def load_rows(source, scope='all'):
     if scope not in ('tax', 'all'):
         raise ValueError('SCOPE_INVALID')
     manifest = strict_json((source / 'manifest.json').read_bytes())
-    if manifest.get('schema') != 'precedent-summary-v1':
+    if manifest.get('schema') != SCHEMA:
         raise ValueError('MANIFEST_SCHEMA_INVALID')
     verify_cache(source, manifest)
-    rows, failures, excluded = [], [], 0
+    rows, failures, excluded, skipped = [], [], 0, 0
     for entry in manifest['documents']:
+        if entry['status'] == 'SKIPPED':
+            skipped += 1  # source not collected by design (e.g. rows without case numbers)
+            continue
         if entry['status'] != 'SUCCESS':
             failures.append({'target': entry['target'], 'id': entry['id'], 'reason': entry.get('reason', 'PENDING')})
             continue
         detail = strict_json((source / entry['path']).read_bytes())
-        row = validated(entry['row'], detail, entry['target'], manifest['date'], entry['listing_only'])
+        row = validated(entry['row'], detail, entry['target'], entry['kind'])
         if (scope == 'tax' and entry['target'] == 'prec'
                 and not (tax_reasons(row, entry['row']) or tax_reasons(row, detail))):
             excluded += 1
             continue
         rows.append((TABLES[entry['target']], row))
-    manifest['scope_selection'] = dict(scope=scope, excluded_documents=excluded, rule='tax-v1')
+    manifest['scope_selection'] = dict(scope=scope, excluded_documents=excluded, skipped_sources=skipped, rule='tax-v2')
     return manifest, rows, failures
 
 
