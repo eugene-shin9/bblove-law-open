@@ -49,54 +49,56 @@ jobs:
               main()
           PY
           python3 "$RUNNER_TEMP/probe.py"
-      - name: Source split statistics (public data)
+      - name: New collector entry pipeline on live samples (codes and counts only)
         env:
           LAW_OC: ${{ secrets.LAW_OC }}
         run: |
-          cat > "$RUNNER_TEMP/stat.py" <<'PY'
-          import json, os, re, sys
+          cat > "$RUNNER_TEMP/live.py" <<'PY'
+          import json, os, sys, tempfile, traceback
           from collections import Counter
+          from pathlib import Path
           sys.path[:0] = [os.path.join(os.environ['GITHUB_WORKSPACE'], 'src')]
-          from bblove_law_all import Client
-          from bblove_v107_pilot import records, text
-          def emit(oc, title, obj):
-              print(f'::notice title={title}::' + json.dumps(obj, ensure_ascii=False).replace(oc, '***')[:3800])
+          import bblove_precedent_collect as m
+          from bblove_law_all import Client, today
+          from bblove_v107_pilot import records, sanitized, text
+          from bblove_storage import strict_json
           def main():
-              oc = os.environ['LAW_OC']
-              c = Client(oc, seconds=900, interval=1.0)
-              def lst(**p):
-                  doc, _ = c.get('lawSearch.do', p)
-                  root = [v for v in doc.values() if isinstance(v, dict) and 'totalCnt' in v][0]
-                  rows = next((records(v) for k, v in root.items() if isinstance(v, (list, dict))), [])
-                  return int(text(root, 'totalCnt')), rows
-              for src in ('대법원', '국세법령정보시스템', '근로복지공단산재판례'):
-                  total, rows = lst(target='prec', datSrcNm=src, display=100, page=1)
-                  emit(oc, 'stat prec ' + src, {'total': total, 'rows': len(rows),
-                      'court_nonempty': sum(bool(text(r, '법원명')) for r in rows),
-                      'courts': dict(Counter(text(r, '법원명') for r in rows).most_common(5)),
-                      'caseno_samples': [text(r, '사건번호') for r in rows[:5]],
-                      'caseno_pattern_ok': sum(bool(re.search(r'\d{2,4}[가-힣]+\s*\d+', text(r, '사건번호'))) for r in rows),
-                      'sources': dict(Counter(text(r, '데이터출처명') for r in rows)),
-                      'dates': [text(r, '선고일자') for r in rows[:3]]})
-                  if src == '대법원' and rows:
-                      sid = text(rows[0], '판례일련번호')
-                      doc, _ = c.get('lawService.do', dict(target='prec', ID=sid))
-                      svc = next((v for v in doc.values() if isinstance(v, dict)), {})
-                      emit(oc, 'stat prec court detail', {'id': sid, 'keys': sorted(svc)[:30],
-                           'has_summary': bool(text(svc, '판시사항') or text(svc, '판결요지')), 'court': text(svc, '법원명'), 'caseno': text(svc, '사건번호')})
-              total, rows = lst(target='prec', display=1, page=1)
-              emit(oc, 'stat prec all', {'total': total})
-              for page in (1, 700, 1400):
-                  total, rows = lst(target='ttSpecialDecc', display=100, page=page)
-                  emit(oc, f'stat tribunal p{page}', {'total': total, 'rows': len(rows), 'title_nonempty': sum(bool(text(r, '사건명')) for r in rows),
-                       'number_samples': [text(r, '청구번호') for r in rows[:4]], 'kinds': dict(Counter(text(r, '재결구분명') for r in rows)),
-                       'number_ok': sum(bool(re.fullmatch(r'[가-힣]*\d{2,4}[가-힣]+\d+', re.sub(r'\s', '', text(r, '청구번호')))) for r in rows)})
-              for page in (1, 600, 1300):
-                  total, rows = lst(target='ntsCgmExpc', display=100, page=page)
-                  emit(oc, f'stat nts p{page}', {'total': total, 'rows': len(rows), 'date_ok': sum(bool(re.fullmatch(r'\d{4}\.\d{2}\.\d{2}', text(r, '해석일자'))) for r in rows),
-                       'date_samples': [text(r, '해석일자') for r in rows[:3]], 'link_hosts': dict(Counter(re.sub(r'^https?://([^/]+).*', r'\1', text(r, '법령해석상세링크')) for r in rows)),
-                       'number_empty': sum(not text(r, '안건번호') for r in rows), 'orgs': dict(Counter(text(r, '해석기관명') for r in rows))})
+              oc = os.environ['LAW_OC']; d = today()
+              c = Client(oc, seconds=1500, interval=1.0)
+              out = Path(tempfile.mkdtemp())
+              sets = [('prec', {}, 1), ('prec', {'datSrcNm': '대법원'}, 1), ('prec', {'datSrcNm': '대법원'}, 400),
+                      ('prec', {'datSrcNm': '국세법령정보시스템'}, 250), ('ntsCgmExpc', {}, 1),
+                      ('ttSpecialDecc', {}, 1), ('ttSpecialDecc', {}, 1400)]
+              for target, extra, page in sets:
+                  res = {'set': f'{target} {extra} p{page}'}
+                  try:
+                      doc, _ = c.get('lawSearch.do', dict(target=target, display=100, page=page, **extra))
+                      root = [v for v in doc.values() if isinstance(v, dict) and 'totalCnt' in v][0]
+                      rows = [{k: r[k] for k in m.FIELDS[target] if k in r} for r in records(m.catalog_rows(root, target))]
+                      _, raw = sanitized({'rows': rows, 'totalCnt': 0}, oc)
+                      rows = strict_json(raw)['rows']
+                      kinds, codes, details = Counter(), Counter(), 0
+                      for r in rows:
+                          e = dict(target=target, id=m.identifier(r, target), row=r, kind=m.default_kind(r, target))
+                          kinds[e['kind']] += 1
+                          if e['kind'] == 'skipped':
+                              continue
+                          if e['kind'] == 'detail':
+                              if details >= 12:
+                                  continue
+                              details += 1
+                          try:
+                              raw = m.store_entry(c, out, e, d)
+                              m.validated(e['row'], strict_json(raw), target, e['kind'])
+                              codes['OK_' + e['kind']] += 1
+                          except Exception as exc:
+                              fr = [f'{os.path.basename(f.filename)}:{f.lineno}' for f in traceback.extract_tb(exc.__traceback__)][-1:]
+                              codes[(str(exc) if str(exc) in m.ERROR_CODES else type(exc).__name__ + '@' + ','.join(fr))] += 1
+                      res.update(rows=len(rows), kinds=dict(kinds), results=dict(codes))
+                  except Exception as exc:
+                      res['error'] = type(exc).__name__ + ':' + (str(exc) if str(exc) in m.ERROR_CODES else '')
+                  print('::notice title=live ' + res['set'] + '::' + json.dumps(res, ensure_ascii=False).replace(oc, '***'))
           if __name__ == '__main__':
               main()
           PY
-          python3 "$RUNNER_TEMP/stat.py"
+          python3 "$RUNNER_TEMP/live.py"
