@@ -38,7 +38,7 @@ FIELDS = {
                    '문서번호', '안건명', '제목', '회신일자', '해석일자', '생산일자',
                    '질의요지', '질의내용', '회신', '회신내용', '답변요지', '관련법령', '법령해석상세링크'),
     'ttSpecialDecc': ('특별행정심판재결례일련번호', '청구번호', '의결일자',
-                      '재결구분명', '재결례유형명', '세목', '사건명', '재결요지', '관련법령', '주문'),
+                      '재결구분명', '재결례유형명', '세목', '사건명', '재결요지', '관련법령'),
 }
 # Row array key inside the lawSearch.do root, as law.go.kr returns it (probe 2026-10-29:
 # PrecSearch.prec, CgmExpc.cgmExpc, Decc.decc). The target name is accepted first.
@@ -267,10 +267,9 @@ def validated(row, summary, target, kind):
         if not (base['issues'].strip() or base['holding'].strip()):
             raise ValueError('SUMMARY_EMPTY')
         return base
-    # Recent decisions come without 사건명/재결요지 (probe 2026-10-29); the short 주문 (disposition)
-    # then stands in as an explicitly labelled title.
-    order = clean('주문')
-    base.update(title=clean('사건명') or base['title'] or (f'주문: {order[:200]}' if order else ''),
+    # Recent decisions come without 사건명/재결요지 (probe 2026-10-29). 주문·이유 are never stored,
+    # so such a decision is kept findable by number and date under an explicit placeholder title.
+    base.update(title=clean('사건명') or base['title'] or f"{base['number']} 결정(사건명 미제공)",
                 summary=clean('재결요지'), laws=clean('관련법령'),
                 decision_type=text(summary, '재결례유형명') or base['decision_type'],
                 tax_type=text(summary, '세목') or base['tax_type'])

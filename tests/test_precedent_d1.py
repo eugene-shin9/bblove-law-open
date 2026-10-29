@@ -276,10 +276,10 @@ class SummaryCollectionTests(unittest.TestCase):
             self.assertTrue(collect(FakeClient(tt_rows=[TT_ROW], tt_detail=bare), out, DATE))
             m = strict_json((out/'manifest.json').read_bytes())
             e = next(d for d in m['documents'] if d['target'] == 'ttSpecialDecc')
-            self.assertEqual(validated(e['row'], strict_json((out/e['path']).read_bytes()), 'ttSpecialDecc', 'detail')['title'],
-                             '주문: 심판청구를 기각한다.')
-        with tempfile.TemporaryDirectory() as t:
-            self.assertFalse(collect(FakeClient(tt_rows=[TT_ROW], tt_detail={**TT_DETAIL, '사건명': ''}), Path(t), DATE))
+            raw = (out/e['path']).read_bytes()
+            self.assertNotIn('심판청구를 기각한다'.encode(), raw)  # 주문 is never stored
+            self.assertEqual(validated(e['row'], strict_json(raw), 'ttSpecialDecc', 'detail')['title'],
+                             '조심2025중2548 결정(사건명 미제공)')
         with tempfile.TemporaryDirectory() as t:
             out = Path(t)
             titled = {**TT_ROW, '사건명': '합성 쟁점 여부(기각)'}
