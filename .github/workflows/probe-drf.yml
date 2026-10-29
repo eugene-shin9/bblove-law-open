@@ -49,40 +49,56 @@ jobs:
               main()
           PY
           python3 "$RUNNER_TEMP/probe.py"
-      - name: List future-dated rows on the first 3 catalog pages per target (public case numbers and dates only)
+      - name: Fixed collector dry run per target (page 1 catalog, 3 details; codes only)
         env:
           LAW_OC: ${{ secrets.LAW_OC }}
         run: |
-          cat > "$RUNNER_TEMP/future.py" <<'PY'
-          import json, os, re, sys
+          cat > "$RUNNER_TEMP/dry2.py" <<'PY'
+          import json, os, sys, traceback
+          from collections import Counter
           sys.path[:0] = [os.path.join(os.environ['GITHUB_WORKSPACE'], 'src')]
+          import bblove_precedent_collect as m
           from bblove_law_all import Client, today
-          from bblove_v107_pilot import records, text
-          oc = os.environ['LAW_OC']; t = today()
-          keys = {'prec': ('선고일자', '사건번호', '법원명', '판례일련번호'), 'ntsCgmExpc': ('회신일자', '해석일자', '생산일자', '안건번호', '법령해석례일련번호'),
-                  'ttSpecialDecc': ('의결일자', '청구번호', '특별행정심판재결례일련번호')}
-          import traceback
+          from bblove_v107_pilot import records
+          from bblove_storage import strict_json
           def main():
-           c = Client(oc, seconds=600, interval=1.0)
-           for target, ks in keys.items():
-            try:
-              hits, n = [], 0
-              for page in (1, 2, 3):
-                  doc, _ = c.get('lawSearch.do', dict(target=target, display=100, page=page))
-                  root = next(v for v in doc.values() if isinstance(v, dict) and 'totalCnt' in v)
-                  lk = [k for k, v in root.items() if isinstance(v, (list, dict))]
-                  rows = records(root[lk[0]]) if lk else []
-                  n += len(rows)
-                  for r in rows:
-                      day = re.sub(r'\D', '', text(r, *ks[:1]) if target != 'ntsCgmExpc' else text(r, '회신일자', '해석일자', '생산일자'))
-                      if len(day) == 8 and day > t:
-                          hits.append({k: text(r, k) for k in ks if text(r, k)})
-              out = json.dumps({'target': target, 'rowkey': lk, 'today': t, 'rows': n, 'future': hits[:10], 'future_count': len(hits)}, ensure_ascii=False)
-              print(f'::notice title=future {target}::' + ('REDACTED' if oc in out else out))
-            except Exception as e:
-              fr = [f'{os.path.basename(f.filename)}:{f.lineno}' for f in traceback.extract_tb(e.__traceback__)]
-              print(f'::notice title=future {target} error::' + json.dumps({'exc': type(e).__name__, 'frames': fr[-4:]}))
+              oc = os.environ['LAW_OC']; d = today()
+              c = Client(oc, seconds=600, interval=1.0)
+              for target in m.TARGETS:
+                  res = {'target': target}
+                  try:
+                      doc, _ = c.get('lawSearch.do', dict(target=target, display=100, page=1))
+                      root = [v for v in doc.values() if isinstance(v, dict) and 'totalCnt' in v][0]
+                      rows = [{k: r[k] for k in m.FIELDS[target] if k in r} for r in records(m.catalog_rows(root, target))]
+                      res['rows'] = len(rows)
+                      res['fields_missing'] = sorted({k for k in m.FIELDS[target]} - set().union(*[set(r) for r in rows]))[:12]
+                      codes = Counter()
+                      for r in rows:
+                          try:
+                              m.normalize(r, target, d, allow_future=True); codes['OK'] += 1
+                          except Exception as e:
+                              codes[str(e) if str(e) in m.ERROR_CODES else type(e).__name__] += 1
+                      res['catalog'] = dict(codes)
+                      det = Counter()
+                      for r in rows[:3]:
+                          sid = m.identifier(r, target)
+                          try:
+                              ddoc, raw = c.get('lawService.do', dict(target=target, ID=sid), original=True)
+                              if target == 'ntsCgmExpc' and (ddoc == {} or ddoc == {'NtsCgmExpcService': {}}):
+                                  raw = json.dumps(r, ensure_ascii=False).encode(); lo = True
+                              else:
+                                  lo = False
+                              raw = m.summary_bytes(raw, target)
+                              m.validated(r, strict_json(raw), target, d, lo); det['OK' + ('_listing_only' if lo else '')] += 1
+                          except Exception as e:
+                              fr = [f'{os.path.basename(f.filename)}:{f.lineno}' for f in traceback.extract_tb(e.__traceback__)][-2:]
+                              det[(str(e) if str(e) in m.ERROR_CODES else type(e).__name__) + '@' + ','.join(fr)] += 1
+                      res['details'] = dict(det)
+                  except Exception as e:
+                      res['error'] = type(e).__name__
+                  out = json.dumps(res, ensure_ascii=False)
+                  print(f'::notice title=dry2 {target}::' + ('REDACTED' if oc in out else out))
           if __name__ == '__main__':
               main()
           PY
-          python3 "$RUNNER_TEMP/future.py"
+          python3 "$RUNNER_TEMP/dry2.py"

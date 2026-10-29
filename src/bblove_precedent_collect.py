@@ -30,6 +30,9 @@ FIELDS = {
                       '재결구분명', '재결례유형명', '세목', '사건명', '재결요지',
                       '관련법령', '행정심판재결례상세링크'),
 }
+# Row array key inside the lawSearch.do root, as law.go.kr returns it (probe 2026-10-29:
+# PrecSearch.prec, CgmExpc.cgmExpc, Decc.decc). The target name is accepted first.
+ROW_KEYS = {'prec': ('prec',), 'ntsCgmExpc': ('cgmExpc', 'expc'), 'ttSpecialDecc': ('decc',)}
 ID_KEYS = {'prec': ('판례일련번호', '판례정보일련번호'),
            'ntsCgmExpc': ('법령해석일련번호', '법령해석례일련번호', '일련번호'),
            'ttSpecialDecc': ('특별행정심판재결례일련번호',)}
@@ -44,7 +47,8 @@ ERROR_CODES = frozenset(('CATALOG_ROOT_INVALID', 'CATALOG_COUNT_CHANGED', 'CATAL
     'INTERPRETATION_URL_INVALID', 'INTERPRETATION_URL_MISSING',
     'TRIBUNAL_NUMBER_INVALID', 'TRIBUNAL_METADATA_MISSING',
     'TRIBUNAL_URL_INVALID', 'TRIBUNAL_URL_MISSING',
-    'CREDENTIAL_BEARING_SUMMARY', 'COLLECTION_BUDGET_EXHAUSTED', 'REQUEST_FAILED_AFTER_RETRIES'))
+    'CREDENTIAL_BEARING_SUMMARY', 'COLLECTION_BUDGET_EXHAUSTED', 'REQUEST_FAILED_AFTER_RETRIES',
+    'DATE_IN_FUTURE'))
 
 
 def members(raw):
@@ -151,14 +155,26 @@ def tribunal_url(row, sid):
     return urlunsplit(('https', parts.netloc, parts.path, urlencode(sorted(query.items()), doseq=True), ''))
 
 
-def normalize(row, target, date):
+def catalog_rows(root, target):
+    for key in (target,) + ROW_KEYS[target]:
+        if key in root:
+            return root[key]
+    return []
+
+
+def normalize(row, target, date, allow_future=False):
     sid = identifier(row, target)
     value = (text(row, '의결일자') if target == 'ttSpecialDecc' else
              text(row, '선고일자') if target == 'prec' else text(row, '회신일자', '해석일자', '생산일자'))
     if not re.fullmatch(r'\d{8}|\d{4}\.\d{2}\.\d{2}\.?|\d{4}-\d{2}-\d{2}', value):
         raise ValueError('DATE_FORMAT_INVALID')
     day = re.sub(r'\D', '', value)
-    check_date(day, 'summary', date)
+    check_date(day, 'summary')
+    # A listed decision dated after the collection date (law.go.kr lists e.g. a Supreme Court
+    # case with a 2026-12-11 date on 2026-10-29) is kept in the catalog so counts stay exact,
+    # but never collected as a summary: it fails visibly with DATE_IN_FUTURE.
+    if not allow_future and date and day > date:
+        raise ValueError('DATE_IN_FUTURE')
     title = text(row, '사건명') if target in ('prec', 'ttSpecialDecc') else text(row, '안건명', '제목')
     if not title:
         raise ValueError('TITLE_MISSING')
@@ -345,7 +361,7 @@ def collect(client, out, date, scope='all', stop=None, account=None):
                 total = int(text(root, 'totalCnt'))
                 if total < 0 or state.get('total', total) != total:
                     raise ValueError('CATALOG_COUNT_CHANGED')
-                raw_rows = root.get(target, root.get('decc' if target == 'ttSpecialDecc' else 'expc', []))
+                raw_rows = catalog_rows(root, target)
                 batch = records(raw_rows)
                 if isinstance(raw_rows, list) and len(raw_rows) != len(batch):
                     raise ValueError('CATALOG_ROW_INVALID')
@@ -357,7 +373,7 @@ def collect(client, out, date, scope='all', stop=None, account=None):
                     sid = identifier(row, target)
                     if sid in known:
                         raise ValueError('CATALOG_DUPLICATE_ID')
-                    normalize(row, target, date)
+                    normalize(row, target, date, allow_future=True)
                     known.add(sid)
                 if len(known) > total or (len(known) < total and len(rows) != 100) or (not rows and total):
                     raise ValueError('CATALOG_INCOMPLETE')
@@ -385,6 +401,7 @@ def collect(client, out, date, scope='all', stop=None, account=None):
                 continue
             try:
                 if 'sha256' not in entry:
+                    normalize(entry['row'], target, date)  # DATE_IN_FUTURE fails before any request
                     check_budget()
                     doc, raw = client.get('lawService.do', dict(target=target, ID=sid), original=True)
                     # A successful empty response is the only automatic fallback.
