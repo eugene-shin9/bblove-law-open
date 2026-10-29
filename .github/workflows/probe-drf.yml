@@ -67,17 +67,16 @@ jobs:
               s = str(v).replace('\n', ' ')
               return s[:70]
           def emit(oc, title, obj):
-              out = json.dumps(obj, ensure_ascii=False)
-              out = 'REDACTED' if oc in out else out
+              out = json.dumps(obj, ensure_ascii=False).replace(oc, '***')
               for i in range(0, len(out), 3500):
                   print(f'::notice title={title} {i//3500}::' + out[i:i+3500])
+          C = {}
           def get(oc, ep, params):
-              c = BoundedClient(oc, measured_transport, request_limit=1)
+              c = C.setdefault('c', __import__('bblove_law_all').Client(oc, seconds=900, interval=1.0))
               try:
-                  doc, raw, _ = c.json(ep, params, 'schema')
-              except PilotBlocked as e:
-                  r = c.receipts[-1] if c.receipts else {}
-                  return None, {'error': str(e)[:60], 'http': r.get('http_status'), 'type': r.get('content_type'), 'bytes': r.get('bytes')}
+                  doc, _ = c.get(ep, params)
+              except Exception as e:
+                  return None, {'error': str(e)[:60] if str(e).isupper() or '_' in str(e) else type(e).__name__}
               return doc, None
           def walk(o, path=''):
               if isinstance(o, dict):
