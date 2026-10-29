@@ -1,0 +1,81 @@
+name: Probe DRF targets (temporary diagnostics)
+on:
+  push:
+    branches: [claude/probe-drf]
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: One list request per target; print only status codes, content type and JSON root keys
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: |
+          cat > "$RUNNER_TEMP/probe.py" <<'PY'
+          import json, os, sys
+          sys.path[:0] = [os.path.join(os.environ['GITHUB_WORKSPACE'], 'src')]
+          from bblove_tax_p2_collect import BoundedClient, PilotBlocked
+          from bblove_law_transport import measured_transport
+
+          def main():
+              oc = os.environ['LAW_OC']
+              for target in ('law', 'eflaw', 'prec', 'ntsCgmExpc', 'ttSpecialDecc'):
+                  c = BoundedClient(oc, measured_transport, request_limit=1)
+                  keys, err = None, None
+                  try:
+                      doc, raw, _ = c.json('lawSearch.do', {'target': target, 'display': 1, 'page': 1}, 'probe ' + target)
+                      root = next((v for v in doc.values() if isinstance(v, dict)), {})
+                      keys = {'root': sorted(doc)[:3], 'totalCnt': root.get('totalCnt'), 'fields': sorted(root)[:8]}
+                  except PilotBlocked as exc:
+                      err = str(exc)
+                  r = c.receipts[-1] if c.receipts else {}
+                  msg = json.dumps({'target': target, 'status': r.get('status'), 'http': r.get('http_status'),
+                                    'type': r.get('content_type'), 'bytes': r.get('bytes'), 'exc': r.get('exception_type'),
+                                    'reason': r.get('reason_type'), 'error': err, 'json': keys}, ensure_ascii=False)
+                  if oc in msg:
+                      msg = 'REDACTED'
+                  print(f'::notice title=probe {target}::{msg}')
+
+          if __name__ == '__main__':
+              main()
+          PY
+          python3 "$RUNNER_TEMP/probe.py"
+      - name: Precedent collector dry run (first catalog page only; prints exception type and code lines only)
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: |
+          cat > "$RUNNER_TEMP/dry.py" <<'PY'
+          import json, os, sys, tempfile, traceback
+          sys.path[:0] = [os.path.join(os.environ['GITHUB_WORKSPACE'], 'src')]
+          import bblove_precedent_collect as m
+          from bblove_law_all import Client, today
+          oc = os.environ['LAW_OC']
+          orig = m.save
+          def save(path, data):
+              if str(path).endswith('attempt.json'):
+                  et, ev, tb = sys.exc_info()
+                  msg = str(ev).replace(oc, '***')[:160] if ev else ''
+                  frames = [f'{os.path.basename(f.filename)}:{f.lineno}:{f.name}' for f in traceback.extract_tb(tb)] if tb else []
+                  out = json.dumps({'exc': et.__name__ if et else None, 'msg': msg, 'frames': frames[-6:]}, ensure_ascii=False)
+                  print('::notice title=dry exception::' + ('REDACTED' if oc in out else out))
+              return orig(path, data)
+          m.save = save
+          c = Client(oc, seconds=300, interval=1.0)
+          d = tempfile.mkdtemp()
+          ok = m.collect(c, d, today(), 'all', stop=lambda: 'TIME_BUDGET' if c.calls >= 1 else None)
+          man = os.path.join(d, 'manifest.json')
+          info = json.load(open(man)) if os.path.exists(man) else {}
+          print('::notice title=dry result::' + json.dumps({'ok': ok, 'calls': c.calls, 'stop': info.get('stop_reason'),
+                'catalogs': info.get('catalogs'), 'docs': len(info.get('documents', []))}, ensure_ascii=False))
+          PY
+          python3 "$RUNNER_TEMP/dry.py"
+
