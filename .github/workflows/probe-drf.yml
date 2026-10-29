@@ -62,12 +62,15 @@ jobs:
           c = Client(oc, seconds=600, interval=1.0)
           keys = {'prec': ('선고일자', '사건번호', '법원명', '판례일련번호'), 'ntsCgmExpc': ('회신일자', '해석일자', '생산일자', '안건번호', '법령해석례일련번호'),
                   'ttSpecialDecc': ('의결일자', '청구번호', '특별행정심판재결례일련번호')}
+          import traceback
           for target, ks in keys.items():
+            try:
               hits, n = [], 0
               for page in (1, 2, 3):
                   doc, _ = c.get('lawSearch.do', dict(target=target, display=100, page=page))
                   root = next(v for v in doc.values() if isinstance(v, dict) and 'totalCnt' in v)
-                  rows = records(root.get(target, root.get('decc' if target == 'ttSpecialDecc' else 'expc', [])))
+                  lk = [k for k, v in root.items() if isinstance(v, (list, dict))]
+                  rows = records(root[lk[0]]) if lk else []
                   n += len(rows)
                   for r in rows:
                       day = re.sub(r'\D', '', text(r, *ks[:1]) if target != 'ntsCgmExpc' else text(r, '회신일자', '해석일자', '생산일자'))
@@ -75,5 +78,8 @@ jobs:
                           hits.append({k: text(r, k) for k in ks if text(r, k)})
               out = json.dumps({'target': target, 'today': t, 'rows': n, 'future': hits[:10], 'future_count': len(hits)}, ensure_ascii=False)
               print(f'::notice title=future {target}::' + ('REDACTED' if oc in out else out))
+            except Exception as e:
+              fr = [f'{os.path.basename(f.filename)}:{f.lineno}' for f in traceback.extract_tb(e.__traceback__)]
+              print(f'::notice title=future {target} error::' + json.dumps({'exc': type(e).__name__, 'frames': fr[-4:]}))
           PY
           python3 "$RUNNER_TEMP/future.py"
