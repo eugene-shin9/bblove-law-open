@@ -38,7 +38,7 @@ FIELDS = {
                    '문서번호', '안건명', '제목', '회신일자', '해석일자', '생산일자',
                    '질의요지', '질의내용', '회신', '회신내용', '답변요지', '관련법령', '법령해석상세링크'),
     'ttSpecialDecc': ('특별행정심판재결례일련번호', '청구번호', '의결일자',
-                      '재결구분명', '재결례유형명', '세목', '사건명', '재결요지', '관련법령'),
+                      '재결구분명', '재결례유형명', '세목', '사건명', '재결요지', '관련법령', '주문'),
 }
 # Row array key inside the lawSearch.do root, as law.go.kr returns it (probe 2026-10-29:
 # PrecSearch.prec, CgmExpc.cgmExpc, Decc.decc). The target name is accepted first.
@@ -61,8 +61,9 @@ ERROR_CODES = frozenset(('CATALOG_ROOT_INVALID', 'CATALOG_COUNT_CHANGED', 'CATAL
     'DATE_IN_FUTURE', 'DETAIL_NOT_FOUND', 'SOURCE_NOT_COLLECTED', 'CACHE_KIND_INVALID'))
 SCHEMA = 'precedent-summary-v2'
 PREC_KINDS = {'대법원': {'detail', 'listing'}, '국세법령정보시스템': {'listing'}}
-# '대법원-2025-두-34754' (국세법령정보시스템 rows); the court is the prefix.
-HYPHEN_CASE = re.compile(r'(?P<court>[가-힣]+(?:법원|지원))-(?P<year>\d{2,4})-(?P<code>[가-힣]+)-(?P<serial>\d+)')
+# 국세법령정보시스템 rows put the court into the number: '대법원-2025-두-34754',
+# '대법원2026두31124', '서울행정법원2025구합55369', '부산고등법원(창원)-2015-누-10783'.
+COURT_CASE = re.compile(r'(?P<court>[가-힣]+(?:법원|지원)(?:\([가-힣]+\))?)-?(?P<year>\d{2,4})-?(?P<code>[가-힣]+)-?(?P<serial>\d+)')
 SAVE_EVERY_SECONDS = 60
 
 
@@ -194,7 +195,7 @@ def row_date(row, target):
 
 def case_numbers(value):
     """Every case number in a (possibly merged) field, spacing and hyphens removed."""
-    compact = re.sub(r'[\s-]', '', HYPHEN_CASE.sub(lambda m: m['year'] + m['code'] + m['serial'], value or ''))
+    compact = re.sub(r'[\s-]', '', COURT_CASE.sub(lambda m: m['year'] + m['code'] + m['serial'], value or ''))
     return set(re.findall(r'\d{2,4}[가-힣]+\d+', compact))
 
 
@@ -203,9 +204,9 @@ def listed(row, target):
     sid, day = identifier(row, target), row_date(row, target)
     if target == 'prec':
         number = re.sub(r'\s', '', text(row, '사건번호'))
-        hyphen = HYPHEN_CASE.fullmatch(number)
-        if hyphen:
-            court, case_no = hyphen['court'], hyphen['year'] + hyphen['code'] + hyphen['serial']
+        prefixed = COURT_CASE.fullmatch(number)
+        if prefixed:
+            court, case_no = prefixed['court'], prefixed['year'] + prefixed['code'] + prefixed['serial']
         else:
             court, case_no = text(row, '법원명'), number
         if not court or not case_numbers(case_no):
@@ -266,7 +267,11 @@ def validated(row, summary, target, kind):
         if not (base['issues'].strip() or base['holding'].strip()):
             raise ValueError('SUMMARY_EMPTY')
         return base
-    base.update(title=clean('사건명') or base['title'], summary=clean('재결요지'), laws=clean('관련법령'),
+    # Recent decisions come without 사건명/재결요지 (probe 2026-10-29); the short 주문 (disposition)
+    # then stands in as an explicitly labelled title.
+    order = clean('주문')
+    base.update(title=clean('사건명') or base['title'] or (f'주문: {order[:200]}' if order else ''),
+                summary=clean('재결요지'), laws=clean('관련법령'),
                 decision_type=text(summary, '재결례유형명') or base['decision_type'],
                 tax_type=text(summary, '세목') or base['tax_type'])
     if not base['title']:
