@@ -104,6 +104,17 @@ class LoopTests(unittest.TestCase):
             for p in Path(t, 'summaries').rglob('*.json'):
                 self.assertNotIn(b'FULL_JUDGMENT_MUST_NEVER_PERSIST', p.read_bytes())
 
+    def test_summary_counts_failure_reasons_only_as_codes(self):
+        with tempfile.TemporaryDirectory() as out:
+            docs = [{'target': 'prec', 'status': 'FAILED', 'reason': 'DETAIL_NOT_FOUND'},
+                    {'target': 'prec', 'status': 'FAILED', 'reason': 'DETAIL_NOT_FOUND'},
+                    {'target': 'ttSpecialDecc', 'status': 'FAILED', 'reason': 'DATE_IN_FUTURE'},
+                    {'target': 'prec', 'status': 'SUCCESS'}]
+            Path(out, 'manifest.json').write_text(json.dumps({'date': DATE, 'documents': docs}), encoding='utf-8')
+            s = cp.summary(out)
+        self.assertEqual(s['failure_reasons'], {'prec:DETAIL_NOT_FOUND': 2, 'ttSpecialDecc:DATE_IN_FUTURE': 1})
+        self.assertEqual(s['counts']['prec:SUCCESS'], 1)
+
     def test_step_outputs(self):
         with tempfile.TemporaryDirectory() as t:
             target = Path(t) / 'out.txt'
