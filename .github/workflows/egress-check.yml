@@ -1,0 +1,34 @@
+name: Egress check (law.go.kr DRF reachability, manual)
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: law-go-kr-drf
+  cancel-in-progress: false
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Choose law.go.kr egress and check it answers (fails fast when blocked)
+        id: egress
+        uses: ./.github/actions/law-egress
+        with:
+          client-id: ${{ secrets.TS_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          exit-node: ${{ secrets.TS_EXIT_NODE }}
+      - name: One credentialed list request per target (codes and JSON keys only)
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+          HTTPS_PROXY: ${{ steps.egress.outputs.https-proxy }}
+        run: python -I scripts/egress_check.py
