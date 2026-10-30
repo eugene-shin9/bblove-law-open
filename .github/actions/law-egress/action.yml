@@ -1,0 +1,95 @@
+name: law.go.kr egress
+description: >
+  Choose how this job reaches law.go.kr DRF and fail fast if it cannot.
+  With a Tailscale workload-identity credential configured, only processes given the returned
+  https-proxy reach the internet through the maintainer's exit node (userspace networking:
+  the runner's own routes, DNS and GitHub traffic are untouched). Without it, requests go direct.
+  Nothing identifying the tailnet, its nodes or addresses is printed.
+inputs:
+  client-id:
+    description: Tailscale OIDC trust-credential client ID (empty = direct egress)
+    required: false
+    default: ''
+  audience:
+    description: Tailscale OIDC trust-credential audience
+    required: false
+    default: ''
+  exit-node:
+    description: Exit node name or Tailscale IP
+    required: false
+    default: ''
+outputs:
+  https-proxy:
+    description: Proxy URL for the collection step only (empty for direct egress)
+    value: ${{ steps.mode.outputs.proxy }}
+  mode:
+    description: korea-exit or direct
+    value: ${{ steps.mode.outputs.mode }}
+runs:
+  using: composite
+  steps:
+    - name: Decide egress mode
+      id: mode
+      shell: bash
+      env:
+        CLIENT_ID: ${{ inputs.client-id }}
+        AUDIENCE: ${{ inputs.audience }}
+        EXIT_NODE: ${{ inputs.exit-node }}
+      run: |
+        set -euo pipefail
+        if [ -z "$CLIENT_ID$AUDIENCE$EXIT_NODE" ]; then
+          echo "mode=direct" >> "$GITHUB_OUTPUT"
+          echo "proxy=" >> "$GITHUB_OUTPUT"
+          echo "::notice title=egress::mode=direct (Tailscale not configured)"
+        elif [ -n "$CLIENT_ID" ] && [ -n "$AUDIENCE" ] && [ -n "$EXIT_NODE" ]; then
+          echo "::add-mask::$EXIT_NODE"
+          echo "mode=korea-exit" >> "$GITHUB_OUTPUT"
+          echo "proxy=http://127.0.0.1:1055" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error title=egress::Tailscale settings are partly configured (need client ID, audience and exit node)"
+          exit 1
+        fi
+    - name: Join tailnet as an ephemeral tagged node using the exit node (userspace proxy only)
+      if: steps.mode.outputs.mode == 'korea-exit'
+      uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+      with:
+        oauth-client-id: ${{ inputs.client-id }}
+        audience: ${{ inputs.audience }}
+        tags: tag:bblove-ci
+        version: '1.104.4'
+        use-cache: 'false'
+        log-mode: quiet
+        timeout: 30s
+        retry: '2'
+        tailscaled-args: --tun=userspace-networking --outbound-http-proxy-listen=127.0.0.1:1055
+        args: --exit-node=${{ inputs.exit-node }}
+    - name: Fail fast unless law.go.kr DRF answers through the chosen path
+      shell: bash
+      env:
+        PROXY: ${{ steps.mode.outputs.proxy }}
+        MODE: ${{ steps.mode.outputs.mode }}
+      run: |
+        set -uo pipefail
+        url='https://www.law.go.kr/DRF/lawSearch.do?target=law&type=JSON&display=1'
+        args=(-sS -o /dev/null -w '%{http_code}' --max-time 20)
+        if [ -n "$PROXY" ]; then args+=(--proxy "$PROXY"); fi
+        code=000
+        for attempt in 1 2 3; do
+          code=$(curl "${args[@]}" "$url" 2>/dev/null) || code=000
+          [ "$code" != "000" ] && break
+          sleep 5
+        done
+        country=unknown
+        if [ -n "$PROXY" ]; then
+          country=$(curl -sS --max-time 10 --proxy "$PROXY" https://ipinfo.io/country 2>/dev/null | tr -dc 'A-Z' | head -c 2) || country=unknown
+          [ -n "$country" ] || country=unknown
+        fi
+        echo "::notice title=egress::mode=$MODE drf_http=$code exit_country=$country"
+        if [ "$code" = "000" ]; then
+          echo "::error title=egress::law.go.kr DRF did not answer via mode=$MODE (EGRESS_BLOCKED). Stopping before collection."
+          exit 1
+        fi
+        if [ "$MODE" = "korea-exit" ] && [ "$country" != "KR" ] && [ "$country" != "unknown" ]; then
+          echo "::error title=egress::exit node is not in Korea (country=$country)"
+          exit 1
+        fi

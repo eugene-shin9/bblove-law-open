@@ -47,11 +47,20 @@ jobs:
             official-all-v1-
       - name: Diagnose restored RAW without API requests
         run: python scripts/diagnose_law_collection.py --report collection-diagnostics-before.json
+      - name: Choose law.go.kr egress and check it answers (fails fast when blocked)
+        id: egress
+        uses: ./.github/actions/law-egress
+        with:
+          client-id: ${{ secrets.TS_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          exit-node: ${{ secrets.TS_EXIT_NODE }}
       - name: Collect current editions (bounded to less than 60 minutes; resumes next run)
         id: collect
         timeout-minutes: 60
         env:
           LAW_OC: ${{ secrets.LAW_OC }}
+          # Only this step goes through the exit node; empty means direct.
+          HTTPS_PROXY: ${{ steps.egress.outputs.https-proxy }}
         run: python src/bblove_law_all.py --partial-ok
       - name: Diagnose RAW after collection
         if: always()

@@ -44,11 +44,20 @@ jobs:
           key: admrul-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             admrul-v1-
+      - name: Choose law.go.kr egress and check it answers (fails fast when blocked)
+        id: egress
+        uses: ./.github/actions/law-egress
+        with:
+          client-id: ${{ secrets.TS_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          exit-node: ${{ secrets.TS_EXIT_NODE }}
       - name: Collect administrative rules (bounded; partial resumes next run)
         id: collect
         timeout-minutes: 60
         env:
           LAW_OC: ${{ secrets.LAW_OC }}
+          # Only this step goes through the exit node; empty means direct.
+          HTTPS_PROXY: ${{ steps.egress.outputs.https-proxy }}
         run: python src/bblove_admrul.py collect --out auto/admrul --seconds 3300 --partial-ok
       - name: Credential scan before caching or uploading anything
         id: scan_raw
