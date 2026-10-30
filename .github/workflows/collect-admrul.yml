@@ -124,5 +124,5 @@ jobs:
           st = dict(collections.Counter(d.get('status') for d in docs))
           a = pathlib.Path('auto/admrul/attempt.json')
           att = json.loads(a.read_text()) if a.exists() else {}
-          print(f"::notice title=admrul::date={m.get('date')} status={m.get('status')} docs={len(docs)} counts={st} attempt={att.get('status')}/{att.get('reason')} org_seen={json.dumps(att.get('org_seen'), ensure_ascii=False)}")
+          print(f"::notice title=admrul::date={m.get('date')} status={m.get('status')} docs={len(docs)} counts={st} attempt={att.get('status')}/{att.get('reason')} org_observed={json.dumps(m.get('org_observed'), ensure_ascii=False)} excluded={len(m.get('excluded', []))}")
           PY

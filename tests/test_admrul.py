@@ -140,17 +140,30 @@ class AdminRules(unittest.TestCase):
                                       row(3,'기획재정부','소득세 납세절차','예규')]))
         self.assertEqual(len(m['documents']),3)
 
-        class Leaky(Fake):
+        class SubAgency(Fake):
             def get(self,endpoint,params,original=False):
                 doc,raw=super().get(endpoint,params,original)
                 if endpoint=='lawSearch.do' and params['org']==A.ORG['국세청']:
-                    doc['AdmRulSearch']['admrul'][0]['소관부처명']='서울지방국세청'
+                    doc['AdmRulSearch']['admrul'][0]['소관부처명']='국세상담센터'
                 return doc,A.encode(doc)
-        out=self.root/'leaky'
-        self.assertFalse(A.collect(Leaky(both_orgs([row()])),out,DATE))
-        attempt=json.loads((out/'attempt.json').read_text())
-        self.assertEqual(attempt['reason'],'ADMRUL_ORG_FILTER_MISMATCH')
-        self.assertEqual(attempt['org_seen'],{'requested':'국세청','observed':['서울지방국세청']})
+        # A sub-agency under the requested org code is excluded and listed, not a filter failure.
+        out=self.root/'suborg'
+        self.assertTrue(A.collect(SubAgency(both_orgs([row(),row(2,'국세청','세무조사 운영 지침','훈령')])),out,DATE))
+        m=json.loads((out/'manifest.json').read_text())
+        self.assertEqual(sorted(m['org_observed']),['국세상담센터','국세청','재정경제부'])
+        self.assertIn('OUTSIDE_ORGANIZATIONS',{e['reason'] for e in m['excluded']})
+        self.assertTrue(all(e['row']['소관부처명']!='국세상담센터' for e in m['documents']))
+
+        class WrongCode(Fake):
+            def get(self,endpoint,params,original=False):
+                doc,raw=super().get(endpoint,params,original)
+                if endpoint=='lawService.do':
+                    doc['AdmRulService']['행정규칙기본정보']['소관부처코드']='9999999'
+                return doc,A.encode(doc)
+        out=self.root/'wrongcode'
+        A.collect(WrongCode(both_orgs([row()])),out,DATE)
+        m=json.loads((out/'manifest.json').read_text())
+        self.assertEqual({e['reason'] for e in m['documents'] if e['status']=='FAILED'},{'ADMRUL_ORG_CODE_MISMATCH'})
 
     def test_resume_zero_calls_and_exact_raw_bytes(self):
         client,m=self.collected()
@@ -247,7 +260,8 @@ class AdminRules(unittest.TestCase):
         self.assertTrue(A.collect(replay,self.raw,DATE));self.assertEqual(replay.calls,0)
 
     def test_catalog_unknown_envelope_bad_page_other_org_duplicate_and_date_fail(self):
-        for damage in ('envelope','page','org','duplicate','date'):
+        # 'org' no longer aborts: a sub-agency name under the requested code is excluded (see sub-agency test).
+        for damage in ('envelope','page','duplicate','date'):
             with self.subTest(damage=damage):
                 d={'AdmRulSearch':{'totalCnt':'1','page':'1','admrul':[row()]}}
                 if damage=='envelope':d={'unknown':d['AdmRulSearch']}
