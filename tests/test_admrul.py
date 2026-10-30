@@ -23,7 +23,7 @@ def row(i=1, org='국세청', title='조사사무처리규정', kind='훈령'):
 
 def detail(r, body='제1조(목적) 합성 세무조사의 목적.\n제2조(절차) 합성 납세자 권익 보호.'):
     basic={k:v for k,v in r.items() if k!='현행연혁구분'}
-    basic.update(현행여부='Y',소관부처코드=A.ORG[r['소관부처명']])
+    basic.update(현행여부='Y',소관부처코드=A.ORG[A.current_org(r['소관부처명'])])
     return {'AdmRulService':{'행정규칙기본정보':basic,'조문내용':body}}
 
 
@@ -31,7 +31,7 @@ class Fake:
     credential='fixture-credential-only'
 
     def __init__(self, rows=None, details=None, stop_after=None):
-        self.rows=rows if rows is not None else [row(),row(2,'기획재정부','소득세 납세절차','예규')]
+        self.rows=rows if rows is not None else [row(),row(2,'재정경제부','소득세 납세절차','예규')]
         self.details=details or {}
         self.calls=0
         self.requests=[]
@@ -44,7 +44,7 @@ class Fake:
             raise A.PilotBlocked('COLLECTION_BUDGET_EXHAUSTED')
         if endpoint=='lawSearch.do':
             org=next(n for n,c in A.ORG.items() if c==params['org'])
-            rows=[r for r in self.rows if r['소관부처명']==org]
+            rows=[r for r in self.rows if A.current_org(r['소관부처명'])==org]
             start=(params['page']-1)*100
             doc={'AdmRulSearch':{'totalCnt':str(len(rows)),'page':str(params['page']),
                                 'admrul':rows[start:start+100]}}
@@ -57,7 +57,7 @@ class Fake:
 
 def both_orgs(rows):
     """Unselected personnel rule keeps each required catalog nonempty."""
-    present = {r['소관부처명'] for r in rows}
+    present = {A.current_org(r['소관부처명']) for r in rows}
     return rows + [row(900 + i, org, '인사관리규정')
                    for i, org in enumerate(A.ORG) if org not in present]
 
@@ -127,12 +127,30 @@ class AdminRules(unittest.TestCase):
               row(5,'국세청','소득세 지침','지침'),row(6,'법무부','조세 조사 규정')]
         client,m=self.collected(Fake(rows))
         self.assertEqual(len(m['documents']),2)
-        self.assertEqual({e['row']['소관부처명'] for e in m['documents']},set(A.ORG))
+        # Former ministry name (기획재정부) is accepted as 재정경제부; others stay excluded.
+        self.assertEqual({A.current_org(e['row']['소관부처명']) for e in m['documents']},set(A.ORG))
         self.assertEqual({e['reason'] for e in m['excluded']},{'NO_TAX_KEYWORD','CUSTOMS_EXCLUDED','OUTSIDE_KINDS'})
         self.assertEqual(A.exclusion(row(6,'법무부')), 'OUTSIDE_ORGANIZATIONS')
         lists=[p for ep,p,_ in client.requests if ep=='lawSearch.do']
         self.assertEqual({p['org'] for p in lists},set(A.ORG.values()))
         self.assertTrue(all(p['target']=='admrul' and p['nw']=='1' for p in lists))
+
+    def test_renamed_ministry_and_foreign_ministry_in_filtered_catalog(self):
+        client,m=self.collected(Fake([row(),row(2,'재정경제부','부가가치세 사무처리','고시'),
+                                      row(3,'기획재정부','소득세 납세절차','예규')]))
+        self.assertEqual(len(m['documents']),3)
+
+        class Leaky(Fake):
+            def get(self,endpoint,params,original=False):
+                doc,raw=super().get(endpoint,params,original)
+                if endpoint=='lawSearch.do' and params['org']==A.ORG['국세청']:
+                    doc['AdmRulSearch']['admrul'][0]['소관부처명']='서울지방국세청'
+                return doc,A.encode(doc)
+        out=self.root/'leaky'
+        self.assertFalse(A.collect(Leaky(both_orgs([row()])),out,DATE))
+        attempt=json.loads((out/'attempt.json').read_text())
+        self.assertEqual(attempt['reason'],'ADMRUL_ORG_FILTER_MISMATCH')
+        self.assertEqual(attempt['org_seen'],{'requested':'국세청','observed':['서울지방국세청']})
 
     def test_resume_zero_calls_and_exact_raw_bytes(self):
         client,m=self.collected()
