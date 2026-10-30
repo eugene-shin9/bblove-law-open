@@ -105,13 +105,17 @@ def summary(out):
     if not path.exists():
         return {}
     m = json.loads(path.read_text(encoding='utf-8'))
-    counts = {}
+    counts, failures = {}, {}
     for d in m.get('documents', []):
         key = f"{d.get('target')}:{d.get('status')}"
         counts[key] = counts.get(key, 0) + 1
+        if d.get('status') == 'FAILED':
+            # Reasons are fixed allowlisted codes (never exception text), safe to publish.
+            reason = f"{d.get('target')}:{d.get('reason')}"
+            failures[reason] = failures.get(reason, 0) + 1
     return {'date': m.get('date'), 'status': m.get('status'), 'stop_reason': m.get('stop_reason'),
             'catalogs': {t: {k: c.get(k) for k in ('total', 'complete')} for t, c in m.get('catalogs', {}).items()},
-            'counts': counts}
+            'counts': counts, 'failure_reasons': failures}
 
 
 def main():
