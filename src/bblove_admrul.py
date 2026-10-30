@@ -24,7 +24,11 @@ from bblove_v107_pilot import check_date, sanitized, text
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from build_mcp_assets_official import encode, iso, META_LIMIT
 
-ORG = {'국세청': '1210000', '기획재정부': '1051000'}
+# DRF org code -> ministry names the catalog may report for it. 기획재정부 was
+# renamed 재정경제부 (law.go.kr now lists tax statutes under the new name) while
+# its org code stayed; rows keep whichever name the DRF actually returned.
+ORG = {'1210000': ('국세청',), '1051000': ('재정경제부', '기획재정부')}
+ORG_NAMES = {name: code for code, names in ORG.items() for name in names}
 KINDS = {'훈령', '예규', '고시'}
 KEYWORDS = ('세', '조세', '국세', '조사', '징수', '체납', '부가', '소득', '법인', '상속', '증여')
 POLICY = 'tax-admrul-v1-no-customs'
@@ -54,7 +58,7 @@ def checked_row(row, date):
 
 
 def exclusion(row):
-    if row['소관부처명'] not in ORG:
+    if row['소관부처명'] not in ORG_NAMES:
         return 'OUTSIDE_ORGANIZATIONS'
     if row['행정규칙종류'] not in KINDS:
         return 'OUTSIDE_KINDS'
@@ -67,7 +71,7 @@ def exclusion(row):
     return None
 
 
-def parse_page(doc, org, page, date):
+def parse_page(doc, code, page, date):
     root = doc.get('AdmRulSearch') if isinstance(doc, dict) else None
     if not isinstance(root, dict) or not re.fullmatch(r'\d+', text(root, 'totalCnt')):
         raise ValueError('ADMRUL_CATALOG_SHAPE')
@@ -82,7 +86,7 @@ def parse_page(doc, org, page, date):
     for r in rows:
         item = checked_row(r, date)
         # A different ministry in an org-filtered response signals a broken filter.
-        if item['소관부처명'] != org:
+        if item['소관부처명'] not in ORG[code]:
             raise ValueError('ADMRUL_ORG_FILTER_MISMATCH')
         if text(r, '현행연혁구분') not in {'현행', '1'}:
             raise ValueError('ADMRUL_NOT_CURRENT')
@@ -96,7 +100,7 @@ def catalog(client, out, date):
     cached = strict_json(checkpoint.read_bytes()) if checkpoint.exists() else {}
     reuse = cached.get('date') == date and cached.get('policy') == POLICY
     receipts, rows, seen = [], [], set()
-    for org, code in ORG.items():
+    for code in ORG:
         total, received = None, 0
         for page in range(1, 102):
             path = f'catalog/{code}/{page}.json'
@@ -109,7 +113,7 @@ def catalog(client, out, date):
                 clean, _ = sanitized(doc, getattr(client, 'credential', ''))
                 raw = encode(clean)  # selection evidence; never claimed as an original
             doc = safe_raw(raw, getattr(client, 'credential', ''))
-            batch, count = parse_page(doc, org, page, date)
+            batch, count = parse_page(doc, code, page, date)
             # An empty required ministry may mean a retired org code. Do not
             # publish the other ministry alone, including from old checkpoints.
             if count == 0:
@@ -200,7 +204,7 @@ def validate_raw(raw, row, date, credential=''):
         raise ValueError('ADMRUL_METADATA_MISMATCH')
     if text(basic, '현행여부') != 'Y':
         raise ValueError('ADMRUL_NOT_CURRENT')
-    if text(basic, '소관부처코드') != ORG[actual['소관부처명']]:
+    if text(basic, '소관부처코드') != ORG_NAMES[actual['소관부처명']]:
         raise ValueError('ADMRUL_ORG_CODE_MISMATCH')
     # Guide declares 조문내용, not the normal law's 조문/조문단위 envelope.
     # No guessed dictionary flattening: a different JSON nesting must be reviewed.
