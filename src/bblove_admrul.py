@@ -34,12 +34,9 @@ def current_org(name):
     return FORMER.get(name, name)
 
 
-class OrgFilterMismatch(ValueError):
-    """Fixed code; `seen` holds only public ministry names for the progress report."""
-    def __init__(self, requested, seen):
-        super().__init__('ADMRUL_ORG_FILTER_MISMATCH')
-        self.seen = {'requested': requested,
-                     'observed': sorted(n for n in seen if re.fullmatch(r'[가-힣]{2,20}', n))[:10]}
+def public_names(names):
+    """Ministry names only (Hangul, short) for progress reports; nothing else is echoed."""
+    return sorted(n for n in set(names) if re.fullmatch(r'[가-힣]{2,20}', n))[:20]
 KINDS = {'훈령', '예규', '고시'}
 KEYWORDS = ('세', '조세', '국세', '조사', '징수', '체납', '부가', '소득', '법인', '상속', '증여')
 POLICY = 'tax-admrul-v1-no-customs'
@@ -94,10 +91,11 @@ def parse_page(doc, org, page, date):
     if not isinstance(rows, list) or len(rows) > 100 or (count and not rows):
         raise ValueError('ADMRUL_CATALOG_ROWS')
     checked = [checked_row(r, date) for r in rows]
-    # A different ministry in an org-filtered response signals a broken filter.
-    names = {item['소관부처명'] for item in checked}
-    if any(current_org(n) != org for n in names):
-        raise OrgFilterMismatch(org, names)
+    # The org-code filter also returns the ministry's sub-agencies (e.g. 국세상담센터 under 국세청).
+    # Those rows are kept for exclusion() to list transparently; the detail's 소관부처코드 is
+    # checked against the requested code in validate_raw, so a wrong code never publishes.
+    for item in checked:
+        item['요청부처'] = org
     for r in rows:
         if text(r, '현행연혁구분') not in {'현행', '1'}:
             raise ValueError('ADMRUL_NOT_CURRENT')
@@ -214,7 +212,8 @@ def validate_raw(raw, row, date, credential=''):
         raise ValueError('ADMRUL_METADATA_MISMATCH')
     if text(basic, '현행여부') != 'Y':
         raise ValueError('ADMRUL_NOT_CURRENT')
-    if text(basic, '소관부처코드') != ORG[current_org(actual['소관부처명'])]:
+    requested = row.get('요청부처') or current_org(actual['소관부처명'])
+    if text(basic, '소관부처코드') != ORG.get(requested):
         raise ValueError('ADMRUL_ORG_CODE_MISMATCH')
     # Guide declares 조문내용, not the normal law's 조문/조문단위 envelope.
     # No guessed dictionary flattening: a different JSON nesting must be reviewed.
@@ -245,13 +244,13 @@ def collect(client, out, date):
     except Exception as exc:
         reason = code(exc, 'ADMRUL_CATALOG_FAILED')
         save(out / 'attempt.json', {'status': 'INCOMPLETE' if reason == 'COLLECTION_BUDGET_EXHAUSTED' else 'FAILED',
-             'reason': reason, 'api_calls': client.calls,
-             **({'org_seen': exc.seen} if isinstance(exc, OrgFilterMismatch) else {})})
+             'reason': reason, 'api_calls': client.calls})
         # Never let a previous complete checkpoint publish after a list failure.
         manifest['catalog_failure'] = reason
         manifest['documents'] = previous.get('documents', [])
         save(path, manifest)
         return False
+    manifest['org_observed'] = public_names(r['소관부처명'] for r in rows)
     for row in rows:
         entry = {'id': row['행정규칙ID'], 'mst': row['행정규칙일련번호'],
                  'title': row['행정규칙명'], 'row': row, 'status': 'PENDING',
