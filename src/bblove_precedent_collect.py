@@ -59,6 +59,16 @@ ERROR_CODES = frozenset(('CATALOG_ROOT_INVALID', 'CATALOG_COUNT_CHANGED', 'CATAL
     'TRIBUNAL_URL_INVALID', 'TRIBUNAL_URL_MISSING',
     'CREDENTIAL_BEARING_SUMMARY', 'COLLECTION_BUDGET_EXHAUSTED', 'REQUEST_FAILED_AFTER_RETRIES',
     'DATE_IN_FUTURE', 'DETAIL_NOT_FOUND', 'SOURCE_NOT_COLLECTED', 'CACHE_KIND_INVALID'))
+# Permanent for this source snapshot; use retry_failed='all' after a source correction.
+# DATE_IN_FUTURE is deliberately excluded: the date gate can open on a later day.
+PERMANENT_FAILURES = frozenset({
+    'SUMMARY_EMPTY',          # The source supplies neither an issue nor a holding.
+    'CASE_OR_COURT_INVALID',  # The stored catalog lacks a usable case number/court.
+    'LIST_DETAIL_MISMATCH',   # The source list and detail disagree on identity/date.
+    'TITLE_MISSING',          # A required source title is absent, not a transport failure.
+    'DATE_FORMAT_INVALID',    # A source date is malformed or not a calendar date.
+    'TRIBUNAL_NUMBER_INVALID',  # The stored tribunal number is absent or malformed.
+})
 SCHEMA = 'precedent-summary-v2'
 PREC_KINDS = {'대법원': {'detail', 'listing'}, '국세법령정보시스템': {'listing'}}
 # 국세법령정보시스템 rows put the court into the number: '대법원-2025-두-34754',
@@ -449,7 +459,19 @@ def store_entry(client, out, entry, date, check_budget=lambda: None):
     return raw
 
 
-def collect(client, out, date, scope='all', stop=None, account=None, clock=time.monotonic):
+def collect(client, out, date, scope='all', stop=None, account=None, clock=time.monotonic,
+            retry_failed='transient', skipped_failures=None):
+    """Resume one pass; report skipped permanent failures separately from the manifest.
+
+    skipped_failures, when supplied, is a per-call reason/count dict, not an account
+    callback or a completion result. 'all' refreshes failed details even if cached;
+    'none' leaves every FAILED entry untouched. SUCCESS/SKIPPED always stay cached.
+    """
+    if retry_failed not in ('transient', 'all', 'none'):
+        raise ValueError('RETRY_FAILED_INVALID')
+    if skipped_failures is None:
+        skipped_failures = {}
+    skipped_failures.clear()
     if scope not in ('tax', 'all'):
         raise ValueError('SCOPE_INVALID')
     out = Path(out)
@@ -532,9 +554,17 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
             target, sid = entry['target'], entry['id']
             if entry['status'] in ('SUCCESS', 'SKIPPED'):
                 continue
+            failed = entry['status'] == 'FAILED'
+            permanent = failed and entry.get('reason') in PERMANENT_FAILURES
+            if failed and (retry_failed == 'none' or (retry_failed == 'transient' and permanent)):
+                if permanent:
+                    reason = entry['reason']
+                    skipped_failures[reason] = skipped_failures.get(reason, 0) + 1
+                continue
             try:
-                raw = (store_entry(client, out, entry, date, check_budget) if 'sha256' not in entry
-                       else (out / entry['path']).read_bytes())
+                refresh = failed and retry_failed == 'all'
+                raw = (store_entry(client, out, entry, date, check_budget)
+                       if refresh or 'sha256' not in entry else (out / entry['path']).read_bytes())
                 result = validated(entry['row'], strict_json(raw), target, entry['kind'])
                 entry.update(status='SUCCESS')
                 entry.pop('reason', None)
