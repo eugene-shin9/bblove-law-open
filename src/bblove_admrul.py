@@ -151,26 +151,70 @@ def catalog(client, out, date):
 
 
 class BodyHTML(HTMLParser):
-    """Convert textual HTML to lines; attachments/scripts never become invented text."""
+    """Extract text, replacing images and discarding active/embedded subtrees.
+
+    Attributes are never copied except a plain image alt label. Counts describe
+    parsed img/script start tags (including those inside discarded subtrees);
+    script/style raw text is not reparsed as markup.
+    """
+    DROP = {'script', 'style', 'iframe', 'object'}
+    # Keep subtree handling identical across Python parser releases/backports.
+    CDATA_CONTENT_ELEMENTS = ('script', 'style')
+
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.parts = []
+        self.suppressed = []
+        self.has_text = False
+        self.images_removed = 0
+        self.scripts_removed = 0
 
     def handle_starttag(self, tag, attrs):
-        if tag in {'script', 'style', 'iframe', 'img', 'object'}:
-            raise ValueError('ADMRUL_UNSUPPORTED_BODY_HTML')
-        if tag in {'p', 'div', 'br', 'tr', 'li', 'td', 'th'}:
+        if tag == 'img':
+            self.images_removed += 1
+        if tag == 'script':
+            self.scripts_removed += 1
+        if tag in self.DROP:
+            if not self.suppressed:
+                self.parts.append(' ')
+            self.suppressed.append(tag)
+            return
+        if self.suppressed:
+            return
+        if tag == 'img':
+            alt = dict(attrs).get('alt') or ''
+            # Alt is plain text, never retained HTML or executable URL content.
+            alt = re.sub(r'<[^>]*>', '', alt)
+            alt = re.sub(r'javascript:[^\s]*', '', alt, flags=re.I)
+            alt = ' '.join(alt.split())
+            self.parts.append(f'[이미지: {alt}]' if alt else '[이미지]')
+        elif tag in {'p', 'div', 'br', 'tr', 'li', 'td', 'th'}:
             self.parts.append('\n')
 
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+        # HTMLParser otherwise stays in raw-text mode after <script/>/<style/>.
+        if tag in {'script', 'style'}:
+            self.clear_cdata_mode()
+
     def handle_endtag(self, tag):
+        if self.suppressed:
+            if tag == self.suppressed[-1]:
+                self.suppressed.pop()
+                if not self.suppressed:
+                    self.parts.append(' ')
+            return
         if tag in {'p', 'div', 'tr', 'li'}:
             self.parts.append('\n')
 
     def handle_data(self, value):
-        self.parts.append(value)
+        if not self.suppressed:
+            self.parts.append(value)
+            self.has_text = self.has_text or bool(value.strip())
 
 
-def body_text(value):
+def body_text(value, removals=None):
     if isinstance(value, list) and all(isinstance(v, str) for v in value):
         value = '\n'.join(value)
     if not isinstance(value, str):
@@ -179,14 +223,18 @@ def body_text(value):
         parser = BodyHTML()
         parser.feed(value)
         parser.close()
-        value = ''.join(parser.parts)
+        if removals is not None:
+            for key in ('images_removed', 'scripts_removed'):
+                removals[key] = removals.get(key, 0) + getattr(parser, key)
+        value = ''.join(parser.parts) if parser.has_text else ''
+    # Keep the existing non-whitespace threshold; image labels alone are not body text.
     if not value.strip():
         raise ValueError('ADMRUL_BODY_MISSING')
     return value.strip()
 
 
-def article_rows(value):
-    body = body_text(value)
+def article_rows(value, removals=None):
+    body = body_text(value, removals)
     matches = list(re.finditer(r'(?m)^\s*(제\d+조(?:의\d+)?)(?:\s*\(([^)\n]*)\))?', body))
     if not matches:
         return [[f'문단{i}', '', p.strip()] for i, p in enumerate(re.split(r'\n+', body), 1) if p.strip()]
@@ -201,7 +249,7 @@ def article_rows(value):
     return out
 
 
-def validate_raw(raw, row, date, credential=''):
+def validate_raw(raw, row, date, credential='', removals=None):
     doc = safe_raw(raw, credential)
     service = doc.get('AdmRulService') if isinstance(doc, dict) else None
     if not isinstance(service, dict):
@@ -217,12 +265,12 @@ def validate_raw(raw, row, date, credential=''):
         raise ValueError('ADMRUL_ORG_CODE_MISMATCH')
     # Guide declares 조문내용, not the normal law's 조문/조문단위 envelope.
     # No guessed dictionary flattening: a different JSON nesting must be reviewed.
-    articles = article_rows(service.get('조문내용'))
+    articles = article_rows(service.get('조문내용'), removals)
     if service.get('부칙'):
         value = service['부칙']
         if isinstance(value, dict):
             value = value.get('부칙내용')
-        articles.append(['부칙', '', body_text(value)])
+        articles.append(['부칙', '', body_text(value, removals)])
     return actual, articles
 
 
@@ -237,7 +285,7 @@ def collect(client, out, date):
     path = out / 'manifest.json'
     previous = strict_json(path.read_bytes()) if path.exists() else {}
     old = {e['id']: e for e in previous.get('documents', [])}
-    manifest = {'schema': 1, 'policy': POLICY, 'date': date, 'status': 'INCOMPLETE',
+    manifest = {'schema': 2, 'policy': POLICY, 'date': date, 'status': 'INCOMPLETE',
                 'started_at': stamp(), 'documents': [], 'excluded': [], 'api_calls': 0}
     try:
         rows = catalog(client, out, date)
@@ -254,6 +302,7 @@ def collect(client, out, date):
     for row in rows:
         entry = {'id': row['행정규칙ID'], 'mst': row['행정규칙일련번호'],
                  'title': row['행정규칙명'], 'row': row, 'status': 'PENDING',
+                 'images_removed': 0, 'scripts_removed': 0,
                  'path': f"raw/{row['행정규칙ID']}/{row['행정규칙일련번호']}.json"}
         reason = exclusion(row)
         if reason:
@@ -280,7 +329,7 @@ def collect(client, out, date):
             target.write_bytes(raw)  # safe exact original, even when semantic validation fails
             entry.update(sha256=hashlib.sha256(raw).hexdigest(), reused=reuse,
                          collected_at=cached.get('collected_at', stamp()) if reuse else stamp())
-            _, arts = validate_raw(raw, entry['row'], date, getattr(client, 'credential', ''))
+            _, arts = validate_raw(raw, entry['row'], date, getattr(client, 'credential', ''), entry)
             entry.update(status='SUCCESS', articles=len(arts))
         except Exception as exc:
             reason = code(exc, 'ADMRUL_DETAIL_FAILED')

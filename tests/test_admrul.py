@@ -305,6 +305,80 @@ class AdminRules(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'DUPLICATE_ARTICLE'):A.article_rows('제1조(목적) 하나\n제1조(목적) 둘')
 
 
+    def test_mixed_html_succeeds_with_image_markers_and_removal_receipts(self):
+        r = row()
+        body = ('<p>제1조(목적) 합성 본문<img src="x" alt="합성 도표">'
+                '<img src="y"/></p><script>hidden_script()</script>'
+                '<style>.hidden_style { color: red; }</style><p>제2조(절차) 합성 절차</p>')
+        d = detail(r, body)
+        d['AdmRulService']['부칙'] = {'부칙내용':
+            '<p>합성 부칙<img alt="부칙 도표"></p><script>hidden_supplement()</script>'}
+        client, manifest = self.collected(Fake(details={r['행정규칙일련번호']: d}))
+        self.assertEqual(manifest['schema'], 2)
+        entry = manifest['documents'][0]
+        self.assertEqual((entry['status'], entry['images_removed'], entry['scripts_removed']),
+                         ('SUCCESS', 3, 2))
+        self.assertEqual((self.raw / entry['path']).read_bytes(), A.encode(d))
+        A.build(self.raw, self.dest)
+        asset = json.loads((self.dest / f"admrul/docs/{entry['mst']}.json").read_bytes())[0]
+        rendered = '\n'.join(a[2] for a in asset['a'])
+        self.assertIn('[이미지: 합성 도표][이미지]', rendered)
+        self.assertIn('[이미지: 부칙 도표]', rendered)
+        self.assertNotIn('hidden_', rendered)
+        self.assertNotIn('<', rendered)
+        # A v1 checkpoint has no counters; replay must calculate them from exact originals.
+        manifest['schema'] = 1
+        for e in manifest['documents']:
+            e.pop('images_removed')
+            e.pop('scripts_removed')
+        A.save(self.raw / 'manifest.json', manifest)
+        replay, updated = self.collected(Fake(stop_after=0))
+        self.assertEqual(replay.calls, 0)
+        self.assertEqual(updated['documents'][0]['images_removed'], 3)
+        self.assertEqual(updated['documents'][0]['scripts_removed'], 2)
+        self.assertEqual(updated['documents'][1]['scripts_removed'], 0)
+
+    def test_script_only_body_fails_with_existing_code_and_counts(self):
+        r = row()
+        d = detail(r, '<script>synthetic_only()</script><style>p{display:none}</style>')
+        _, manifest = self.collected(Fake(details={r['행정규칙일련번호']: d}))
+        entry = manifest['documents'][0]
+        self.assertEqual(entry['status'], 'FAILED')
+        self.assertEqual(entry['reason'], 'ADMRUL_BODY_MISSING')
+        self.assertEqual((entry['images_removed'], entry['scripts_removed']), (0, 1))
+        failures = json.loads((self.raw / 'collection-failures.json').read_bytes())
+        self.assertEqual(failures[0]['reason'], 'ADMRUL_BODY_MISSING')
+        for body in ('<img alt="합성 도표">', '<style>hidden</style>', '  '):
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, 'ADMRUL_BODY_MISSING'):
+                A.body_text(body)
+
+    def test_link_and_event_attributes_never_become_body(self):
+        body = ('<p onclick="hidden_event()"><a href="javascript:hidden_link()" '
+                'onmouseover="hidden_hover()">합성 링크 본문</a>'
+                '<img src="javascript:hidden_image()" onerror="hidden_error()" alt="합성 도표"></p>')
+        self.assertEqual(A.body_text(body), '합성 링크 본문[이미지: 합성 도표]')
+        # Entity-encoded/mixed-case attributes remain attributes, never text.
+        self.assertEqual(A.body_text('<A HREF="java&#115;cript:hidden()" ONCLICK="hidden()">합성</A>'),
+                         '합성')
+        self.assertEqual(A.body_text('가<img alt="javascript:hidden()">나'), '가[이미지]나')
+
+    def test_embedded_subtrees_nested_self_closing_and_unclosed(self):
+        for hidden in (
+                '<iframe>hidden<iframe>nested</iframe>hidden</iframe>',
+                '<object><p>hidden</p><object>nested</object></object>',
+                '<object><script>hidden()</script><img alt="hidden"></object>',
+                '<script/>', '<style/>', '<iframe/>', '<object/>'):
+            with self.subTest(hidden=hidden):
+                stats = {}
+                rendered = A.body_text('합성 앞' + hidden + '합성 뒤', stats)
+                self.assertEqual(' '.join(rendered.split()), '합성 앞 합성 뒤')
+                self.assertEqual(stats['scripts_removed'], int('script' in hidden))
+                self.assertEqual(stats['images_removed'], int('<img' in hidden))
+        self.assertEqual(A.body_text('합성 앞<object>hidden'), '합성 앞')
+        # A mismatched close must not expose content of an unclosed nested subtree.
+        self.assertEqual(A.body_text('합성 앞<object><iframe>hidden</object>hidden'), '합성 앞')
+        self.assertEqual(A.body_text(['<p>가</p>', '<p>나</p>']), '가\n\n\n나')
+
     def test_asset_verifier_rejects_tampering_extras_oversize_and_meta_is_atomic(self):
         self.assets()
         path=next((self.dest/'admrul/docs').glob('*.json'))
