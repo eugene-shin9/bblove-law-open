@@ -72,50 +72,72 @@ jobs:
         with:
           path: auto/precedent-collection
           key: precedent-summary-v2-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Decide whether this collection is already published
+      - name: Which finished catalogs could be published early (no network, no copy)
+        id: finished
+        if: steps.collect.outcome == 'success' && steps.collect.outputs.complete != 'true'
+        run: python -I scripts/collect_precedents.py --out auto/precedent-collection --finished-targets
+      - name: Decide what to publish and whether it is already published
         id: tag
-        if: steps.collect.outputs.complete == 'true'
+        if: steps.collect.outputs.complete == 'true' || steps.finished.outputs.partial_targets != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          COMPLETE: ${{ steps.collect.outputs.complete }}
+          PARTIAL: ${{ steps.finished.outputs.partial_targets }}
         run: |
           date=$(python3 -c "import json;print(json.load(open('auto/precedent-collection/manifest.json'))['date'])")
-          tag="prec-${date}"
+          if [ "$COMPLETE" = "true" ]; then
+            tag="prec-${date}"; src="auto"; title="판례·국세청 해석·조세심판원 요지 수집본 ($tag)"
+          else
+            # Finished catalogs first (e.g. prec-20261030-partial-prec); the final prec-<date> supersedes them.
+            tag="prec-${date}-partial-$(echo "$PARTIAL" | tr ',' '-')"; src="auto/precedent-export"
+            title="요지 수집본 중간 게시 (부분: $PARTIAL) ($tag)"
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "src=$src" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
           if gh release view "$tag" >/dev/null 2>&1; then echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Export the finished catalogs (only when they are not published yet)
+        id: export
+        if: steps.tag.outputs.tag != '' && steps.tag.outputs.exists == 'false' && steps.collect.outputs.complete != 'true'
+        run: |
+          python -I scripts/collect_precedents.py --out auto/precedent-collection --export-complete auto/precedent-export
+          [ -f auto/precedent-export/precedent-collection/manifest.json ] || { echo "::error title=EXPORT_VERIFY_FAILED::partial export did not verify; nothing published"; exit 1; }
       - name: Package collection in parts under 2 GiB, with release-info
-        if: steps.collect.outputs.complete == 'true' && steps.tag.outputs.exists == 'false'
+        if: steps.tag.outputs.tag != '' && steps.tag.outputs.exists == 'false'
         run: |
           mkdir -p release
-          tar -C auto -czf - precedent-collection | split -b 1900m -d -a 2 - release/precedent-collection.tar.gz.part-
-          cp auto/precedent-collection/manifest.json release/precedent-manifest.json
-          python3 - <<'PY'
+          src="${{ steps.tag.outputs.src }}"
+          tar -C "$src" -czf - precedent-collection | split -b 1900m -d -a 2 - release/precedent-collection.tar.gz.part-
+          cp "$src/precedent-collection/manifest.json" release/precedent-manifest.json
+          python3 - "$src/precedent-collection" <<'PY'
           import json, sys
           sys.path.insert(0, 'scripts')
           from collect_precedents import summary
-          json.dump({'outcome': '${{ steps.collect.outputs.outcome }}', **summary('auto/precedent-collection')},
+          json.dump({'outcome': '${{ steps.collect.outputs.outcome }}', **summary(sys.argv[1])},
                     open('release/precedent-summary.json', 'w'), ensure_ascii=False, indent=2)
           PY
-          python -I scripts/release_info.py --release release --manifest auto/precedent-collection/manifest.json --kind precedent-summary-raw
+          python -I scripts/release_info.py --release release --manifest "$src/precedent-collection/manifest.json" --kind precedent-summary-raw
           (cd release && sha256sum -- * > SHA256SUMS)
       - name: Credential scan of the release payload
-        if: steps.collect.outputs.complete == 'true' && steps.tag.outputs.exists == 'false'
+        if: steps.tag.outputs.tag != '' && steps.tag.outputs.exists == 'false'
         env:
           LAW_OC: ${{ secrets.LAW_OC }}
-        run: python -I scripts/secret_scan.py release/precedent-manifest.json release/precedent-summary.json release/release-info.json auto/precedent-collection
+        run: python -I scripts/secret_scan.py release/precedent-manifest.json release/precedent-summary.json release/release-info.json "${{ steps.tag.outputs.src }}/precedent-collection"
       - name: Build provenance attestation
-        if: steps.collect.outputs.complete == 'true' && steps.tag.outputs.exists == 'false'
+        if: steps.tag.outputs.tag != '' && steps.tag.outputs.exists == 'false'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: release/*
       - name: Publish an immutable release (draft until every file is uploaded)
-        if: steps.collect.outputs.complete == 'true' && steps.tag.outputs.exists == 'false'
+        if: steps.tag.outputs.tag != '' && steps.tag.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
+          TITLE: ${{ steps.tag.outputs.title }}
         run: |
           gh release create "$TAG" --draft --target "$GITHUB_SHA" --latest=false \
-            --title "판례·국세청 해석·조세심판원 요지 수집본 ($TAG)" \
-            --notes "law.go.kr DRF 요지 수집본(전문 미포함). 조각 파일을 이어 붙여 풀고(cat part-* | tar -xz), release-info.json·SHA256SUMS·attestation으로 검증."
+            --title "$TITLE" \
+            --notes "law.go.kr DRF 요지 수집본(전문 미포함). 태그에 -partial-이 있으면 먼저 끝난 분류(manifest의 partial_targets)만 담은 중간 게시본. 조각 파일을 이어 붙여 풀고(cat part-* | tar -xz), release-info.json·SHA256SUMS·attestation으로 검증."
           gh release upload "$TAG" release/*
           gh release edit "$TAG" --draft=false --latest=false
           echo "Published $TAG" >> "$GITHUB_STEP_SUMMARY"

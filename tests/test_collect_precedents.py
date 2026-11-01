@@ -12,7 +12,9 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 sys.path.insert(0, str(ROOT / 'src'))
 sys.path.insert(0, str(ROOT / 'tests'))
 import collect_precedents as cp
-from test_precedent_d1 import FakeClient, DATE
+from test_precedent_d1 import FakeClient, DATE, TT_ROW
+from bblove_precedent_collect import collect, verify_cache
+from bblove_storage import strict_json
 
 
 class Clock:
@@ -121,7 +123,7 @@ class LoopTests(unittest.TestCase):
             with patch.dict(os.environ, {'GITHUB_OUTPUT': str(target)}):
                 cp.write_outputs('PASS_DONE')
                 cp.write_outputs('PAUSED')
-            self.assertEqual(target.read_text(), 'outcome=PASS_DONE\ncomplete=true\noutcome=PAUSED\ncomplete=false\n')
+            self.assertEqual(target.read_text(), 'outcome=PASS_DONE\ncomplete=true\npartial_targets=\noutcome=PAUSED\ncomplete=false\npartial_targets=\n')
 
 
 if __name__ == '__main__':
@@ -178,3 +180,103 @@ class PacingTests(unittest.TestCase):
         self.assertEqual(Client('x').interval, .3)
         self.assertEqual(Client('x', interval=1.0).interval, 1.0)
         self.assertEqual(Client('x', interval=.01).interval, .3)
+
+
+class PartialExportTests(unittest.TestCase):
+    """Finished catalogs of an unfinished collection are exported for early publication."""
+
+    def paused_collection(self, out):
+        # prec (2 details) finishes; the tribunal catalog is listed but its detail hits the budget.
+        client = FakeClient(count=2, tt_rows=[TT_ROW], budget_at=3)
+        collect(client, out, DATE, stop=lambda: None)
+        m = json.loads(Path(out, 'manifest.json').read_text())
+        self.assertEqual(cp.finished_targets(m), ['prec', 'ntsCgmExpc'])
+        return m
+
+    def test_export_keeps_only_finished_catalogs_and_verifies(self):
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as d:
+            self.paused_collection(t)
+            self.assertEqual(cp.export_complete(t, d), ['prec', 'ntsCgmExpc'])
+            export = Path(d, 'precedent-collection')
+            m = strict_json((export / 'manifest.json').read_bytes())
+            self.assertEqual(m['partial_targets'], ['prec', 'ntsCgmExpc'])
+            self.assertEqual(set(m['catalogs']), {'prec', 'ntsCgmExpc'})
+            self.assertEqual(m['status'], 'COMPLETE')
+            self.assertNotIn('stop_reason', m)
+            self.assertTrue(all(d['target'] in ('prec', 'ntsCgmExpc') for d in m['documents']))
+            self.assertFalse((export / 'pages/ttSpecialDecc').exists())
+            verify_cache(export, m)  # inventory matches the exported manifest exactly
+            self.assertEqual(cp.outcome(export), 'COMPLETE')
+            # Re-export replaces a stale export directory.
+            (export / 'stale.json').write_text('{}')
+            cp.export_complete(t, d)
+            self.assertFalse((export / 'stale.json').exists())
+
+    def test_export_is_empty_when_nothing_or_everything_is_finished(self):
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as d:
+            self.assertEqual(cp.export_complete(t, d), [])  # no manifest yet
+            collect(FakeClient(count=1, tt_rows=[TT_ROW], budget_at=1), t, DATE, stop=lambda: None)  # all PENDING
+            self.assertEqual(cp.export_complete(t, d), [])
+            self.assertTrue(collect(FakeClient(count=1, tt_rows=[TT_ROW]), t, DATE))  # everything finished → whole collection
+            self.assertEqual(cp.export_complete(t, d), [])
+            self.assertFalse(Path(d, 'precedent-collection').exists())
+
+    def test_loader_resumes_partial_export_without_paging_missing_catalogs(self):
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as d:
+            self.paused_collection(t)
+            cp.export_complete(t, d)
+            export = Path(d, 'precedent-collection')
+            client = FakeClient(count=2, tt_rows=[TT_ROW])
+            self.assertTrue(collect(client, export, DATE))
+            self.assertEqual(client.calls, 0)  # nothing listed or fetched: no tribunal paging
+            m = strict_json((export / 'manifest.json').read_bytes())
+            self.assertEqual(set(m['catalogs']), {'prec', 'ntsCgmExpc'})
+
+    def test_unknown_partial_target_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertTrue(collect(FakeClient(count=1), t, DATE))
+            m = json.loads(Path(t, 'manifest.json').read_text())
+            m['partial_targets'] = ['prec', 'bogus']
+            Path(t, 'manifest.json').write_text(json.dumps(m, ensure_ascii=False))
+            self.assertFalse(collect(FakeClient(count=1), t, DATE))
+            self.assertTrue(Path(t, 'attempt.json').exists())
+
+    def test_finished_targets_cli_is_empty_when_whole_collection_is_done(self):
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as d:
+            target = Path(d) / 'out.txt'
+            self.assertTrue(collect(FakeClient(count=1, tt_rows=[TT_ROW]), t, DATE))
+            with patch.dict(os.environ, {'GITHUB_OUTPUT': str(target)}), \
+                    patch('sys.argv', ['collect_precedents.py', '--out', t, '--finished-targets']):
+                self.assertEqual(cp.main(), 0)
+            self.assertIn('complete=true\npartial_targets=\n', target.read_text())
+            t2 = Path(d, 'paused')
+            t2.mkdir()
+            self.paused_collection(t2)  # tribunal row pending → prec,nts exportable
+            target.write_text('')
+            with patch.dict(os.environ, {'GITHUB_OUTPUT': str(target)}), \
+                    patch('sys.argv', ['collect_precedents.py', '--out', str(t2), '--finished-targets']):
+                self.assertEqual(cp.main(), 0)
+            self.assertIn('complete=false\npartial_targets=prec,ntsCgmExpc\n', target.read_text())
+            self.assertFalse(Path(d, 'precedent-collection').exists())  # nothing copied
+
+    def test_export_verifies_itself_and_summary_marks_partial(self):
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as d:
+            self.paused_collection(t)
+            cp.export_complete(t, d)
+            self.assertEqual(cp.summary(Path(d, 'precedent-collection'))['partial_targets'], ['prec', 'ntsCgmExpc'])
+            self.assertNotIn('partial_targets', cp.summary(t))
+            # A corrupted source summary makes the export fail its own verification and leaves nothing behind.
+            victim = next(Path(t, 'summaries/prec').glob('*.json'))
+            victim.write_bytes(victim.read_bytes() + b' ')
+            self.assertEqual(cp.export_complete(t, d), [])
+            self.assertFalse(Path(d, 'precedent-collection').exists())
+
+    def test_export_cli_writes_step_outputs(self):
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as d:
+            self.paused_collection(t)
+            target = Path(d) / 'out.txt'
+            with patch.dict(os.environ, {'GITHUB_OUTPUT': str(target)}), \
+                    patch('sys.argv', ['collect_precedents.py', '--out', t, '--export-complete', str(Path(d, 'x'))]):
+                self.assertEqual(cp.main(), 0)
+            self.assertIn('partial_targets=prec,ntsCgmExpc\n', target.read_text())
+            self.assertIn('complete=false\n', target.read_text())
