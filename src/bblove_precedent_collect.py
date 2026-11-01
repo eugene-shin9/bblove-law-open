@@ -305,6 +305,12 @@ def verify_cache(out, manifest):
     """Check the entire inventory before any network request or SQL build."""
     if manifest.get('schema') != SCHEMA:
         raise ValueError('MANIFEST_SCHEMA_INVALID')
+    partial = manifest.get('partial_targets')
+    if partial is not None and (
+            not isinstance(partial, list) or not partial or len(set(partial)) != len(partial)
+            or not set(partial) < set(TARGETS) or set(manifest.get('catalogs', {})) != set(partial)
+            or any(d.get('target') not in partial for d in manifest.get('documents', []))):
+        raise ValueError('MANIFEST_SCHEMA_INVALID')
     expected, seen = set(), set()
     for item in manifest.get('pages', []) + manifest.get('documents', []):
         if 'sha256' not in item:
@@ -469,7 +475,8 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
             reason = stop() if stop else None
             if reason:
                 raise CollectionPaused(reason)
-        for target in TARGETS:
+        # A partial public export lists its catalogs in partial_targets; the rest are never paged here.
+        for target in tuple(manifest.get('partial_targets') or TARGETS):
             state = manifest['catalogs'].setdefault(target, {'next_page': 1, 'complete': False})
             known = {e['id'] for e in manifest['documents'] if e['target'] == target}
             while not state['complete']:

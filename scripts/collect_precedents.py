@@ -16,13 +16,14 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from bblove_law_all import Client, today  # noqa: E402
-from bblove_precedent_collect import collect  # noqa: E402
+from bblove_precedent_collect import collect, verify_cache  # noqa: E402
 
 MIN_SLICE = 120  # do not start a new Client with less than two minutes left
 # The live catalog can change while it is being paged (new decisions are listed first by default).
@@ -93,11 +94,65 @@ def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect
             return state
 
 
-def write_outputs(state):
+def write_outputs(state, partial_targets=()):
     target = os.environ.get('GITHUB_OUTPUT')
     if target:
         with open(target, 'a', encoding='utf-8') as fh:
             fh.write(f'outcome={state}\ncomplete={"true" if state in ("COMPLETE", "PASS_DONE") else "false"}\n')
+            fh.write(f'partial_targets={",".join(partial_targets)}\n')
+
+
+def finished_targets(manifest):
+    """Catalogs that are fully listed and have no PENDING document, in TARGET_ORDER."""
+    catalogs = manifest.get('catalogs', {})
+    pending = {d.get('target') for d in manifest.get('documents', []) if d.get('status') == 'PENDING'}
+    return [t for t in TARGET_ORDER if catalogs.get(t, {}).get('complete') and t not in pending]
+
+
+def export_complete(out, dest):
+    """Copy the finished catalogs of an unfinished collection into dest/precedent-collection.
+
+    Returns the exported targets ([] when nothing is finished or everything is, in which case the
+    whole collection is published instead). The exported manifest keeps the cache schema, lists
+    only the exported catalogs, pages and documents, and records them in `partial_targets` so a
+    consumer never pages the missing catalogs itself.
+    """
+    out, dest = Path(out), Path(dest)
+    path = out / 'manifest.json'
+    if not path.exists():
+        return []
+    m = json.loads(path.read_text(encoding='utf-8'))
+    targets = finished_targets(m)
+    if not targets or len(targets) == len(TARGET_ORDER):
+        return []
+    keep = set(targets)
+    export = dest / 'precedent-collection'
+    if export.exists():
+        shutil.rmtree(export)
+    export.mkdir(parents=True)
+    pages = [p for p in m.get('pages', []) if p.get('target') in keep]
+    docs = [d for d in m.get('documents', []) if d.get('target') in keep]
+    for item in pages + docs:
+        if 'sha256' not in item:
+            continue
+        src = out / item['path']
+        target_file = export / item['path']
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, target_file)
+    exported = dict(m)
+    exported.update(
+        catalogs={t: m['catalogs'][t] for t in targets}, pages=pages, documents=docs, partial_targets=targets,
+        status='COMPLETE' if all(d.get('status') in ('SUCCESS', 'SKIPPED') for d in docs) else 'INCOMPLETE')
+    exported.pop('stop_reason', None)
+    (export / 'manifest.json').write_text(json.dumps(exported, ensure_ascii=False, indent=2), encoding='utf-8')
+    try:
+        verify_cache(export, exported)  # the export must pass the same checks a consumer applies
+    except Exception as exc:
+        shutil.rmtree(export)
+        print(f'EXPORT_VERIFY_FAILED {exc}' if str(exc) in ('MANIFEST_SCHEMA_INVALID',) or str(exc).startswith('CACHE_')
+              else 'EXPORT_VERIFY_FAILED')
+        return []
+    return targets
 
 
 def summary(out):
@@ -114,6 +169,7 @@ def summary(out):
             reason = f"{d.get('target')}:{d.get('reason')}"
             failures[reason] = failures.get(reason, 0) + 1
     return {'date': m.get('date'), 'status': m.get('status'), 'stop_reason': m.get('stop_reason'),
+            **({'partial_targets': m['partial_targets']} if m.get('partial_targets') else {}),
             'catalogs': {t: {k: c.get(k) for k in ('total', 'complete')} for t, c in m.get('catalogs', {}).items()},
             'counts': counts, 'failure_reasons': failures}
 
@@ -125,7 +181,24 @@ def main():
     ap.add_argument('--seconds', type=float, default=18000)
     ap.add_argument('--interval', type=float, default=1.0,
                     help='seconds between requests (sequential collector; >= 0.3)')
+    ap.add_argument('--export-complete', type=Path, default=None,
+                    help='no collection: copy the finished catalogs of --out here and print them')
+    ap.add_argument('--finished-targets', action='store_true',
+                    help='no collection: only write/print which catalogs of --out could be exported')
     args = ap.parse_args()
+    if args.finished_targets:
+        path = args.out / 'manifest.json'
+        m = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+        targets = finished_targets(m)
+        targets = [] if len(targets) == len(TARGET_ORDER) else targets
+        write_outputs(outcome(args.out), targets)
+        print(json.dumps({'partial_targets': targets}, ensure_ascii=False))
+        return 0
+    if args.export_complete is not None:
+        targets = export_complete(args.out, args.export_complete)
+        write_outputs(outcome(args.out), targets)
+        print(json.dumps({'partial_targets': targets}, ensure_ascii=False))
+        return 0
     credential = os.environ.get('LAW_OC', '')
     if not credential:
         print('LAW_OC_NOT_AVAILABLE')
