@@ -289,3 +289,46 @@ class SummaryMigrationPublicationTests(unittest.TestCase):
         self.assertTrue(cp.should_publish(m))
         m['date'] = '20261103'
         self.assertFalse(cp.should_publish(m))
+
+
+class PublicationCoverageTests(unittest.TestCase):
+    def row(self, tag, draft=False):
+        return {'tagName': tag, 'isDraft': draft}
+
+    def test_full_release_blocks_f2_reproduction(self):
+        rows = [self.row('prec-20261101')]
+        self.assertEqual(cp.published_targets(rows), set(cp.TARGET_ORDER))
+        self.assertFalse(cp.may_publish_partial(['prec'], rows))
+
+    def test_union_not_largest_partial_and_drafts_ignored(self):
+        rows = [self.row('prec-20261101-partial-prec'), self.row('prec-20261102-partial-ntsCgmExpc')]
+        self.assertFalse(cp.may_publish_partial(['prec'], rows))
+        self.assertTrue(cp.may_publish_partial(['prec', 'ntsCgmExpc'], rows))
+        self.assertTrue(cp.may_publish_partial(['prec'], [self.row('prec-20261101', True)]))
+        self.assertTrue(cp.may_publish_partial(['prec'], []))
+        self.assertFalse(cp.may_publish_partial([], []))
+
+    def test_history_errors_are_not_absence(self):
+        import subprocess
+        for rc, out, err in [(1, '[]', ''), (0, '[]', 'warning'), (0, 'not json', ''),
+                             (0, '{}', ''), (0, '[{}]', '')]:
+            with self.subTest(rc=rc, out=out, err=err), self.assertRaises(ValueError):
+                cp.partial_publication_allowed(['prec'], lambda *a, **kw: subprocess.CompletedProcess(a, rc, out, err))
+        self.assertTrue(cp.partial_publication_allowed(['prec'], lambda *a, **kw: subprocess.CompletedProcess(a, 0, '[]', '')))
+        with self.assertRaisesRegex(ValueError, 'TRUNCATED'):
+            cp.partial_publication_allowed(['prec'], lambda *a, **kw: subprocess.CompletedProcess(
+                a, 0, json.dumps([self.row('law-20261101')] * cp.RELEASE_HISTORY_LIMIT), ''))
+
+    def test_workflow_calls_guard_and_cli_failure_is_error(self):
+        from contextlib import redirect_stdout
+        import io
+        text = (ROOT/'.github/workflows/collect-precedents.yml').read_text()
+        self.assertIn('if ! publish=$(python3 scripts/collect_precedents.py --may-publish-partial "$PARTIAL"); then', text)
+        self.assertNotIn('max_by(length)', text)
+        self.assertIn('::error::PARTIAL_RELEASE_HISTORY_FAILED', text)
+        out = io.StringIO()
+        with patch.object(cp, 'partial_publication_allowed', side_effect=ValueError('synthetic')), \
+                patch('sys.argv', ['collect_precedents.py', '--may-publish-partial', 'prec']), redirect_stdout(out):
+            self.assertEqual(cp.main(), 1)
+        self.assertIn('::error::', out.getvalue())
+        self.assertNotIn('true', out.getvalue())
