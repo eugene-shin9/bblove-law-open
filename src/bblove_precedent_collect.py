@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import re
 import time
+import tempfile
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
 
 from bblove_law_all import Client, save, stamp, today
@@ -392,6 +393,9 @@ def verify_cache(out, manifest):
                     (number and overlap is not None and snapshot['next_page'] == overlap + 2)):
                 raise ValueError('CACHE_CATALOG_TOTAL_MISMATCH')
     for e in manifest.get('documents', []):
+        if (type(e.get('attempts', 0)) is not int or e.get('attempts', 0) < 0
+                or type(e.get('frozen', False)) is not bool):
+            raise ValueError('MANIFEST_SCHEMA_INVALID')
         key = (e['target'], e['id'])
         if (key in seen or identifier(e['row'], e['target']) != e['id']
                 or listed_rows.get(key) != e['row']):
@@ -496,18 +500,75 @@ def store_entry(client, out, entry, date, check_budget=lambda: None):
     return raw
 
 
+TRANSIENT_RETRY_LIMIT = 500
+MAX_TRANSIENT_ATTEMPTS = 3
+
+
+def recover_transient(client, out, manifest, date, check_budget, checkpoint, limit):
+    """One bounded durable queue per discovery round; failed cached bytes remain untouched."""
+    inc = manifest['incremental']
+    recovery = inc.get('recovery')
+    if recovery is None:
+        eligible = []
+        for entry in manifest['documents']:
+            if (entry['status'] != 'FAILED' or entry.get('reason') in PERMANENT_FAILURES
+                    or entry.get('frozen') or entry.get('attempts', 0) >= MAX_TRANSIENT_ATTEMPTS):
+                continue
+            if entry.get('reason') == 'DATE_IN_FUTURE' and row_date(entry['row'], entry['target']) > date:
+                continue
+            eligible.append([entry['target'], entry['id']])
+        recovery = dict(queue=eligible[:limit], cursor=0, successes=0, complete=False)
+        inc['recovery'] = recovery
+        checkpoint(force=True)
+    indexed = {(e['target'], e['id']): e for e in manifest['documents']}
+    while recovery['cursor'] < len(recovery['queue']):
+        check_budget()
+        entry = indexed[tuple(recovery['queue'][recovery['cursor']])]
+        if entry['status'] == 'FAILED':
+            candidate = dict(entry)
+            try:
+                # Validate in isolation: a failed refresh must not overwrite the old cache.
+                with tempfile.TemporaryDirectory() as folder:
+                    raw = store_entry(client, Path(folder), candidate, date, check_budget)
+                    validated(candidate['row'], strict_json(raw), candidate['target'], candidate['kind'])
+                candidate['sha256'] = put_bytes(out, candidate['path'], raw)
+                candidate.update(status='SUCCESS')
+                candidate.pop('reason', None)
+                candidate.pop('frozen', None)
+                entry.update(candidate)
+                entry.pop('reason', None)
+                entry.pop('frozen', None)
+                recovery['successes'] += 1
+                manifest['date'] = date
+            except CollectionPaused:
+                raise
+            except Exception as exc:
+                if str(exc) == 'COLLECTION_BUDGET_EXHAUSTED':
+                    raise CollectionPaused('TIME_BUDGET') from None
+                entry['attempts'] = entry.get('attempts', 0) + 1
+                if entry['attempts'] >= MAX_TRANSIENT_ATTEMPTS:
+                    entry['frozen'] = True
+        recovery['cursor'] += 1
+        checkpoint(force=True)
+    recovery['complete'] = True
+    checkpoint(force=True)
+
+
 def collect(client, out, date, scope='all', stop=None, account=None, clock=time.monotonic,
-            retry_failed='transient', skipped_failures=None, incremental=False, min_days=1):
+            retry_failed='transient', skipped_failures=None, incremental=False, min_days=1, transient_limit=TRANSIENT_RETRY_LIMIT):
     """Resume one pass; report skipped permanent failures separately from the manifest.
 
     incremental opts the public producer into daily discovery; consumers keep it off.
     Base catalog totals remain immutable; increments hold each round's total and cursor.
-    Existing FAILED entries are frozen during producer incremental runs.
+    Producer discovery preserves FAILED entries; a bounded recovery queue follows each round.
 
     skipped_failures, when supplied, is a per-call reason/count dict, not an account
     callback or a completion result. 'all' refreshes failed details even if cached;
     'none' leaves every FAILED entry untouched. SUCCESS/SKIPPED always stay cached.
     """
+    requested_retry = retry_failed
+    if type(transient_limit) is not int or transient_limit < 0:
+        raise ValueError('TRANSIENT_LIMIT_INVALID')
     if min_days < 1:
         raise ValueError('MIN_DAYS_INVALID')
     if retry_failed not in ('transient', 'all', 'none'):
@@ -546,7 +607,7 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
                 # Persist the reset first; crash recovery removes the old unrecorded files.
                 checkpoint_now(force=True)
                 discard_unrecorded(out, manifest)
-        if manifest.get('summary_empty_migrated') and incremental:
+        if manifest.get('summary_empty_migrated') and incremental and requested_retry != 'all':
             retry_failed = 'none'
 
         inc = manifest.get('incremental')
@@ -555,6 +616,7 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
                  and not any(e['status'] == 'PENDING' for e in manifest['documents']))
         last_date = manifest.get('last_catalog_date', manifest['date'])
         if (incremental and ready and (not inc or inc.get('complete'))
+                and (not inc or inc.get('recovery', {}).get('complete', True))
                 and (datetime.strptime(date, '%Y%m%d') - datetime.strptime(last_date, '%Y%m%d')).days >= min_days):
             number = (inc['round'] if inc else 0) + 1
             inc = dict(round=number, new_documents=0, per_target={t: 0 for t in TARGETS}, complete=False)
@@ -564,7 +626,7 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
                 c.setdefault('increments', []).append(dict(next_page=1, complete=False))
             checkpoint_now(force=True)
         active_inc = bool(inc and not inc.get('complete'))
-        if incremental and (inc or ready):
+        if incremental and (inc or ready) and requested_retry != 'all':
             retry_failed = 'none'
 
         if account:
@@ -687,6 +749,9 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
         if active_inc:
             manifest['date'] = date
             inc['complete'] = not any(e['status'] == 'PENDING' for e in entries)
+        if (incremental and requested_retry == 'transient' and inc and inc.get('complete')
+                and not any(e['status'] == 'PENDING' for e in entries)):
+            recover_transient(client, out, manifest, date, check_budget, checkpoint_now, transient_limit)
         manifest.update(status='COMPLETE' if all(e['status'] in ('SUCCESS', 'SKIPPED') for e in manifest['documents'])
                         else 'INCOMPLETE', updated_at=stamp(), api_calls=client.calls)
         checkpoint_now(force=True)

@@ -25,7 +25,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from bblove_law_all import Client, today  # noqa: E402
-from bblove_precedent_collect import collect, save_manifest, verify_cache  # noqa: E402
+from bblove_precedent_collect import collect, save_manifest, verify_cache, PERMANENT_FAILURES  # noqa: E402
 
 MIN_SLICE = 120  # do not start a new Client with less than two minutes left
 # The live catalog can change while it is being paged (new decisions are listed first by default).
@@ -43,6 +43,8 @@ def outcome(out):
     docs = m.get('documents', [])
     catalogs_done = bool(m.get('catalogs')) and all(c.get('complete') for c in m['catalogs'].values())
     if m.get('incremental') and not m['incremental'].get('complete'):
+        return 'PAUSED'
+    if m.get('incremental', {}).get('recovery', {}).get('complete') is False:
         return 'PAUSED'
     if m.get('status') == 'COMPLETE' and catalogs_done:
         return 'COMPLETE'
@@ -187,6 +189,15 @@ def export_complete(out, dest):
     return targets
 
 
+def transient_failures(manifest):
+    counts = {}
+    for entry in manifest.get('documents', []):
+        if entry.get('status') == 'FAILED' and entry.get('reason') not in PERMANENT_FAILURES:
+            reason = entry.get('reason', 'UNKNOWN_FAILURE')
+            counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
 def summary(out):
     path = Path(out) / 'manifest.json'
     if not path.exists():
@@ -204,7 +215,7 @@ def summary(out):
             **({'partial_targets': m['partial_targets']} if m.get('partial_targets') else {}),
             'catalogs': {t: {k: c.get(k) for k in ('total', 'complete')} for t, c in m.get('catalogs', {}).items()},
             **({'incremental': m['incremental']} if m.get('incremental') else {}),
-            'counts': counts, 'failure_reasons': failures}
+            'counts': counts, 'failure_reasons': failures, 'transient_failures': transient_failures(m)}
 
 
 RELEASE_HISTORY_LIMIT = 1000
@@ -260,7 +271,7 @@ def should_publish(manifest):
     inc = manifest.get('incremental')
     migrated = (manifest.get('summary_empty_migrated', 0) > 0
                 and manifest.get('summary_empty_completed_date') == manifest.get('date'))
-    return not inc or (inc.get('complete', False) and (inc['new_documents'] > 0 or migrated))
+    return not inc or (inc.get('complete', False) and inc.get('recovery', {}).get('complete', True) and (inc['new_documents'] > 0 or migrated or inc.get('recovery', {}).get('successes', 0) > 0))
 
 
 def main():
@@ -276,7 +287,11 @@ def main():
     ap.add_argument('--finished-targets', action='store_true',
                     help='no collection: only write/print which catalogs of --out could be exported')
     ap.add_argument('--may-publish-partial', help='check release coverage for comma-separated targets; no collection')
+    ap.add_argument('--summary', action='store_true', help='offline manifest summary; no collection')
     args = ap.parse_args()
+    if args.summary:
+        print(json.dumps(summary(args.out), ensure_ascii=False))
+        return 0
     if args.may_publish_partial is not None:
         try:
             print('true' if partial_publication_allowed(args.may_publish_partial.split(',')) else 'false')
