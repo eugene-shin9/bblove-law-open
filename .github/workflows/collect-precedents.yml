@@ -94,6 +94,13 @@ jobs:
             tag="prec-${date}"; src="auto"; title="판례·국세청 해석·조세심판원 요지 수집본 ($tag)"
           else
             # Finished catalogs first (e.g. prec-20261030-partial-prec); the final prec-<date> supersedes them.
+            # Never publish a partial that covers fewer catalogs than one already published: consumers take
+            # the newest release, and a re-collection that reopens a catalog must not shrink what they get.
+            published=$(gh release list --limit 100 --json tagName,isDraft --jq '[.[]|select(.isDraft|not)|.tagName|select(startswith("prec-") and contains("-partial-"))|split("-partial-")[1]|split("-")]|max_by(length)//[]|join(",")')
+            if ! python3 -c "import sys;cur=set(sys.argv[1].split(','));prev=set(filter(None,sys.argv[2].split(',')));sys.exit(0 if prev<=cur else 1)" "$PARTIAL" "$published"; then
+              echo "::notice::PARTIAL_SUBSET_SKIPPED current=$PARTIAL published=$published"
+              exit 0
+            fi
             tag="prec-${date}-partial-$(echo "$PARTIAL" | tr ',' '-')"; src="auto/precedent-export"
             title="요지 수집본 중간 게시 (부분: $PARTIAL) ($tag)"
           fi

@@ -180,7 +180,9 @@ def summary(out):
 
 def should_publish(manifest):
     inc = manifest.get('incremental')
-    return not inc or (inc.get('complete', False) and inc['new_documents'] > 0)
+    migrated = (manifest.get('summary_empty_migrated', 0) > 0
+                and manifest.get('summary_empty_completed_date') == manifest.get('date'))
+    return not inc or (inc.get('complete', False) and (inc['new_documents'] > 0 or migrated))
 
 
 def main():

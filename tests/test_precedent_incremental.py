@@ -50,7 +50,7 @@ class IncrementalTests(unittest.TestCase):
     def test_min_days_and_failed_snapshot_preserved(self):
         with tempfile.TemporaryDirectory() as t:
             out = Path(t)
-            collect(FakeClient(detail={**PREC, '판시사항': '', '판결요지': ''}), out, DATE)
+            collect(FakeClient(detail={**PREC, '사건번호': '2099두999'}), out, DATE)
             client = FakeClient()
             collect(client, out, NEXT, incremental=True, min_days=2)
             self.assertEqual(client.calls, 0)
