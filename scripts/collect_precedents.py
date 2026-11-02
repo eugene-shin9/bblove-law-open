@@ -40,6 +40,8 @@ def outcome(out):
     m = json.loads(path.read_text(encoding='utf-8'))
     docs = m.get('documents', [])
     catalogs_done = bool(m.get('catalogs')) and all(c.get('complete') for c in m['catalogs'].values())
+    if m.get('incremental') and not m['incremental'].get('complete'):
+        return 'PAUSED'
     if m.get('status') == 'COMPLETE' and catalogs_done:
         return 'COMPLETE'
     if m.get('stop_reason') or any(d.get('status') == 'PENDING' for d in docs) or not catalogs_done:
@@ -68,7 +70,7 @@ def reset_catalog(out):
     return target
 
 
-def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect_fn=collect, date=None):
+def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect_fn=collect, date=None, min_days=1):
     out = Path(out)
     deadline = clock() + total_seconds
     stop = lambda: 'TIME_BUDGET' if clock() >= deadline else None  # noqa: E731
@@ -81,7 +83,8 @@ def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect
             return 'PAUSED'
         if attempt.exists():
             attempt.unlink()  # only this invocation's failures count
-        collect_fn(client_factory(remaining), out, date, scope, stop=stop)
+        collect_fn(client_factory(remaining), out, date, scope, stop=stop,
+                   **({'incremental': True, 'min_days': min_days} if collect_fn is collect else {}))
         if attempt.exists():
             reason = json.loads(attempt.read_text(encoding='utf-8')).get('reason')
             if reason in RESETTABLE and resets < MAX_RESETS and reset_catalog(out):
@@ -171,13 +174,20 @@ def summary(out):
     return {'date': m.get('date'), 'status': m.get('status'), 'stop_reason': m.get('stop_reason'),
             **({'partial_targets': m['partial_targets']} if m.get('partial_targets') else {}),
             'catalogs': {t: {k: c.get(k) for k in ('total', 'complete')} for t, c in m.get('catalogs', {}).items()},
+            **({'incremental': m['incremental']} if m.get('incremental') else {}),
             'counts': counts, 'failure_reasons': failures}
+
+
+def should_publish(manifest):
+    inc = manifest.get('incremental')
+    return not inc or (inc.get('complete', False) and inc['new_documents'] > 0)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--out', type=Path, default=Path('auto/precedent-collection'))
     ap.add_argument('--scope', choices=('tax', 'all'), default='all')
+    ap.add_argument('--min-days', type=int, default=1)
     ap.add_argument('--seconds', type=float, default=18000)
     ap.add_argument('--interval', type=float, default=1.0,
                     help='seconds between requests (sequential collector; >= 0.3)')
@@ -205,7 +215,7 @@ def main():
         write_outputs('FAILED')
         return 1
     state = run(args.out, args.scope, args.seconds,
-                lambda remaining: Client(credential, seconds=remaining, interval=args.interval))
+                lambda remaining: Client(credential, seconds=remaining, interval=args.interval), min_days=args.min_days)
     write_outputs(state)
     print(json.dumps({'outcome': state, **summary(args.out)}, ensure_ascii=False))
     return 1 if state == 'FAILED' else 0
