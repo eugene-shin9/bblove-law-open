@@ -80,3 +80,69 @@ class IncrementalTests(unittest.TestCase):
             self.assertFalse(collect(client, out, NEXT, incremental=True))
             self.assertEqual(json.loads((out/'attempt.json').read_text())['reason'], 'CATALOG_COUNT_CHANGED')
             verify_cache(out, json.loads((out/'manifest.json').read_text()))
+
+class IncrementalResetTests(unittest.TestCase):
+    def test_run_recovers_count_change_and_preserves_previous_rounds(self):
+        from collect_precedents import run
+        from test_collect_precedents import Clock
+        with tempfile.TemporaryDirectory() as t:
+            out = Path(t)
+            collect(FakeClient(count=301), out, DATE)
+            collect(grown(), out, NEXT, incremental=True)
+            before = {p: p.read_bytes() for folder in ('pages', 'summaries')
+                      for p in (out / folder).rglob('*.json')}
+            old = json.loads((out / 'manifest.json').read_text())
+            clock = Clock()
+            class Pausing(FakeClient):
+                def get(self, endpoint, params, **kw):
+                    result = super().get(endpoint, params, **kw)
+                    clock.now = 1000
+                    return result
+            client = Pausing(count=301)
+            client.rows = grown().rows
+            self.assertEqual(run(out, 'all', 1000, lambda r: client, clock=clock,
+                                 date='20261017'), 'PAUSED')
+            client = grown()
+            client.rows.insert(0, {**PREC, '판례일련번호': '305', '사건번호': '2099두305'})
+            self.assertEqual(run(out, 'all', 1000, lambda r: client, date='20261017'), 'COMPLETE')
+            m = json.loads((out / 'manifest.json').read_text())
+            verify_cache(out, m)
+            self.assertTrue(any(d['id'] == '305' and d['status'] == 'SUCCESS' for d in m['documents']))
+            self.assertEqual(m['incremental']['new_documents'], 1)
+            self.assertEqual({p: p.read_bytes() for p in before}, before)
+            for target, catalog in old['catalogs'].items():
+                self.assertEqual({k: v for k, v in m['catalogs'][target].items() if k != 'increments'},
+                                 {k: v for k, v in catalog.items() if k != 'increments'})
+                self.assertEqual(m['catalogs'][target]['increments'][:-1], catalog['increments'])
+
+    def test_incremental_reset_limit(self):
+        import collect_precedents as cp
+        calls = []
+        def failing(client, out, date, scope, stop=None):
+            calls.append(1)
+            m = {'catalogs': {'prec': {'complete': True, 'increments': [
+                {'complete': False, 'next_page': 1}]}}, 'pages': [], 'documents': [],
+                'incremental': {'round': 1, 'complete': False, 'new_documents': 0,
+                                'per_target': {'prec': 0}}}
+            Path(out, 'manifest.json').write_text(json.dumps(m))
+            Path(out, 'attempt.json').write_text(json.dumps({'reason': 'CATALOG_COUNT_CHANGED'}))
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(cp.run(t, 'all', 1000, lambda r: None, collect_fn=failing), 'FAILED')
+        self.assertEqual(len(calls), cp.MAX_RESETS + 1)
+
+    def test_fetched_active_detail_prevents_destructive_reset(self):
+        from collect_precedents import reset_catalog
+        with tempfile.TemporaryDirectory() as t:
+            out = Path(t)
+            collect(FakeClient(count=301), out, DATE)
+            client = grown()
+            collect(client, out, NEXT, incremental=True,
+                    stop=lambda: 'TIME_BUDGET' if client.calls else None)
+            m = json.loads((out / 'manifest.json').read_text())
+            entry = next(d for d in m['documents'] if d.get('round') == 1)
+            entry.update(sha256='cached', path='summaries/prec/cached.json')
+            (out / entry['path']).write_bytes(b'cached summary')
+            (out / 'manifest.json').write_text(json.dumps(m))
+            before = {p: p.read_bytes() for p in out.rglob('*.json')}
+            self.assertIsNone(reset_catalog(out))
+            self.assertEqual({p: p.read_bytes() for p in before}, before)

@@ -23,7 +23,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from bblove_law_all import Client, today  # noqa: E402
-from bblove_precedent_collect import collect, verify_cache  # noqa: E402
+from bblove_precedent_collect import collect, save_manifest, verify_cache  # noqa: E402
 
 MIN_SLICE = 120  # do not start a new Client with less than two minutes left
 # The live catalog can change while it is being paged (new decisions are listed first by default).
@@ -50,13 +50,40 @@ def outcome(out):
 
 
 def reset_catalog(out):
-    """Restart the first unfinished catalog if none of its details were fetched. Returns the target or None."""
+    """Restart an unfinished listing without discarding fetched details or older rounds."""
     out = Path(out)
     path = out / 'manifest.json'
     if not path.exists():
         return None
     m = json.loads(path.read_text(encoding='utf-8'))
     catalogs = m.get('catalogs', {})
+    inc = m.get('incremental')
+    if inc and inc.get('complete') is False:
+        number = inc['round']
+        target = next((t for t in TARGET_ORDER if t in catalogs
+                       and catalogs[t].get('increments')
+                       and not catalogs[t]['increments'][-1].get('complete')), None)
+        if target is None:
+            return None
+        def active(item):
+            return item.get('target') == target and item.get('round') == number
+        removed = [d for d in m.get('documents', []) if active(d)]
+        # Details normally start only after every listing completes. Fail closed for
+        # an unexpected mixed state: removing its pages would orphan cached details.
+        if any('sha256' in d for d in removed):
+            return None
+        pages = [p for p in m.get('pages', []) if active(p)]
+        m['pages'] = [p for p in m.get('pages', []) if not active(p)]
+        m['documents'] = [d for d in m.get('documents', []) if not active(d)]
+        catalogs[target]['increments'][-1] = {'next_page': 1, 'complete': False}
+        inc['new_documents'] -= len(removed)
+        inc['per_target'][target] -= len(removed)
+        m.pop('stop_reason', None)
+        # Commit the inventory first; collector crash recovery removes orphan pages.
+        save_manifest(path, m)
+        for page in pages:
+            (out / page['path']).unlink(missing_ok=True)
+        return target
     target = next((t for t in TARGET_ORDER if t in catalogs and not catalogs[t].get('complete')), None)
     if target is None or any(d.get('target') == target and 'sha256' in d for d in m.get('documents', [])):
         return None
