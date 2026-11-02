@@ -16,6 +16,7 @@ discarded judgment. Existing Client, atomic save, strict JSON and date gates are
 shared with the current-law collector.
 """
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -302,6 +303,11 @@ def discard_unrecorded(out, manifest):
     for target, state in manifest.get('catalogs', {}).items():
         folder = out / 'pages' / target
         for page in folder.glob('*.json') if folder.is_dir() else ():
+            match = re.fullmatch(r'inc-([1-9][0-9]*)-([1-9][0-9]*)', page.stem)
+            rounds = state.get('increments', [])
+            if (match and int(match[1]) <= len(rounds)
+                    and int(match[2]) >= rounds[int(match[1])-1]['next_page'] and not page.is_symlink()):
+                page.unlink()
             if page.stem.isdigit() and int(page.stem) >= state['next_page'] and not page.is_symlink():
                 page.unlink()
     for entry in manifest.get('documents', []):
@@ -326,7 +332,7 @@ def verify_cache(out, manifest):
         if 'sha256' not in item:
             continue
         path = item['path']
-        if not re.fullmatch(r'(?:pages|summaries)/(?:prec|ntsCgmExpc|ttSpecialDecc)/[0-9]+\.json', path) or path in expected:
+        if not re.fullmatch(r'(?:pages/(?:prec|ntsCgmExpc|ttSpecialDecc)/(?:inc-[1-9][0-9]*-)?[0-9]+|summaries/(?:prec|ntsCgmExpc|ttSpecialDecc)/[0-9]+)\.json', path) or path in expected:
             raise ValueError('CACHE_PATH_INVALID_OR_DUPLICATE')
         expected.add(path)
         file = out / path
@@ -346,20 +352,41 @@ def verify_cache(out, manifest):
         raise ValueError('CACHE_INVENTORY_MISMATCH')
     listed_rows = {}
     for target, state in manifest.get('catalogs', {}).items():
-        pages = [p for p in manifest.get('pages', []) if p['target'] == target]
-        if [p['page'] for p in pages] != list(range(1, state['next_page'])):
+        rounds = [state] + state.get('increments', [])
+        target_pages = [p for p in manifest.get('pages', []) if p['target'] == target]
+        if any(type(p.get('round', 0)) is not int or not 0 <= p.get('round', 0) < len(rounds) for p in target_pages):
             raise ValueError('CACHE_CATALOG_PAGE_GAP')
-        for page in pages:
-            value = strict_json((out / page['path']).read_bytes())
-            if value['totalCnt'] != state['total']:
-                raise ValueError('CACHE_CATALOG_TOTAL_MISMATCH')
-            for row in value['rows']:
-                key = (target, identifier(row, target))
-                if key in listed_rows:
+        for number, snapshot in enumerate(rounds):
+            pages = [p for p in target_pages if p.get('round', 0) == number]
+            if [p['page'] for p in pages] != list(range(1, snapshot['next_page'])):
+                raise ValueError('CACHE_CATALOG_PAGE_GAP')
+            prior = set(listed_rows)
+            round_seen = set()
+            overlap = None
+            for page in pages:
+                expected_path = (f"pages/{target}/inc-{number}-{page['page']}.json" if number
+                                 else f"pages/{target}/{page['page']}.json")
+                if page['path'] != expected_path:
+                    raise ValueError('CACHE_PATH_INVALID')
+                value = strict_json((out / page['path']).read_bytes())
+                if value['totalCnt'] != snapshot['total']:
+                    raise ValueError('CACHE_CATALOG_TOTAL_MISMATCH')
+                keys = {(target, identifier(row, target)) for row in value['rows']}
+                if len(keys) != len(value['rows']) or keys & round_seen:
                     raise ValueError('CACHE_ID_DUPLICATE_OR_MISMATCH')
-                listed_rows[key] = row
-        if state['complete'] and sum(k[0] == target for k in listed_rows) != state['total']:
-            raise ValueError('CACHE_CATALOG_TOTAL_MISMATCH')
+                round_seen |= keys
+                if len(round_seen) > snapshot['total'] or (len(round_seen) < snapshot['total'] and len(keys) != 100):
+                    raise ValueError('CACHE_CATALOG_TOTAL_MISMATCH')
+                if number and keys <= prior and overlap is None:
+                    overlap = page['page']
+                for row in value['rows']:
+                    key = (target, identifier(row, target))
+                    listed_rows.setdefault(key, row)  # older document snapshots stay immutable
+            if number and snapshot.get('overlap_page') != overlap:
+                raise ValueError('CACHE_CATALOG_TOTAL_MISMATCH')
+            if snapshot['complete'] and not (len(round_seen) == snapshot['total'] or
+                    (number and overlap is not None and snapshot['next_page'] == overlap + 2)):
+                raise ValueError('CACHE_CATALOG_TOTAL_MISMATCH')
     for e in manifest.get('documents', []):
         key = (e['target'], e['id'])
         if (key in seen or identifier(e['row'], e['target']) != e['id']
@@ -460,13 +487,19 @@ def store_entry(client, out, entry, date, check_budget=lambda: None):
 
 
 def collect(client, out, date, scope='all', stop=None, account=None, clock=time.monotonic,
-            retry_failed='transient', skipped_failures=None):
+            retry_failed='transient', skipped_failures=None, incremental=False, min_days=1):
     """Resume one pass; report skipped permanent failures separately from the manifest.
+
+    incremental opts the public producer into daily discovery; consumers keep it off.
+    Base catalog totals remain immutable; increments hold each round's total and cursor.
+    Existing FAILED entries are frozen during producer incremental runs.
 
     skipped_failures, when supplied, is a per-call reason/count dict, not an account
     callback or a completion result. 'all' refreshes failed details even if cached;
     'none' leaves every FAILED entry untouched. SUCCESS/SKIPPED always stay cached.
     """
+    if min_days < 1:
+        raise ValueError('MIN_DAYS_INVALID')
     if retry_failed not in ('transient', 'all', 'none'):
         raise ValueError('RETRY_FAILED_INVALID')
     if skipped_failures is None:
@@ -488,6 +521,24 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
             discard_unrecorded(out, manifest)
         verify_cache(out, manifest)
         manifest.pop('stop_reason', None)
+        inc = manifest.get('incremental')
+        ready = (set(manifest['catalogs']) == set(TARGETS)
+                 and all(c['complete'] for c in manifest['catalogs'].values())
+                 and not any(e['status'] == 'PENDING' for e in manifest['documents']))
+        last_date = manifest.get('last_catalog_date', manifest['date'])
+        if (incremental and ready and (not inc or inc.get('complete'))
+                and (datetime.strptime(date, '%Y%m%d') - datetime.strptime(last_date, '%Y%m%d')).days >= min_days):
+            number = (inc['round'] if inc else 0) + 1
+            inc = dict(round=number, new_documents=0, per_target={t: 0 for t in TARGETS}, complete=False)
+            manifest['incremental'] = inc
+            manifest['date'] = date
+            for c in manifest['catalogs'].values():
+                c.setdefault('increments', []).append(dict(next_page=1, complete=False))
+            checkpoint_now(force=True)
+        active_inc = bool(inc and not inc.get('complete'))
+        if incremental and (inc or ready):
+            retry_failed = 'none'
+
         if account:
             for entry in manifest['documents']:
                 if entry['status'] == 'SUCCESS':
@@ -500,6 +551,10 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
         # A partial public export lists its catalogs in partial_targets; the rest are never paged here.
         for target in tuple(manifest.get('partial_targets') or TARGETS):
             state = manifest['catalogs'].setdefault(target, {'next_page': 1, 'complete': False})
+            if active_inc:
+                state = state['increments'][-1]
+            prior = {e['id'] for e in manifest['documents'] if e['target'] == target and e.get('round', 0) < inc['round']} if active_inc else set()
+            round_seen = {identifier(row, target) for p in manifest['pages'] if active_inc and p['target'] == target and p.get('round') == inc['round'] for row in strict_json((out / p['path']).read_bytes())['rows']}
             known = {e['id'] for e in manifest['documents'] if e['target'] == target}
             while not state['complete']:
                 check_budget()
@@ -524,10 +579,11 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
                     # Catalog-time checks are id and duplicates only: one odd row must
                     # fail by itself later, never the whole catalog.
                     sid = identifier(row, target)
-                    if sid in known or sid in fresh:
+                    if sid in (round_seen if active_inc else known) or sid in fresh:
                         raise ValueError('CATALOG_DUPLICATE_ID')
                     fresh.add(sid)
-                if len(known) + len(fresh) > total or (len(known) + len(fresh) < total and len(rows) != 100) or (not rows and total):
+                counted = len(round_seen) if active_inc else len(known)
+                if counted + len(fresh) > total or (counted + len(fresh) < total and len(rows) != 100) or (not rows and total):
                     raise ValueError('CATALOG_INCOMPLETE')
                 # Catalogs are sanitized projections. Detail values below retain
                 # exact lexical source bytes; neither cache can contain full text.
@@ -535,18 +591,30 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
                 if credential_markers(raw):
                     raise ValueError('CREDENTIAL_MARKER')
                 rows = strict_json(raw)['rows']  # Manifest and page share the sanitized projection.
-                path = f'pages/{target}/{page}.json'
+                path = f"pages/{target}/inc-{inc['round']}-{page}.json" if active_inc else f'pages/{target}/{page}.json'
                 sha = put_bytes(out, path, raw)
-                manifest['pages'].append(dict(target=target, page=page, path=path, sha256=sha))
+                manifest['pages'].append(dict(target=target, page=page, path=path, sha256=sha, **({'round': inc['round']} if active_inc else {})))
                 for r in rows:
+                    if identifier(r, target) in known:
+                        continue
                     kind = default_kind(r, target)
                     entry = dict(target=target, id=identifier(r, target), row=r, kind=kind, status='PENDING')
                     if kind == 'skipped':
                         entry.update(status='SKIPPED', reason='SOURCE_NOT_COLLECTED')
+                    if active_inc:
+                        entry['round'] = inc['round']
+                        inc['new_documents'] += 1
+                        inc['per_target'][target] += 1
                     manifest['documents'].append(entry)
                 known |= fresh
-                state.update(total=total, next_page=page + 1, complete=len(known) == total)
+                round_seen |= fresh
+                if active_inc and fresh <= prior:
+                    state.setdefault('overlap_page', page)
+                done = (len(round_seen) == total or page == state.get('overlap_page', -2) + 1) if active_inc else len(known) == total
+                state.update(total=total, next_page=page + 1, complete=done)
                 checkpoint_now(force=state['complete'])
+        if active_inc or 'last_catalog_date' not in manifest:
+            manifest['last_catalog_date'] = date
         entries = manifest['documents']
         if scope == 'tax':
             entries = sorted(entries, key=tax_first)
@@ -584,6 +652,9 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
                         raise CollectionPaused('TIME_BUDGET') from None
                     break
             checkpoint_now()
+        if active_inc:
+            manifest['date'] = date
+            inc['complete'] = not any(e['status'] == 'PENDING' for e in entries)
         manifest.update(status='COMPLETE' if all(e['status'] in ('SUCCESS', 'SKIPPED') for e in manifest['documents'])
                         else 'INCOMPLETE', updated_at=stamp(), api_calls=client.calls)
         checkpoint_now(force=True)

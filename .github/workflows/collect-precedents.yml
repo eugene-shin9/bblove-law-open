@@ -2,7 +2,7 @@ name: Collect precedent, NTS interpretation and tax-tribunal summaries (law.go.k
 on:
   workflow_dispatch:
   schedule:
-    # 매일 04:10 KST (19:10 UTC). 끝까지 받을 때까지 이어서 수집, 끝나면 게시 1회.
+    # 매일 04:10 KST (19:10 UTC). 끝까지 받을 때까지 이어서 수집, 완료 후 매일 신규분 확인.
     - cron: '10 19 * * *'
 permissions: {}
 concurrency:
@@ -86,6 +86,11 @@ jobs:
         run: |
           date=$(python3 -c "import json;print(json.load(open('auto/precedent-collection/manifest.json'))['date'])")
           if [ "$COMPLETE" = "true" ]; then
+            publish=$(python3 -c "import json,sys;sys.path.insert(0,'scripts');from collect_precedents import should_publish;print(should_publish(json.load(open('auto/precedent-collection/manifest.json'))))")
+            if [ "$publish" = "False" ]; then
+              echo "::notice::INCREMENTAL_NO_NEW"
+              exit 0
+            fi
             tag="prec-${date}"; src="auto"; title="판례·국세청 해석·조세심판원 요지 수집본 ($tag)"
           else
             # Finished catalogs first (e.g. prec-20261030-partial-prec); the final prec-<date> supersedes them.
