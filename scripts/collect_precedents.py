@@ -17,6 +17,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import re
+import subprocess
 import sys
 import time
 
@@ -205,6 +207,55 @@ def summary(out):
             'counts': counts, 'failure_reasons': failures}
 
 
+RELEASE_HISTORY_LIMIT = 1000
+
+
+def published_targets(release_rows):
+    """Union of every published precedent release's coverage, including full releases."""
+    if not isinstance(release_rows, list):
+        raise ValueError('RELEASE_HISTORY_INVALID')
+    targets = set()
+    for row in release_rows:
+        if (not isinstance(row, dict) or not isinstance(row.get('tagName'), str)
+                or type(row.get('isDraft')) is not bool):
+            raise ValueError('RELEASE_HISTORY_INVALID')
+        if row['isDraft']:
+            continue
+        tag = row['tagName']
+        if re.fullmatch(r'prec-[0-9]{8}', tag):
+            targets.update(TARGET_ORDER)
+        elif tag.startswith('prec-'):
+            match = re.fullmatch(r'prec-[0-9]{8}-partial-(.+)', tag)
+            parts = match[1].split('-') if match else []
+            if not parts or len(set(parts)) != len(parts) or not set(parts) <= set(TARGET_ORDER):
+                raise ValueError('RELEASE_HISTORY_INVALID')
+            targets.update(parts)
+    return targets
+
+
+def may_publish_partial(current, release_rows):
+    current = set(current)
+    if not current or not current < set(TARGET_ORDER):
+        return False
+    return published_targets(release_rows) <= current
+
+
+def partial_publication_allowed(current, execute=subprocess.run):
+    """Fail closed on request errors, stderr, invalid JSON or truncated history."""
+    try:
+        result = execute(['gh', 'release', 'list', '--limit', str(RELEASE_HISTORY_LIMIT),
+                          '--json', 'tagName,isDraft'], capture_output=True, text=True, timeout=120)
+        if result.returncode or result.stderr.strip():
+            raise ValueError('RELEASE_HISTORY_REQUEST_FAILED')
+        rows = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        raise ValueError('RELEASE_HISTORY_REQUEST_FAILED') from None
+    published_targets(rows)  # distinguish a valid [] from invalid/incomplete history
+    if len(rows) >= RELEASE_HISTORY_LIMIT:
+        raise ValueError('RELEASE_HISTORY_TRUNCATED')
+    return may_publish_partial(current, rows)
+
+
 def should_publish(manifest):
     inc = manifest.get('incremental')
     migrated = (manifest.get('summary_empty_migrated', 0) > 0
@@ -224,7 +275,15 @@ def main():
                     help='no collection: copy the finished catalogs of --out here and print them')
     ap.add_argument('--finished-targets', action='store_true',
                     help='no collection: only write/print which catalogs of --out could be exported')
+    ap.add_argument('--may-publish-partial', help='check release coverage for comma-separated targets; no collection')
     args = ap.parse_args()
+    if args.may_publish_partial is not None:
+        try:
+            print('true' if partial_publication_allowed(args.may_publish_partial.split(',')) else 'false')
+        except ValueError:
+            print('::error::PARTIAL_RELEASE_HISTORY_FAILED')
+            return 1
+        return 0
     if args.finished_targets:
         path = args.out / 'manifest.json'
         m = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
