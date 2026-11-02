@@ -124,8 +124,8 @@ class SummaryCollectionTests(unittest.TestCase):
                 self.assertEqual(retry.calls, 0)
         with tempfile.TemporaryDirectory() as t:
             out = Path(t)
-            self.assertFalse(collect(FakeClient(detail={**PREC, '판시사항':'', '판결요지':''}), out, DATE))
-            self.assertEqual(strict_json((out/'manifest.json').read_bytes())['documents'][0]['reason'], 'SUMMARY_EMPTY')
+            self.assertTrue(collect(FakeClient(detail={**PREC, '판시사항':'', '판결요지':''}), out, DATE))
+            self.assertEqual(strict_json((out/'manifest.json').read_bytes())['documents'][0]['status'], 'SUCCESS')
 
     def test_future_dated_listing_is_kept_in_catalog_but_fails_without_request(self):
         # law.go.kr listed 대법원 2025두34754 with 선고일자 2026.12.11 on 2026-10-29; the whole
@@ -367,7 +367,7 @@ class SummaryCollectionTests(unittest.TestCase):
         self.assertEqual(strict_json(result), PREC)
 
     def test_html_only_summary_and_bad_official_links_fail(self):
-        variants = [dict(detail={**PREC, '판시사항':'<p>&nbsp;</p>', '판결요지':'<br/>'}),
+        variants = [
                     dict(detail={**PREC, '판례정보일련번호':'99'}),
                     dict(nts_rows=[{**NTS, '법령해석상세링크':'https://example.invalid/LSW/expcInfoP.do?expcSeq=2'}]),
                     dict(nts_rows=[{**NTS, '법령해석상세링크':'https://www.law.go.kr/LSW/expcInfoP.do?expcSeq=99'}])]
@@ -404,7 +404,7 @@ class D1BuildTests(unittest.TestCase):
     def test_partial_failures_visible_in_report_and_sql_escaping(self):
         with tempfile.TemporaryDirectory() as t:
             source = Path(t)/'source'
-            self.assertFalse(collect(FakeClient(detail={**PREC,'판결요지':'','판시사항':''}),source,DATE))
+            self.assertFalse(collect(FakeClient(detail={**PREC,'사건번호':'2099두999'}),source,DATE))
             report = build(source, Path(t)/'sql')
             self.assertEqual(report['status'], 'PARTIAL_WITH_FAILURES')
             self.assertEqual(len(report['pending_or_failed']), 1)

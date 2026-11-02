@@ -34,7 +34,8 @@ from bblove_v107_pilot import check_date, records, sanitized, text
 TARGETS = ('prec', 'ntsCgmExpc', 'ttSpecialDecc')
 FIELDS = {
     'prec': ('판례일련번호', '판례정보일련번호', '사건번호', '법원명', '선고일자', '데이터출처명',
-             '사건명', '사건종류명', '사건종류', '판시사항', '판결요지', '참조조문'),
+             '사건명', '사건종류명', '사건종류', '판시사항', '판결요지', '참조조문',
+             'issues', 'holding', 'summary_status'),
     'ntsCgmExpc': ('법령해석일련번호', '법령해석례일련번호', '일련번호', '안건번호',
                    '문서번호', '안건명', '제목', '회신일자', '해석일자', '생산일자',
                    '질의요지', '질의내용', '회신', '회신내용', '답변요지', '관련법령', '법령해석상세링크'),
@@ -63,7 +64,6 @@ ERROR_CODES = frozenset(('CATALOG_ROOT_INVALID', 'CATALOG_COUNT_CHANGED', 'CATAL
 # Permanent for this source snapshot; use retry_failed='all' after a source correction.
 # DATE_IN_FUTURE is deliberately excluded: the date gate can open on a later day.
 PERMANENT_FAILURES = frozenset({
-    'SUMMARY_EMPTY',          # The source supplies neither an issue nor a holding.
     'CASE_OR_COURT_INVALID',  # The stored catalog lacks a usable case number/court.
     'LIST_DETAIL_MISMATCH',   # The source list and detail disagree on identity/date.
     'TITLE_MISSING',          # A required source title is absent, not a transport failure.
@@ -276,7 +276,10 @@ def validated(row, summary, target, kind):
         base.update(title=clean('사건명') or base['title'], issues=clean('판시사항'),
                     holding=clean('판결요지'), refs=clean('참조조문'))
         if not (base['issues'].strip() or base['holding'].strip()):
-            raise ValueError('SUMMARY_EMPTY')
+            base['summary_status'] = 'EMPTY_AT_SOURCE'
+        if 'summary_status' in summary and (summary['summary_status'] != 'EMPTY_AT_SOURCE'
+                or base['issues'] or base['holding'] or summary.get('issues') != '' or summary.get('holding') != ''):
+            raise ValueError('CACHE_SUMMARY_FIELDS_INVALID')
         return base
     # Recent decisions come without 사건명/재결요지 (probe 2026-10-29). 주문·이유 are never stored,
     # so such a decision is kept findable by number and date under an explicit placeholder title.
@@ -478,6 +481,12 @@ def store_entry(client, out, entry, date, check_budget=lambda: None):
             raw = listing_bytes(entry['row'])
         else:
             raw = summary_bytes(raw, target)
+    if target == 'prec' and entry['kind'] == 'detail':
+        value = strict_json(raw)
+        if not any(page_text(text(value, k).encode('utf-8')).strip() for k in ('판시사항', '판결요지')):
+            # Preserve original allowed field bytes; append only local metadata.
+            parts = members(raw)
+            raw = b'{' + b','.join(v for k, v in parts.items() if k not in ('issues', 'holding', 'summary_status')) + b',"issues":"","holding":"","summary_status":"EMPTY_AT_SOURCE"}'
     clean, _ = sanitized(strict_json(raw), getattr(client, 'credential', ''))
     if clean != strict_json(raw) or credential_markers(raw):
         raise ValueError('CREDENTIAL_BEARING_SUMMARY')
@@ -521,6 +530,22 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
             discard_unrecorded(out, manifest)
         verify_cache(out, manifest)
         manifest.pop('stop_reason', None)
+        if manifest.get('rule_version', 1) < 2:
+            migrated = 0
+            for entry in manifest['documents']:
+                if entry['target'] == 'prec' and entry['status'] == 'FAILED' and entry.get('reason') == 'SUMMARY_EMPTY':
+                    entry.update(status='PENDING')
+                    for key in ('reason', 'sha256', 'path'):
+                        entry.pop(key, None)
+                    migrated += 1
+            manifest.update(rule_version=2, summary_empty_migrated=migrated)
+            if migrated:
+                # Persist the reset first; crash recovery removes the old unrecorded files.
+                checkpoint_now(force=True)
+                discard_unrecorded(out, manifest)
+        if manifest.get('summary_empty_migrated') and incremental:
+            retry_failed = 'none'
+
         inc = manifest.get('incremental')
         ready = (set(manifest['catalogs']) == set(TARGETS)
                  and all(c['complete'] for c in manifest['catalogs'].values())
@@ -652,6 +677,10 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
                         raise CollectionPaused('TIME_BUDGET') from None
                     break
             checkpoint_now()
+        if (manifest.get('summary_empty_migrated') and not manifest.get('summary_empty_completed_date')
+                and not any(e['status'] == 'PENDING' for e in entries)):
+            manifest['summary_empty_completed_date'] = date
+            manifest['date'] = date
         if active_inc:
             manifest['date'] = date
             inc['complete'] = not any(e['status'] == 'PENDING' for e in entries)

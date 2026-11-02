@@ -280,3 +280,12 @@ class PartialExportTests(unittest.TestCase):
                 self.assertEqual(cp.main(), 0)
             self.assertIn('partial_targets=prec,ntsCgmExpc\n', target.read_text())
             self.assertIn('complete=false\n', target.read_text())
+
+
+class SummaryMigrationPublicationTests(unittest.TestCase):
+    def test_migrated_content_is_published_on_its_completion_date(self):
+        m = {'date': '20261102', 'incremental': {'complete': True, 'new_documents': 0},
+             'summary_empty_migrated': 3, 'summary_empty_completed_date': '20261102'}
+        self.assertTrue(cp.should_publish(m))
+        m['date'] = '20261103'
+        self.assertFalse(cp.should_publish(m))
