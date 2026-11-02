@@ -64,6 +64,7 @@ ERROR_CODES = frozenset(('CATALOG_ROOT_INVALID', 'CATALOG_COUNT_CHANGED', 'CATAL
 # Permanent for this source snapshot; use retry_failed='all' after a source correction.
 # DATE_IN_FUTURE is deliberately excluded: the date gate can open on a later day.
 PERMANENT_FAILURES = frozenset({
+    'SUMMARY_EMPTY',          # Consumers never refetch; the producer re-collects these once (rule_version 2).
     'CASE_OR_COURT_INVALID',  # The stored catalog lacks a usable case number/court.
     'LIST_DETAIL_MISMATCH',   # The source list and detail disagree on identity/date.
     'TITLE_MISSING',          # A required source title is absent, not a transport failure.
@@ -530,7 +531,9 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
             discard_unrecorded(out, manifest)
         verify_cache(out, manifest)
         manifest.pop('stop_reason', None)
-        if manifest.get('rule_version', 1) < 2:
+        # Only the producer (incremental=True) re-collects old SUMMARY_EMPTY failures; a consumer keeps the
+        # received collection as it is and waits for the next public release.
+        if incremental and manifest.get('rule_version', 1) < 2:
             migrated = 0
             for entry in manifest['documents']:
                 if entry['target'] == 'prec' and entry['status'] == 'FAILED' and entry.get('reason') == 'SUMMARY_EMPTY':

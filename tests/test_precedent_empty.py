@@ -37,7 +37,7 @@ class EmptySourceTests(unittest.TestCase):
                 out = Path(t)
                 collect(FakeClient(count=2), out, DATE)
                 m = json.loads((out/'manifest.json').read_text())
-                m.pop('rule_version')
+                m.pop('rule_version', None)
                 e = m['documents'][0]
                 e.update(status='FAILED', reason='SUMMARY_EMPTY')
                 file = out/e['path']
@@ -62,12 +62,33 @@ class EmptySourceTests(unittest.TestCase):
                 collect(client, out, DATE, incremental=True)
                 self.assertEqual(client.calls, 0)
 
+    def test_consumer_never_refetches_legacy_summary_empty(self):
+        # A consumer (incremental=False, e.g. the private D1 loader) keeps a received collection as it is:
+        # old SUMMARY_EMPTY failures are permanent there and wait for the producer's next release.
+        with tempfile.TemporaryDirectory() as t:
+            out = Path(t)
+            collect(FakeClient(count=2), out, DATE)
+            m = json.loads((out/'manifest.json').read_text())
+            m.pop('rule_version', None)
+            e = m['documents'][0]
+            e.update(status='FAILED', reason='SUMMARY_EMPTY')
+            (out/e['path']).unlink()
+            e.pop('sha256'); e.pop('path')
+            save_manifest(out/'manifest.json', m)
+            client, skipped = FakeClient(count=2, detail=EMPTY), {}
+            self.assertFalse(collect(client, out, DATE, skipped_failures=skipped))  # a FAILED entry remains
+            self.assertEqual(client.calls, 0)
+            self.assertEqual(skipped, {'SUMMARY_EMPTY': 1})
+            m = json.loads((out/'manifest.json').read_text())
+            self.assertEqual(m['documents'][0]['status'], 'FAILED')
+            self.assertNotIn('rule_version', m)
+
     def test_migration_reset_survives_budget_stop(self):
         with tempfile.TemporaryDirectory() as t:
             out = Path(t)
             collect(FakeClient(), out, DATE)
             m = json.loads((out/'manifest.json').read_text())
-            m.pop('rule_version')
+            m.pop('rule_version', None)
             m['documents'][0].update(status='FAILED', reason='SUMMARY_EMPTY')
             save_manifest(out/'manifest.json', m)
             client = FakeClient(detail=EMPTY)
