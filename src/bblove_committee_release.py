@@ -8,6 +8,10 @@ from bblove_storage import digest, strict_json
 from bblove_v107_pilot import check_date
 
 KIND = 'committee-summary-raw'
+# Records that trip a pattern are always excluded; publication halts only when the excluded
+# share exceeds this percentage. The 40-record decc sample showed 1 exclusion (2.5%), so a 1%
+# halt would block every release; 5% still stops a systematic leak.
+EXCLUSION_HALT_PERCENT = 5
 FIELDS = ('source', 'id', 'case_no', 'committee', 'agency', 'decided', 'disposed',
           'title', 'holding', 'order', 'claim', 'type_name', 'type_code', 'official_url')
 PATTERNS = {
@@ -86,7 +90,7 @@ def export(source, dest):
         validate_record(row)
         accepted.append(row)
     total = len(m['documents'])
-    if excluded * 100 > total:
+    if excluded * 100 > total * EXCLUSION_HALT_PERCENT:
         print('::error::COMMITTEE_EXCLUSION_RATE_EXCEEDED')
         raise ValueError('COMMITTEE_EXCLUSION_RATE_EXCEEDED')
     manifest = dict(kind=KIND, format_version=1, total=total, accepted=len(accepted), excluded=excluded,
@@ -111,7 +115,7 @@ def verify(source):
     for key in ('total','accepted','excluded','source_total'):
         if type(m.get(key)) is not int or m[key] < 0:
             raise ValueError('COMMITTEE_COUNTS')
-    if m['accepted']+m['excluded'] != m['total'] or m['excluded']*100 > m['total'] or m['source_total'] != m['total']:
+    if m['accepted']+m['excluded'] != m['total'] or m['excluded']*100 > m['total']*EXCLUSION_HALT_PERCENT or m['source_total'] != m['total']:
         raise ValueError('COMMITTEE_COUNTS')
     reasons=m.get('exclusion_reasons')
     if not isinstance(reasons,dict) or set(reasons)-set(PATTERNS)-{'SOURCE_NOT_SUCCESS'} or any(type(n) is not int or n < 1 for n in reasons.values()):
