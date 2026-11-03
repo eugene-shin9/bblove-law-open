@@ -60,3 +60,45 @@ class FulltextTests(unittest.TestCase):
             m=json.loads((out/'fulltext-manifest.json').read_text())
             self.assertEqual(m['kind'],'precedent-fulltext-raw')
             self.assertEqual(len(m['documents']),1)
+
+
+class FulltextProgressTests(unittest.TestCase):
+    def factory(self):
+        class FullClient(FakeClient):
+            def get(self, *args, **kwargs):
+                doc, raw = super().get(*args, **kwargs)
+                doc = {'PrecService': doc['Service']}
+                return doc, json.dumps(doc).encode()
+        return lambda seconds: FullClient(count=5)
+
+    def test_next_day_continues_with_unstored_ids_instead_of_restarting(self):
+        from datetime import datetime, timedelta
+        with tempfile.TemporaryDirectory() as t:
+            summary = Path(t)/'summary'; out = Path(t)/'fulltext'
+            collect(FakeClient(count=5), summary, DATE)
+            ids = [e['id'] for e in json.loads((summary/'manifest.json').read_text())['documents']
+                   if e['target'] == 'prec' and e.get('kind') == 'detail' and e['status'] == 'SUCCESS']
+            self.assertGreaterEqual(len(ids), 3)
+            ticks = iter(range(0, 10 ** 6, 40))
+            # A short day-1 budget stores some, not all, IDs.
+            day1 = collect_fulltext(self.factory(), summary, out, 3 * 40 + 34, DATE, clock=lambda: next(ticks))
+            self.assertEqual(day1, 'PAUSED')
+            first = set(json.loads((out/'fulltext-manifest.json').read_text())['documents'])
+            self.assertTrue(1 <= len(first) < len(ids))
+            next_day = (datetime.strptime(DATE, '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d')
+            self.assertEqual(collect_fulltext(self.factory(), summary, out, 10 ** 6, next_day, clock=lambda: 0), 'COMPLETE')
+            m = json.loads((out/'fulltext-manifest.json').read_text())['documents']
+            self.assertEqual(set(m), set(ids))
+            # Day-1 bodies were not refetched on day 2 (recheck waits for the recheck age).
+            self.assertTrue(all(m[i]['checked_date'] == DATE for i in first))
+
+    def test_usage_counter_matches_disk(self):
+        from bblove_precedent_collect import fulltext_usage
+        with tempfile.TemporaryDirectory() as t:
+            out = Path(t)
+            m = dict(kind='precedent-fulltext-raw', format_version=1, date=DATE, documents={})
+            usage = {'bytes': fulltext_usage(out)}
+            make = lambda body: fulltext_object(PREC, json.dumps({'PrecService': dict(PREC, 판례내용=body)}).encode(), 'x')
+            for body in ('<p>하나</p>', '<p>둘 더 긴 본문</p>', '<p>셋</p>', '<p>셋</p>'):
+                store_fulltext(out, make(body), m, usage=usage)
+                self.assertEqual(usage['bytes'], fulltext_usage(out))

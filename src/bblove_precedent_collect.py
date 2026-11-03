@@ -774,6 +774,7 @@ FULLTEXT_TARGETS = {'prec'}
 FULLTEXT_BUDGET_BYTES = 8_000_000_000
 FULLTEXT_WARNING_BYTES = 21_600
 FULLTEXT_MAX_SECONDS = 7200
+FULLTEXT_RECHECK_DAYS = 180
 
 
 def fulltext_object(row, raw, fetched_at, credential=''):
@@ -799,8 +800,16 @@ def fulltext_object(row, raw, fetched_at, credential=''):
     return value
 
 
-def store_fulltext(out, value, manifest, budget=FULLTEXT_BUDGET_BYTES):
-    """Budget includes both retained generations, manifest and peak temporary object."""
+def fulltext_usage(out):
+    out = Path(out)
+    return sum(p.stat().st_size for p in out.rglob('*') if p.is_file()) if out.exists() else 0
+
+
+def store_fulltext(out, value, manifest, budget=FULLTEXT_BUDGET_BYTES, usage=None):
+    """Budget includes both retained generations, manifest and peak temporary object.
+
+    usage, when given, is a {'bytes': int} counter kept in step with the files this function
+    writes and deletes, so a long run does not walk the whole tree once per document."""
     out = Path(out)
     sid = value['id']
     if not re.fullmatch(r'[0-9]+', sid) or not 0 < budget <= FULLTEXT_BUDGET_BYTES:
@@ -810,7 +819,7 @@ def store_fulltext(out, value, manifest, budget=FULLTEXT_BUDGET_BYTES):
     if old and old['body_sha256'] == value['body_sha256']:
         return False
     raw = json.dumps(value, ensure_ascii=False, indent=2).encode('utf-8')
-    used = sum(p.stat().st_size for p in out.rglob('*') if p.is_file())
+    used = fulltext_usage(out) if usage is None else usage['bytes']
     # Allow space for a new manifest and previous-copy before replacing active data.
     metadata = dict(sha256=digest(raw), bytes=len(raw), status='SUCCESS')
     candidate = dict(manifest, documents={**manifest['documents'], sid: metadata})
@@ -818,15 +827,24 @@ def store_fulltext(out, value, manifest, budget=FULLTEXT_BUDGET_BYTES):
     if used + len(raw) + (path.stat().st_size if old else 0) + reserve > budget:
         raise CollectionPaused('FULLTEXT_BYTE_BUDGET')
     versions = out / 'prec' / 'versions' / sid
+    delta = len(raw)
     if old:
+        old_raw = path.read_bytes()
         versions.mkdir(parents=True, exist_ok=True)
-        put_bytes(out, f"prec/versions/{sid}/{old['body_sha256']}.json", path.read_bytes())
+        kept = versions / (old['body_sha256'] + '.json')
+        # old body moves to versions/ (net 0 against the replaced active file);
+        # a same-named copy already there is overwritten.
+        delta -= kept.stat().st_size if kept.exists() else 0
+        put_bytes(out, f"prec/versions/{sid}/{old['body_sha256']}.json", old_raw)
     put_bytes(out, f'prec/{sid}.json', raw)
     if versions.exists():
         keep = old['body_sha256'] if old else None
         for previous in versions.glob('*.json'):
             if previous.stem != keep:
+                delta -= previous.stat().st_size
                 previous.unlink()
+    if usage is not None:
+        usage['bytes'] = used + delta
     manifest['documents'][sid] = metadata
     return True
 
@@ -857,13 +875,23 @@ def collect_fulltext(client_factory, summary_out, out, deadline, date, clock=tim
             raise ValueError('FULLTEXT_CACHE_INVALID')
     manifest.pop('stop_reason', None)
     manifest.update(status='COMPLETE', date=date)
+    usage = {'bytes': fulltext_usage(out)}
+    eligible = [e for e in source['documents'] if e['target'] in FULLTEXT_TARGETS
+                and e.get('kind') == 'detail' and e['status'] == 'SUCCESS']
+    # A date-keyed "checked today" skip alone would restart at the first ID every day and never
+    # reach the rest; fetch IDs without a stored body first (failures included), and recheck stored
+    # bodies for changes only once every ID is stored, oldest check first, after the recheck age.
+    pending = [e for e in eligible if e['id'] not in manifest['documents']]
+    if pending:
+        queue = pending
+    else:
+        today_ = datetime.strptime(date, '%Y%m%d')
+        def age(e):
+            checked = manifest['documents'][e['id']].get('checked_date')
+            return (today_ - datetime.strptime(checked, '%Y%m%d')).days if checked else 10 ** 6
+        queue = sorted((e for e in eligible if age(e) >= FULLTEXT_RECHECK_DAYS), key=age, reverse=True)
     try:
-        for entry in source['documents']:
-            if entry['target'] not in FULLTEXT_TARGETS or entry.get('kind') != 'detail' or entry['status'] != 'SUCCESS':
-                continue
-            # Once per collection date; a later date can discover a changed body.
-            if manifest['documents'].get(entry['id'], {}).get('checked_date') == date:
-                continue
+        for entry in queue:
             remaining = deadline - clock()
             if remaining < 35:
                 raise CollectionPaused('TIME_BUDGET')
@@ -873,7 +901,7 @@ def collect_fulltext(client_factory, summary_out, out, deadline, date, clock=tim
             try:
                 _, raw = client.get('lawService.do', dict(target='prec', ID=entry['id']), original=True)
                 value = fulltext_object(entry['row'], raw, stamp(), getattr(client, 'credential', ''))
-                store_fulltext(out, value, manifest, budget)
+                store_fulltext(out, value, manifest, budget, usage)
                 manifest['documents'][entry['id']]['checked_date'] = date
                 manifest.get('failures', {}).pop(entry['id'], None)
                 sizes = (sizes + [len(raw)])[-100:]
