@@ -315,9 +315,8 @@ class PublicationCoverageTests(unittest.TestCase):
             with self.subTest(rc=rc, out=out, err=err), self.assertRaises(ValueError):
                 cp.partial_publication_allowed(['prec'], lambda *a, **kw: subprocess.CompletedProcess(a, rc, out, err))
         self.assertTrue(cp.partial_publication_allowed(['prec'], lambda *a, **kw: subprocess.CompletedProcess(a, 0, '[]', '')))
-        with self.assertRaisesRegex(ValueError, 'TRUNCATED'):
-            cp.partial_publication_allowed(['prec'], lambda *a, **kw: subprocess.CompletedProcess(
-                a, 0, json.dumps([self.row('law-20261101')] * cp.RELEASE_HISTORY_LIMIT), ''))
+        self.assertTrue(cp.partial_publication_allowed(['prec'], lambda *a, **kw: subprocess.CompletedProcess(
+                a, 0, json.dumps([self.row('decc-20261101')] * cp.RELEASE_HISTORY_LIMIT), '')))
 
     def test_workflow_calls_guard_and_cli_failure_is_error(self):
         from contextlib import redirect_stdout

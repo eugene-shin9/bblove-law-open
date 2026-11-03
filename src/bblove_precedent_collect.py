@@ -377,10 +377,15 @@ def verify_cache(out, manifest):
     """Check the entire inventory before any network request or SQL build."""
     if manifest.get('schema') != SCHEMA:
         raise ValueError('MANIFEST_SCHEMA_INVALID')
+    declared = manifest.get('collection_targets', list(TARGETS))
+    if not isinstance(declared, list) or not declared or len(set(declared)) != len(declared) or not set(declared) <= set(TARGETS):
+        raise ValueError('MANIFEST_SCHEMA_INVALID')
+    if set(manifest.get('catalogs', {})) - set(declared):
+        raise ValueError('MANIFEST_SCHEMA_INVALID')
     partial = manifest.get('partial_targets')
     if partial is not None and (
             not isinstance(partial, list) or not partial or len(set(partial)) != len(partial)
-            or not set(partial) < set(TARGETS) or set(manifest.get('catalogs', {})) != set(partial)
+            or not set(partial) < set(declared) or set(manifest.get('catalogs', {})) != set(partial)
             or any(d.get('target') not in partial for d in manifest.get('documents', []))):
         raise ValueError('MANIFEST_SCHEMA_INVALID')
     expected, seen = set(), set()
@@ -611,7 +616,7 @@ def recover_transient(client, out, manifest, date, check_budget, checkpoint, lim
 
 
 def collect(client, out, date, scope='all', stop=None, account=None, clock=time.monotonic,
-            retry_failed='transient', skipped_failures=None, incremental=False, min_days=1, transient_limit=TRANSIENT_RETRY_LIMIT):
+            retry_failed='transient', skipped_failures=None, incremental=False, min_days=1, transient_limit=TRANSIENT_RETRY_LIMIT, targets=None):
     """Resume one pass; report skipped permanent failures separately from the manifest.
 
     incremental opts the public producer into daily discovery; consumers keep it off.
@@ -635,8 +640,11 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
     if scope not in ('tax', 'all', 'committee'):
         raise ValueError('SCOPE_INVALID')
     out = Path(out)
-    targets = TARGETS if scope == 'committee' else DEFAULT_TARGETS
-    if scope == 'committee':
+    explicit_targets = targets is not None
+    targets = tuple(targets) if explicit_targets else (TARGETS if scope == 'committee' else DEFAULT_TARGETS)
+    if not targets or len(set(targets)) != len(targets) or not set(targets) <= set(TARGETS):
+        raise ValueError('TARGETS_INVALID')
+    if scope == 'committee' and not explicit_targets:
         # Finish ordinary sources first under the SAME caller budget and account.
         seen_accounts = set()
         original_account = account
@@ -656,6 +664,10 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
     checkpoint = out / 'manifest.json'
     manifest = strict_json(checkpoint.read_bytes()) if checkpoint.exists() else {
         'schema': SCHEMA, 'date': date, 'pages': [], 'documents': [], 'catalogs': {}}
+    if explicit_targets:
+        if set(manifest['catalogs']) - set(targets):
+            raise ValueError('TARGETS_CACHE_MISMATCH')
+        manifest['collection_targets'] = list(targets)
     last = [clock()]
     def checkpoint_now(force=False):
         if force or clock() - last[0] >= SAVE_EVERY_SECONDS:
