@@ -15,8 +15,10 @@ def publish(directory, tag, title, commit, execute=subprocess.run):
     info = json.loads((directory / 'release-info.json').read_text())
     kind = info.get('kind')
     pattern = {'committee-summary-raw': r'decc-[0-9]{8}', 'precedent-summary-raw': r'prec-[0-9]{8}(?:-partial-(?:prec|ntsCgmExpc|ttSpecialDecc)(?:-(?:prec|ntsCgmExpc|ttSpecialDecc))*)?',
-               'precedent-fulltext-raw': r'prec-fulltext-[0-9]{8}(?:-partial)?'}.get(kind)
-    if not pattern or not re.fullmatch(pattern, tag) or info.get('format_version') != 1:
+               'precedent-fulltext-raw': r'prec-fulltext-[0-9]{8}-r[0-9]+-a[0-9]+'}.get(kind)
+    if not pattern or not re.fullmatch(pattern, tag) or info.get('format_version') != (2 if kind == 'precedent-fulltext-raw' else 1):
+        raise ValueError('RELEASE_CONTRACT_INVALID')
+    if kind == 'precedent-fulltext-raw' and (info.get('delta') is not True or not tag.startswith('prec-fulltext-'+str(info.get('collected_date'))+'-')):
         raise ValueError('RELEASE_CONTRACT_INVALID')
     files = sorted(str(p) for p in directory.iterdir() if p.is_file())
     if not (directory / 'SHA256SUMS').is_file():
