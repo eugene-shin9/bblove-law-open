@@ -123,19 +123,7 @@ jobs:
       - name: Package collection in parts under 2 GiB, with release-info
         if: steps.tag.outputs.tag != '' && steps.tag.outputs.exists == 'false'
         run: |
-          mkdir -p release
-          src="${{ steps.tag.outputs.src }}"
-          tar -C "$src" -czf - precedent-collection | split -b 1900m -d -a 2 - release/precedent-collection.tar.gz.part-
-          cp "$src/precedent-collection/manifest.json" release/precedent-manifest.json
-          python3 - "$src/precedent-collection" <<'PY'
-          import json, sys
-          sys.path.insert(0, 'scripts')
-          from collect_precedents import summary
-          json.dump({'outcome': '${{ steps.collect.outputs.outcome }}', **summary(sys.argv[1])},
-                    open('release/precedent-summary.json', 'w'), ensure_ascii=False, indent=2)
-          PY
-          python -I scripts/release_info.py --release release --manifest "$src/precedent-collection/manifest.json" --kind precedent-summary-raw
-          (cd release && sha256sum -- * > SHA256SUMS)
+          python -I scripts/package_precedents.py --source "${{ steps.tag.outputs.src }}/precedent-collection" --dest release --kind precedent-summary-raw
       - name: Credential scan of the release payload
         if: steps.tag.outputs.tag != '' && steps.tag.outputs.exists == 'false'
         env:
@@ -153,11 +141,7 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
           TITLE: ${{ steps.tag.outputs.title }}
         run: |
-          gh release create "$TAG" --draft --target "$GITHUB_SHA" --latest=false \
-            --title "$TITLE" \
-            --notes "law.go.kr DRF 요지 수집본(전문 미포함). 태그에 -partial-이 있으면 먼저 끝난 분류(manifest의 partial_targets)만 담은 중간 게시본. 조각 파일을 이어 붙여 풀고(cat part-* | tar -xz), release-info.json·SHA256SUMS·attestation으로 검증."
-          gh release upload "$TAG" release/*
-          gh release edit "$TAG" --draft=false --latest=false
+          python -I scripts/publish_precedents.py --directory release --tag "$TAG" --title "$TITLE" --commit "$GITHUB_SHA"
           echo "Published $TAG" >> "$GITHUB_STEP_SUMMARY"
       - name: Progress (annotation and Job Summary; nothing is committed)
         if: always()

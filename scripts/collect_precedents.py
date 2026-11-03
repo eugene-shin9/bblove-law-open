@@ -25,7 +25,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from bblove_law_all import Client, today  # noqa: E402
-from bblove_precedent_collect import collect, save_manifest, verify_cache, PERMANENT_FAILURES  # noqa: E402
+from bblove_precedent_collect import collect, save_manifest, verify_cache, PERMANENT_FAILURES, collect_fulltext  # noqa: E402
 
 MIN_SLICE = 120  # do not start a new Client with less than two minutes left
 # The live catalog can change while it is being paged (new decisions are listed first by default).
@@ -235,6 +235,8 @@ def published_targets(release_rows):
         tag = row['tagName']
         if re.fullmatch(r'prec-[0-9]{8}', tag):
             targets.update(TARGET_ORDER)
+        elif tag.startswith('prec-fulltext-'):
+            continue
         elif tag.startswith('prec-'):
             match = re.fullmatch(r'prec-[0-9]{8}-partial-(.+)', tag)
             parts = match[1].split('-') if match else []
@@ -277,6 +279,9 @@ def should_publish(manifest):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--out', type=Path, default=Path('auto/precedent-collection'))
+    ap.add_argument('--fulltext', action='store_true')
+    ap.add_argument('--fulltext-out', type=Path, default=Path('auto/fulltext-collection'))
+    ap.add_argument('--fulltext-max-seconds', type=float, default=7200)
     ap.add_argument('--scope', choices=('tax', 'all'), default='all')
     ap.add_argument('--min-days', type=int, default=1)
     ap.add_argument('--seconds', type=float, default=18000)
@@ -317,8 +322,18 @@ def main():
         print('LAW_OC_NOT_AVAILABLE')
         write_outputs('FAILED')
         return 1
+    if args.fulltext and (not 0 < args.fulltext_max_seconds <= 7200 or not 0 < args.seconds <= 18000):
+        print('FULLTEXT_ARGUMENT_INVALID')
+        return 1
+    deadline = time.monotonic() + args.seconds
     state = run(args.out, args.scope, args.seconds,
                 lambda remaining: Client(credential, seconds=remaining, interval=args.interval), min_days=args.min_days)
+    if args.fulltext and state in ('COMPLETE', 'PASS_DONE'):
+        fulltext_state = collect_fulltext(
+            lambda remaining: Client(credential, seconds=remaining, interval=max(1.0, args.interval)),
+            args.out, args.fulltext_out, deadline, today(), max_seconds=args.fulltext_max_seconds,
+            budget=int(os.environ.get('FULLTEXT_BUDGET_BYTES', '8000000000')))
+        print('FULLTEXT_' + fulltext_state)
     write_outputs(state)
     print(json.dumps({'outcome': state, **summary(args.out)}, ensure_ascii=False))
     return 1 if state == 'FAILED' else 0
