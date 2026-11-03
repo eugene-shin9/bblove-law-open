@@ -24,7 +24,7 @@ class WorkflowStructureTests(unittest.TestCase):
         from workflow_contract import job, steps, step_by_id, strings, inputs_refs
         wf = load_workflow(ROOT / '.github/workflows/collect-precedents.yml')
         self.assertEqual(set(wf['on']), {'workflow_dispatch', 'schedule'})
-        self.assertEqual(wf['on']['schedule'], [{'cron': '10 19 * * *'}])
+        self.assertEqual(wf['on']['schedule'], [{'cron': '40 13 * * *'}])
         self.assertEqual(inputs_refs(wf), [])
         j = job(wf, 'collect')
         self.assertEqual(j['if'], "github.ref == 'refs/heads/main'")

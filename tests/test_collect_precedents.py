@@ -325,7 +325,7 @@ class PublicationCoverageTests(unittest.TestCase):
         from workflow_contract import load_workflow, job, step_by_id, strings
         wf = load_workflow(ROOT / '.github/workflows/collect-precedents.yml')
         text = step_by_id(job(wf, 'collect'), 'tag')['run']
-        self.assertEqual(wf['on']['schedule'], [{'cron': '10 19 * * *'}])
+        self.assertEqual(wf['on']['schedule'], [{'cron': '40 13 * * *'}])
         self.assertIs(wf['concurrency']['cancel-in-progress'], False)
         self.assertTrue(all('max_by(length)' not in v for _, v in strings(wf)))
         self.assertIn('if ! publish=$(python3 scripts/collect_precedents.py --may-publish-partial "$PARTIAL"); then', text)
