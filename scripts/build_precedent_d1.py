@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from bblove_law_all import save
-from bblove_precedent_collect import SCHEMA, TARGETS, validated, verify_cache
+from bblove_precedent_collect import SCHEMA, DEFAULT_TARGETS as TARGETS, validated, verify_cache
 from bblove_precedent_scope import tax_reasons
 from bblove_storage import digest, strict_json
 

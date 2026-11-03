@@ -32,8 +32,12 @@ from bblove_storage import digest, strict_json
 from bblove_tax_p3_editions import page_text
 from bblove_v107_pilot import check_date, records, sanitized, text
 
-TARGETS = ('prec', 'ntsCgmExpc', 'ttSpecialDecc')
+DEFAULT_TARGETS = ('prec', 'ntsCgmExpc', 'ttSpecialDecc')
+TARGETS = DEFAULT_TARGETS + ('decc',)
 FIELDS = {
+    'decc': ('행정심판재결례일련번호', '행정심판례일련번호', '사건명', '사건번호', '의결일자',
+             '처분일자', '처분청', '재결청', '재결구분명', '재결구분코드', '재결례유형명',
+             '재결례유형코드', '행정심판례상세링크', '재결요지', '주문', '청구취지', 'summary_status'),
     'prec': ('판례일련번호', '판례정보일련번호', '사건번호', '법원명', '선고일자', '데이터출처명',
              '사건명', '사건종류명', '사건종류', '판시사항', '판결요지', '참조조문',
              'issues', 'holding', 'summary_status'),
@@ -45,8 +49,8 @@ FIELDS = {
 }
 # Row array key inside the lawSearch.do root, as law.go.kr returns it (probe 2026-10-29:
 # PrecSearch.prec, CgmExpc.cgmExpc, Decc.decc). The target name is accepted first.
-ROW_KEYS = {'prec': ('prec',), 'ntsCgmExpc': ('cgmExpc', 'expc'), 'ttSpecialDecc': ('decc',)}
-ID_KEYS = {'prec': ('판례일련번호', '판례정보일련번호'),
+ROW_KEYS = {'decc': ('decc',), 'prec': ('prec',), 'ntsCgmExpc': ('cgmExpc', 'expc'), 'ttSpecialDecc': ('decc',)}
+ID_KEYS = {'decc': ('행정심판재결례일련번호', '행정심판례일련번호'), 'prec': ('판례일련번호', '판례정보일련번호'),
            'ntsCgmExpc': ('법령해석일련번호', '법령해석례일련번호', '일련번호'),
            'ttSpecialDecc': ('특별행정심판재결례일련번호',)}
 ERROR_CODES = frozenset(('CATALOG_ROOT_INVALID', 'CATALOG_COUNT_CHANGED', 'CATALOG_ROW_INVALID',
@@ -148,7 +152,7 @@ def default_kind(row, target):
     """Decided from the list row only, so verify_cache can re-derive it."""
     if target == 'ntsCgmExpc':
         return 'listing'
-    if target == 'ttSpecialDecc':
+    if target in ('ttSpecialDecc', 'decc'):
         return 'detail'
     kinds = PREC_KINDS.get(text(row, '데이터출처명'))
     return ('detail' if 'detail' in kinds else 'listing') if kinds else 'skipped'
@@ -157,6 +161,8 @@ def default_kind(row, target):
 def allowed_kinds(row, target):
     if target == 'ntsCgmExpc':
         return {'listing'}
+    if target == 'decc':
+        return {'detail'}
     if target == 'ttSpecialDecc':
         return {'detail', 'listing'}
     return PREC_KINDS.get(text(row, '데이터출처명'), {'skipped'})
@@ -194,7 +200,7 @@ def catalog_rows(root, target):
 
 
 def row_date(row, target):
-    value = (text(row, '의결일자') if target == 'ttSpecialDecc' else
+    value = (text(row, '의결일자') if target in ('ttSpecialDecc', 'decc') else
              text(row, '선고일자') if target == 'prec' else text(row, '해석일자', '회신일자', '생산일자'))
     if not re.fullmatch(r'\d{8}|\d{4}\.\d{2}\.\d{2}\.?|\d{4}-\d{2}-\d{2}', value):
         raise ValueError('DATE_FORMAT_INVALID')
@@ -212,9 +218,39 @@ def case_numbers(value):
     return set(re.findall(r'\d{2,4}[가-힣]+\d+', compact))
 
 
+def committee_url(row, sid):
+    # Drop all query parameters except the verified source document identity.
+    link = text(row, '행정심판례상세링크')
+    parts = urlsplit(urljoin('https://www.law.go.kr', link))
+    query = parse_qs(parts.query)
+    if (parts.hostname not in ('law.go.kr', 'www.law.go.kr') or parts.username or parts.password
+            or parts.scheme not in ('http', 'https') or parts.port not in (None, 80, 443)
+            or parts.path != '/DRF/lawService.do' or query.get('target') != ['decc']
+            or query.get('ID') != [sid]):
+        raise ValueError('INTERPRETATION_URL_INVALID')
+    return 'https://www.law.go.kr/DRF/lawService.do?' + urlencode({'target': 'decc', 'ID': sid, 'type': 'HTML'})
+
+
+def committee_record(row, sid, day):
+    if not all(text(row, k) for k in ('사건명', '사건번호', '재결청')):
+        raise ValueError('TRIBUNAL_METADATA_MISSING')
+    disposed = text(row, '처분일자')
+    if disposed:
+        disposed = re.sub(r'[.-]', '', disposed)
+        check_date(disposed, 'disposed')
+        disposed = f'{disposed[:4]}-{disposed[4:6]}-{disposed[6:]}'
+    return dict(source='decc', id=sid, case_no=text(row, '사건번호'), committee=text(row, '재결청'),
+                agency=text(row, '처분청'), date=day, decided=f'{day[:4]}-{day[4:6]}-{day[6:]}',
+                disposed=disposed or None, title=text(row, '사건명'), holding='', order='', claim='',
+                type_name=text(row, '재결구분명', '재결례유형명'), type_code=text(row, '재결구분코드', '재결례유형코드'),
+                official_url=committee_url(row, sid))
+
+
 def listed(row, target):
     """Entry-level checks of one list row (no request). Never decides the date gate."""
     sid, day = identifier(row, target), row_date(row, target)
+    if target == 'decc':
+        return committee_record(row, sid, day)
     if target == 'prec':
         number = re.sub(r'\s', '', text(row, '사건번호'))
         prefixed = COURT_CASE.fullmatch(number)
@@ -259,6 +295,8 @@ def validated(row, summary, target, kind):
     before any request, and a cache written later must stay valid on every later day.
     """
     base = listed(row, target)
+    if target == 'decc' and kind != 'detail':
+        raise ValueError('CACHE_KIND_INVALID')
     if kind == 'listing':
         if summary != row:
             raise ValueError('LIST_DETAIL_MISMATCH')
@@ -270,6 +308,19 @@ def validated(row, summary, target, kind):
     if identifier(summary, target) != base['id'] or row_date(summary, target) != base['date']:
         raise ValueError('LIST_DETAIL_MISMATCH')
     clean = lambda key: page_text(text(summary, key).encode('utf-8'))  # noqa: E731
+    if target == 'decc':
+        if any(not text(summary, k) or text(summary, k) != text(row, k) for k in ('사건명', '사건번호', '재결청')):
+            raise ValueError('LIST_DETAIL_MISMATCH')
+        for key in ('처분일자', '처분청'):
+            if re.sub(r'[.-]', '', text(summary, key)) != re.sub(r'[.-]', '', text(row, key)):
+                raise ValueError('LIST_DETAIL_MISMATCH')
+        base.update(holding=clean('재결요지'), order=clean('주문'), claim=clean('청구취지'),
+                    type_name=text(summary, '재결례유형명'), type_code=text(summary, '재결례유형코드'))
+        if not base['holding'].strip():
+            base['summary_status'] = 'EMPTY_AT_SOURCE'
+        if 'summary_status' in summary and (summary['summary_status'] != 'EMPTY_AT_SOURCE' or base['holding'].strip()):
+            raise ValueError('CACHE_SUMMARY_FIELDS_INVALID')
+        return base
     if target == 'prec':
         # The id already proves identity; the number must still agree (merged cases by membership).
         # The detail's court name is abbreviated (창원지법), so the list's court is kept.
@@ -337,7 +388,7 @@ def verify_cache(out, manifest):
         if 'sha256' not in item:
             continue
         path = item['path']
-        if not re.fullmatch(r'(?:pages/(?:prec|ntsCgmExpc|ttSpecialDecc)/(?:inc-[1-9][0-9]*-)?[0-9]+|summaries/(?:prec|ntsCgmExpc|ttSpecialDecc)/[0-9]+)\.json', path) or path in expected:
+        if not re.fullmatch(r'(?:pages/(?:prec|ntsCgmExpc|ttSpecialDecc|decc)/(?:inc-[1-9][0-9]*-)?[0-9]+|summaries/(?:prec|ntsCgmExpc|ttSpecialDecc|decc)/[0-9]+)\.json', path) or path in expected:
             raise ValueError('CACHE_PATH_INVALID_OR_DUPLICATE')
         expected.add(path)
         file = out / path
@@ -443,14 +494,14 @@ def put_bytes(out, path, raw):
     return digest(raw)
 
 
-def count_catalogs(client):
+def count_catalogs(client, scope='all'):
     """Exactly one page per target (transport retries remain Client's policy).
 
     Only numeric counts and fixed statuses leave memory; no response bodies,
     snippets, links, authenticated URLs or credentials are written.
     """
     counts = {}
-    for target in TARGETS:
+    for target in (TARGETS if scope == 'committee' else DEFAULT_TARGETS):
         try:
             doc, _ = client.get('lawSearch.do', dict(target=target, display=1, page=1))
             roots = [v for v in doc.values() if isinstance(v, dict) and 'totalCnt' in v]
@@ -461,7 +512,7 @@ def count_catalogs(client):
         except Exception:
             counts[target] = dict(status='FAILED', reason='COUNT_REQUEST_OR_RESPONSE_FAILED')
     return dict(mode='count', counted_at=stamp(), counts=counts,
-                status='COMPLETE' if all(counts[t]['status'] == 'SUCCESS' for t in TARGETS) else 'INCOMPLETE')
+                status='COMPLETE' if all(counts[t]['status'] == 'SUCCESS' for t in counts) else 'INCOMPLETE')
 
 
 class CollectionPaused(Exception):
@@ -479,6 +530,8 @@ def store_entry(client, out, entry, date, check_budget=lambda: None):
     else:
         check_budget()
         doc, raw = client.get('lawService.do', dict(target=target, ID=sid), original=True)
+        if target == 'decc' and not_found(doc):
+            raise ValueError('DETAIL_NOT_FOUND')
         if not_found(doc):
             if not listed(entry['row'], target)['title']:
                 raise ValueError('DETAIL_NOT_FOUND')
@@ -492,6 +545,9 @@ def store_entry(client, out, entry, date, check_budget=lambda: None):
             # Preserve original allowed field bytes; append only local metadata.
             parts = members(raw)
             raw = b'{' + b','.join(v for k, v in parts.items() if k not in ('issues', 'holding', 'summary_status')) + b',"issues":"","holding":"","summary_status":"EMPTY_AT_SOURCE"}'
+    if target == 'decc' and not page_text(text(strict_json(raw), '재결요지').encode('utf-8')).strip():
+        parts = members(raw)
+        raw = b'{' + b','.join(v for k, v in parts.items() if k != 'summary_status') + b',"summary_status":"EMPTY_AT_SOURCE"}'
     clean, _ = sanitized(strict_json(raw), getattr(client, 'credential', ''))
     if clean != strict_json(raw) or credential_markers(raw):
         raise ValueError('CREDENTIAL_BEARING_SUMMARY')
@@ -504,14 +560,14 @@ TRANSIENT_RETRY_LIMIT = 500
 MAX_TRANSIENT_ATTEMPTS = 3
 
 
-def recover_transient(client, out, manifest, date, check_budget, checkpoint, limit):
+def recover_transient(client, out, manifest, date, check_budget, checkpoint, limit, targets=DEFAULT_TARGETS):
     """One bounded durable queue per discovery round; failed cached bytes remain untouched."""
     inc = manifest['incremental']
     recovery = inc.get('recovery')
     if recovery is None:
         eligible = []
         for entry in manifest['documents']:
-            if (entry['status'] != 'FAILED' or entry.get('reason') in PERMANENT_FAILURES
+            if (entry['target'] not in targets or entry['status'] != 'FAILED' or entry.get('reason') in PERMANENT_FAILURES
                     or entry.get('frozen') or entry.get('attempts', 0) >= MAX_TRANSIENT_ATTEMPTS):
                 continue
             if entry.get('reason') == 'DATE_IN_FUTURE' and row_date(entry['row'], entry['target']) > date:
@@ -524,7 +580,7 @@ def recover_transient(client, out, manifest, date, check_budget, checkpoint, lim
     while recovery['cursor'] < len(recovery['queue']):
         check_budget()
         entry = indexed[tuple(recovery['queue'][recovery['cursor']])]
-        if entry['status'] == 'FAILED':
+        if entry['status'] == 'FAILED' and entry['target'] in targets:
             candidate = dict(entry)
             try:
                 # Validate in isolation: a failed refresh must not overwrite the old cache.
@@ -576,9 +632,27 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
     if skipped_failures is None:
         skipped_failures = {}
     skipped_failures.clear()
-    if scope not in ('tax', 'all'):
+    if scope not in ('tax', 'all', 'committee'):
         raise ValueError('SCOPE_INVALID')
     out = Path(out)
+    targets = TARGETS if scope == 'committee' else DEFAULT_TARGETS
+    if scope == 'committee':
+        # Finish ordinary sources first under the SAME caller budget and account.
+        seen_accounts = set()
+        original_account = account
+        def once(entry, result):
+            key = (entry['target'], entry['id'])
+            if key not in seen_accounts and original_account:
+                original_account(entry, result)
+                seen_accounts.add(key)
+        account = once if original_account else None
+        prior = out / 'manifest.json'
+        cached = strict_json(prior.read_bytes()) if prior.exists() else {}
+        if not cached.get('partial_targets'):
+            ok = collect(client, out, date, scope='all', stop=stop, account=account, clock=clock,
+                         retry_failed=retry_failed, incremental=incremental, min_days=min_days, transient_limit=transient_limit)
+            if not ok or (stop and stop()):
+                return ok
     checkpoint = out / 'manifest.json'
     manifest = strict_json(checkpoint.read_bytes()) if checkpoint.exists() else {
         'schema': SCHEMA, 'date': date, 'pages': [], 'documents': [], 'catalogs': {}}
@@ -611,7 +685,7 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
             retry_failed = 'none'
 
         inc = manifest.get('incremental')
-        ready = (set(manifest['catalogs']) == set(TARGETS)
+        ready = (set(manifest['catalogs']) == set(targets)
                  and all(c['complete'] for c in manifest['catalogs'].values())
                  and not any(e['status'] == 'PENDING' for e in manifest['documents']))
         last_date = manifest.get('last_catalog_date', manifest['date'])
@@ -619,7 +693,7 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
                 and (not inc or inc.get('recovery', {}).get('complete', True))
                 and (datetime.strptime(date, '%Y%m%d') - datetime.strptime(last_date, '%Y%m%d')).days >= min_days):
             number = (inc['round'] if inc else 0) + 1
-            inc = dict(round=number, new_documents=0, per_target={t: 0 for t in TARGETS}, complete=False)
+            inc = dict(round=number, new_documents=0, per_target={t: 0 for t in targets}, complete=False)
             manifest['incremental'] = inc
             manifest['date'] = date
             for c in manifest['catalogs'].values():
@@ -631,7 +705,7 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
 
         if account:
             for entry in manifest['documents']:
-                if entry['status'] == 'SUCCESS':
+                if entry['status'] == 'SUCCESS' and entry['target'] in targets:
                     account(entry, validated(entry['row'], strict_json((out / entry['path']).read_bytes()),
                                              entry['target'], entry['kind']))
         def check_budget():
@@ -639,7 +713,7 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
             if reason:
                 raise CollectionPaused(reason)
         # A partial public export lists its catalogs in partial_targets; the rest are never paged here.
-        for target in tuple(manifest.get('partial_targets') or TARGETS):
+        for target in tuple([t for t in (manifest.get('partial_targets') or targets) if t in targets]):
             state = manifest['catalogs'].setdefault(target, {'next_page': 1, 'complete': False})
             if active_inc:
                 state = state['increments'][-1]
@@ -705,7 +779,8 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
                 checkpoint_now(force=state['complete'])
         if active_inc or 'last_catalog_date' not in manifest:
             manifest['last_catalog_date'] = date
-        entries = manifest['documents']
+        entries = [e for e in manifest['documents'] if e['target'] in targets]
+        entries.sort(key=lambda e: e['target'] == 'decc')
         if scope == 'tax':
             entries = sorted(entries, key=tax_first)
         for entry in entries:
@@ -751,8 +826,8 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
             inc['complete'] = not any(e['status'] == 'PENDING' for e in entries)
         if (incremental and requested_retry == 'transient' and inc and inc.get('complete')
                 and not any(e['status'] == 'PENDING' for e in entries)):
-            recover_transient(client, out, manifest, date, check_budget, checkpoint_now, transient_limit)
-        manifest.update(status='COMPLETE' if all(e['status'] in ('SUCCESS', 'SKIPPED') for e in manifest['documents'])
+            recover_transient(client, out, manifest, date, check_budget, checkpoint_now, transient_limit, targets)
+        manifest.update(status='COMPLETE' if all(e['status'] in ('SUCCESS', 'SKIPPED') for e in entries)
                         else 'INCOMPLETE', updated_at=stamp(), api_calls=client.calls)
         checkpoint_now(force=True)
         return manifest['status'] == 'COMPLETE'
@@ -773,7 +848,7 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--out', type=Path, default=Path('release/precedent-collection'))
-    ap.add_argument('--scope', choices=('tax', 'all'), default='tax')
+    ap.add_argument('--scope', choices=('tax', 'all', 'committee'), default='tax')
     args = ap.parse_args()
     credential = os.environ.get('LAW_OC', '')
     if not credential:
