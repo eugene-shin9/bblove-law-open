@@ -845,16 +845,179 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
         return False
 
 
+FULLTEXT_TARGETS = {'prec'}
+FULLTEXT_BUDGET_BYTES = 8_000_000_000
+FULLTEXT_WARNING_BYTES = 21_600
+FULLTEXT_MAX_SECONDS = 7200
+FULLTEXT_RECHECK_DAYS = 180
+
+
+def fulltext_object(row, raw, fetched_at, credential=''):
+    """Keep source HTML; offsets are Unicode indices including boundary markup."""
+    doc = strict_json(raw)
+    detail = doc.get('PrecService', doc)
+    base = validated(row, strict_json(summary_bytes(raw, 'prec')), 'prec', 'detail')
+    body = detail.get('판례내용')
+    if not isinstance(body, str) or not body.strip():
+        raise ValueError('FULLTEXT_MISSING')
+    # Only authentication query values in links may change. Other source HTML is untouched.
+    body = re.sub(r'(?i)((?:[?&]|&amp;)OC=)[^\s<>"\'&]*', r'\1[REDACTED]', body)
+    bounds = [0] + [m.end() for m in re.finditer(r'(?i)<br\s*/?>|</p\s*>|\n', body)]
+    if bounds[-1] != len(body):
+        bounds.append(len(body))
+    value = dict(id=base['id'], case_no=base['case_no'], court=base['court'], date=base['date'],
+                 official_url=f"https://www.law.go.kr/LSW/precInfoP.do?precSeq={base['id']}",
+                 fetched_at=fetched_at, body=body, body_sha256=digest(body.encode('utf-8')),
+                 paragraphs=[[a, b] for a, b in zip(bounds, bounds[1:]) if a < b], transform_version='raw-1')
+    encoded = json.dumps(value, ensure_ascii=False).encode('utf-8')
+    if credential and credential.encode() in encoded:
+        raise ValueError('CREDENTIAL_BEARING_FULLTEXT')
+    return value
+
+
+def fulltext_usage(out):
+    out = Path(out)
+    return sum(p.stat().st_size for p in out.rglob('*') if p.is_file()) if out.exists() else 0
+
+
+def store_fulltext(out, value, manifest, budget=FULLTEXT_BUDGET_BYTES, usage=None):
+    """Budget includes both retained generations, manifest and peak temporary object.
+
+    usage, when given, is a {'bytes': int} counter kept in step with the files this function
+    writes and deletes, so a long run does not walk the whole tree once per document."""
+    out = Path(out)
+    sid = value['id']
+    if not re.fullmatch(r'[0-9]+', sid) or not 0 < budget <= FULLTEXT_BUDGET_BYTES:
+        raise ValueError('FULLTEXT_ARGUMENT_INVALID')
+    path = out / 'prec' / (sid + '.json')
+    old = strict_json(path.read_bytes()) if path.exists() else None
+    if old and old['body_sha256'] == value['body_sha256']:
+        return False
+    raw = json.dumps(value, ensure_ascii=False, indent=2).encode('utf-8')
+    used = fulltext_usage(out) if usage is None else usage['bytes']
+    # Allow space for a new manifest and previous-copy before replacing active data.
+    metadata = dict(sha256=digest(raw), bytes=len(raw), status='SUCCESS')
+    candidate = dict(manifest, documents={**manifest['documents'], sid: metadata})
+    reserve = len(json.dumps(candidate, ensure_ascii=False, indent=2).encode()) + 4096
+    if used + len(raw) + (path.stat().st_size if old else 0) + reserve > budget:
+        raise CollectionPaused('FULLTEXT_BYTE_BUDGET')
+    versions = out / 'prec' / 'versions' / sid
+    delta = len(raw)
+    if old:
+        old_raw = path.read_bytes()
+        versions.mkdir(parents=True, exist_ok=True)
+        kept = versions / (old['body_sha256'] + '.json')
+        # old body moves to versions/ (net 0 against the replaced active file);
+        # a same-named copy already there is overwritten.
+        delta -= kept.stat().st_size if kept.exists() else 0
+        put_bytes(out, f"prec/versions/{sid}/{old['body_sha256']}.json", old_raw)
+    put_bytes(out, f'prec/{sid}.json', raw)
+    if versions.exists():
+        keep = old['body_sha256'] if old else None
+        for previous in versions.glob('*.json'):
+            if previous.stem != keep:
+                delta -= previous.stat().st_size
+                previous.unlink()
+    if usage is not None:
+        usage['bytes'] = used + delta
+    manifest['documents'][sid] = metadata
+    return True
+
+
+def collect_fulltext(client_factory, summary_out, out, deadline, date, clock=time.monotonic,
+                     max_seconds=FULLTEXT_MAX_SECONDS, budget=FULLTEXT_BUDGET_BYTES):
+    """Second pass over validated summary IDs, sharing the caller's absolute deadline."""
+    if not 0 < max_seconds <= FULLTEXT_MAX_SECONDS or not 0 < budget <= FULLTEXT_BUDGET_BYTES:
+        raise ValueError('FULLTEXT_ARGUMENT_INVALID')
+    summary_out, out = Path(summary_out), Path(out)
+    if summary_out.resolve() == out.resolve() or summary_out.resolve() in out.resolve().parents:
+        raise ValueError('FULLTEXT_DIRECTORY_INVALID')
+    source = strict_json((summary_out / 'manifest.json').read_bytes())
+    verify_cache(summary_out, source)
+    checkpoint = out / 'fulltext-manifest.json'
+    manifest = strict_json(checkpoint.read_bytes()) if checkpoint.exists() else dict(
+        kind='precedent-fulltext-raw', format_version=1, date=date, documents={})
+    if manifest.get('kind') != 'precedent-fulltext-raw' or manifest.get('format_version') != 1:
+        raise ValueError('FULLTEXT_MANIFEST_INVALID')
+    deadline = min(deadline, clock() + max_seconds)
+    client, client_until = None, 0
+    sizes = list(manifest.get('recent_bytes', []))[-100:]
+    for sid, meta in manifest['documents'].items():
+        if not re.fullmatch(r'[0-9]+', sid):
+            raise ValueError('FULLTEXT_ID_INVALID')
+        raw = (out / 'prec' / (sid + '.json')).read_bytes()
+        if digest(raw) != meta['sha256'] or len(raw) != meta['bytes']:
+            raise ValueError('FULLTEXT_CACHE_INVALID')
+    manifest.pop('stop_reason', None)
+    manifest.update(status='COMPLETE', date=date)
+    usage = {'bytes': fulltext_usage(out)}
+    eligible = [e for e in source['documents'] if e['target'] in FULLTEXT_TARGETS
+                and e.get('kind') == 'detail' and e['status'] == 'SUCCESS']
+    # A date-keyed "checked today" skip alone would restart at the first ID every day and never
+    # reach the rest; fetch IDs without a stored body first (failures included), and recheck stored
+    # bodies for changes only once every ID is stored, oldest check first, after the recheck age.
+    pending = [e for e in eligible if e['id'] not in manifest['documents']]
+    if pending:
+        queue = pending
+    else:
+        today_ = datetime.strptime(date, '%Y%m%d')
+        def age(e):
+            checked = manifest['documents'][e['id']].get('checked_date')
+            return (today_ - datetime.strptime(checked, '%Y%m%d')).days if checked else 10 ** 6
+        queue = sorted((e for e in eligible if age(e) >= FULLTEXT_RECHECK_DAYS), key=age, reverse=True)
+    try:
+        for entry in queue:
+            remaining = deadline - clock()
+            if remaining < 35:
+                raise CollectionPaused('TIME_BUDGET')
+            if client is None or clock() >= client_until:
+                client = client_factory(remaining)
+                client_until = clock() + min(remaining, 3400) - 35
+            try:
+                _, raw = client.get('lawService.do', dict(target='prec', ID=entry['id']), original=True)
+                value = fulltext_object(entry['row'], raw, stamp(), getattr(client, 'credential', ''))
+                store_fulltext(out, value, manifest, budget, usage)
+                manifest['documents'][entry['id']]['checked_date'] = date
+                manifest.get('failures', {}).pop(entry['id'], None)
+                sizes = (sizes + [len(raw)])[-100:]
+                if len(sizes) == 100 and sum(sizes) / 100 > FULLTEXT_WARNING_BYTES:
+                    print('::warning title=Fulltext size::FULLTEXT_MOVING_AVERAGE_EXCEEDED')
+            except CollectionPaused:
+                raise
+            except Exception as exc:
+                if str(exc) == 'COLLECTION_BUDGET_EXHAUSTED':
+                    raise CollectionPaused('TIME_BUDGET') from None
+                manifest['status'] = 'INCOMPLETE'
+                manifest.setdefault('failures', {})[entry['id']] = 'FULLTEXT_FETCH_OR_VALIDATION_FAILED'
+            manifest['recent_bytes'] = sizes
+            save(checkpoint, manifest)
+    except CollectionPaused as exc:
+        manifest.update(status='PAUSED', stop_reason=str(exc))
+    save(checkpoint, manifest)
+    return manifest['status']
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--out', type=Path, default=Path('release/precedent-collection'))
     ap.add_argument('--scope', choices=('tax', 'all', 'committee'), default='tax')
+    ap.add_argument('--fulltext', action='store_true')
+    ap.add_argument('--fulltext-max-seconds', type=float, default=7200)
     args = ap.parse_args()
     credential = os.environ.get('LAW_OC', '')
     if not credential:
         print('LAW_OC_NOT_AVAILABLE')
         return 1
+    if args.fulltext and not 0 < args.fulltext_max_seconds <= FULLTEXT_MAX_SECONDS:
+        print('FULLTEXT_ARGUMENT_INVALID')
+        return 1
+    deadline = time.monotonic() + 18000
     ok = collect(Client(credential), args.out, today(), args.scope)
+    if args.fulltext and ok:
+        collect_fulltext(lambda remaining: Client(credential, seconds=remaining), args.out,
+                         Path('auto/fulltext-collection'), deadline, today(),
+                         max_seconds=args.fulltext_max_seconds,
+                         budget=int(os.environ.get('FULLTEXT_BUDGET_BYTES', '8000000000')))
     print('COLLECTION_COMPLETE' if ok else 'COLLECTION_INCOMPLETE')
     return 0 if ok else 1
 
