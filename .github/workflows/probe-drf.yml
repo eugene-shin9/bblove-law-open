@@ -28,7 +28,7 @@ jobs:
 
           def main():
               oc = os.environ['LAW_OC']
-              for target in ('law', 'eflaw', 'prec', 'ntsCgmExpc', 'ttSpecialDecc'):
+              for target in ('decc', 'ttSpecialDecc'):
                   c = BoundedClient(oc, measured_transport, request_limit=1)
                   keys, err = None, None
                   try:
