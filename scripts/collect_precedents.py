@@ -53,7 +53,7 @@ def outcome(out):
     return 'PASS_DONE'
 
 
-def reset_catalog(out):
+def reset_catalog(out, targets=TARGET_ORDER):
     """Restart an unfinished listing without discarding fetched details or older rounds."""
     out = Path(out)
     path = out / 'manifest.json'
@@ -64,7 +64,7 @@ def reset_catalog(out):
     inc = m.get('incremental')
     if inc and inc.get('complete') is False:
         number = inc['round']
-        target = next((t for t in TARGET_ORDER if t in catalogs
+        target = next((t for t in targets if t in catalogs
                        and catalogs[t].get('increments')
                        and not catalogs[t]['increments'][-1].get('complete')), None)
         if target is None:
@@ -88,7 +88,7 @@ def reset_catalog(out):
         for page in pages:
             (out / page['path']).unlink(missing_ok=True)
         return target
-    target = next((t for t in TARGET_ORDER if t in catalogs and not catalogs[t].get('complete')), None)
+    target = next((t for t in targets if t in catalogs and not catalogs[t].get('complete')), None)
     if target is None or any(d.get('target') == target and 'sha256' in d for d in m.get('documents', [])):
         return None
     for page in [p for p in m.get('pages', []) if p.get('target') == target]:
@@ -101,7 +101,7 @@ def reset_catalog(out):
     return target
 
 
-def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect_fn=collect, date=None, min_days=1):
+def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect_fn=collect, date=None, min_days=1, targets=None):
     out = Path(out)
     deadline = clock() + total_seconds
     stop = lambda: 'TIME_BUDGET' if clock() >= deadline else None  # noqa: E731
@@ -115,10 +115,11 @@ def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect
         if attempt.exists():
             attempt.unlink()  # only this invocation's failures count
         collect_fn(client_factory(remaining), out, date, scope, stop=stop,
-                   **({'incremental': True, 'min_days': min_days} if collect_fn is collect else {}))
+                   **({'incremental': True, 'min_days': min_days} if collect_fn is collect else {}),
+                   **({'targets': targets} if targets is not None else {}))
         if attempt.exists():
             reason = json.loads(attempt.read_text(encoding='utf-8')).get('reason')
-            if reason in RESETTABLE and resets < MAX_RESETS and reset_catalog(out):
+            if reason in RESETTABLE and resets < MAX_RESETS and reset_catalog(out, targets or TARGET_ORDER):
                 resets += 1
                 print(f'CATALOG_RESET {reason} ({resets}/{MAX_RESETS})')
                 continue
@@ -256,16 +257,15 @@ def may_publish_partial(current, release_rows):
 def partial_publication_allowed(current, execute=subprocess.run):
     """Fail closed on request errors, stderr, invalid JSON or truncated history."""
     try:
-        result = execute(['gh', 'release', 'list', '--limit', str(RELEASE_HISTORY_LIMIT),
-                          '--json', 'tagName,isDraft'], capture_output=True, text=True, timeout=120)
+        result = execute(['gh', 'api', '--paginate', '--slurp', 'repos/{owner}/{repo}/releases?per_page=100'], capture_output=True, text=True, timeout=120)
         if result.returncode or result.stderr.strip():
             raise ValueError('RELEASE_HISTORY_REQUEST_FAILED')
         rows = json.loads(result.stdout)
+        if isinstance(rows, list) and all(isinstance(page, list) for page in rows):
+            rows = [dict(tagName=r['tag_name'], isDraft=r['draft']) for page in rows for r in page]
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         raise ValueError('RELEASE_HISTORY_REQUEST_FAILED') from None
     published_targets(rows)  # distinguish a valid [] from invalid/incomplete history
-    if len(rows) >= RELEASE_HISTORY_LIMIT:
-        raise ValueError('RELEASE_HISTORY_TRUNCATED')
     return may_publish_partial(current, rows)
 
 
@@ -276,9 +276,31 @@ def should_publish(manifest):
     return not inc or (inc.get('complete', False) and inc.get('recovery', {}).get('complete', True) and (inc['new_documents'] > 0 or migrated or inc.get('recovery', {}).get('successes', 0) > 0))
 
 
+def run_committee(summary_state, out, deadline, factory, clock=time.monotonic, min_days=1):
+    state, new = 'SKIPPED', 0
+    try:
+        if summary_state in ('COMPLETE', 'PASS_DONE'):
+            state = run(out, 'all', max(0, deadline-clock()), factory, clock=clock,
+                        min_days=min_days, targets=('decc',))
+            path = Path(out) / 'manifest.json'
+            if path.exists():
+                m = json.loads(path.read_text())
+                new = m.get('incremental', {}).get('new_documents', len(m['documents']))
+    except Exception:
+        state = 'FAILED'
+        print('::warning::COMMITTEE_COLLECTION_FAILED')
+    target = os.environ.get('GITHUB_OUTPUT')
+    if target:
+        with open(target, 'a') as fh:
+            fh.write(f'committee_outcome={state}\ncommittee_complete={str(state in ("COMPLETE", "PASS_DONE")).lower()}\ncommittee_new={new}\n')
+    return state
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--out', type=Path, default=Path('auto/precedent-collection'))
+    ap.add_argument('--committee', action='store_true')
+    ap.add_argument('--committee-out', type=Path, default=Path('auto/committee-collection'))
     ap.add_argument('--fulltext', action='store_true')
     ap.add_argument('--fulltext-out', type=Path, default=Path('auto/fulltext-collection'))
     ap.add_argument('--fulltext-max-seconds', type=float, default=7200)
@@ -325,16 +347,21 @@ def main():
     if args.fulltext and (not 0 < args.fulltext_max_seconds <= 7200 or not 0 < args.seconds <= 18000):
         print('FULLTEXT_ARGUMENT_INVALID')
         return 1
-    deadline = time.monotonic() + args.seconds
-    state = run(args.out, args.scope, args.seconds,
+    seconds = min(args.seconds, 16200) if args.committee else args.seconds
+    deadline = time.monotonic() + seconds
+    state = run(args.out, args.scope, seconds,
                 lambda remaining: Client(credential, seconds=remaining, interval=args.interval), min_days=args.min_days)
+    write_outputs(state)
+    if args.committee:
+        run_committee(state, args.committee_out, deadline,
+                      lambda remaining: Client(credential, seconds=remaining, interval=max(1.0, args.interval)),
+                      min_days=args.min_days)
     if args.fulltext and state in ('COMPLETE', 'PASS_DONE'):
         fulltext_state = collect_fulltext(
             lambda remaining: Client(credential, seconds=remaining, interval=max(1.0, args.interval)),
             args.out, args.fulltext_out, deadline, today(), max_seconds=args.fulltext_max_seconds,
             budget=int(os.environ.get('FULLTEXT_BUDGET_BYTES', '8000000000')))
         print('FULLTEXT_' + fulltext_state)
-    write_outputs(state)
     print(json.dumps({'outcome': state, **summary(args.out)}, ensure_ascii=False))
     return 1 if state == 'FAILED' else 0
 

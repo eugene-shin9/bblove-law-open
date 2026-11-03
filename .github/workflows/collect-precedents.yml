@@ -49,6 +49,14 @@ jobs:
           key: precedent-summary-v2-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             precedent-summary-v2-
+      - name: Restore committee checkpoint
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: auto/committee-collection
+          key: committee-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            committee-v1-
       - name: Choose law.go.kr egress and check it answers (fails fast when blocked)
         id: egress
         uses: ./.github/actions/law-egress
@@ -63,7 +71,7 @@ jobs:
           LAW_OC: ${{ secrets.LAW_OC }}
           # Only this step goes through the exit node; empty means direct.
           HTTPS_PROXY: ${{ steps.egress.outputs.https-proxy }}
-        run: python scripts/collect_precedents.py --out auto/precedent-collection --scope all --seconds 18000
+        run: python scripts/collect_precedents.py --out auto/precedent-collection --scope all --seconds 18000 --committee
       - name: Credential scan before caching or uploading anything
         id: scan_raw
         if: always()
@@ -155,3 +163,44 @@ jobs:
           att = json.loads(a.read_text()) if a.exists() else {}
           print(f"::notice title=precedents::outcome=${{ steps.collect.outputs.outcome }} {json.dumps(s, ensure_ascii=False)} attempt={att.get('status')}/{att.get('reason')}")
           PY
+      - name: Scan committee cache
+        id: committee_scan
+        if: always() && steps.collect.outputs.committee_outcome != '' && steps.collect.outputs.committee_outcome != 'SKIPPED'
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python -I scripts/secret_scan.py auto/committee-collection
+      - name: Save committee checkpoint
+        if: always() && steps.committee_scan.outcome == 'success'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: auto/committee-collection
+          key: committee-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Build gated committee projection
+        id: committee_package
+        if: always() && steps.committee_scan.outcome == 'success' && steps.collect.outputs.committee_complete == 'true'
+        run: python -I scripts/committee_release.py --source auto/committee-collection --dest release-decc
+      - name: Scan committee release
+        id: committee_release_scan
+        if: always() && steps.committee_scan.outcome == 'success' && steps.committee_package.outcome == 'success'
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python -I scripts/secret_scan.py release-decc
+      - name: Compare last published committee manifest
+        id: committee_publish
+        if: always() && steps.committee_release_scan.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -I scripts/committee_release.py --dest release-decc --decide
+      - name: Attest committee release
+        id: committee_attest
+        if: always() && steps.committee_release_scan.outcome == 'success' && steps.committee_publish.outputs.needed == 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: release-decc/*
+      - name: Publish committee release
+        if: always() && steps.committee_release_scan.outcome == 'success' && steps.committee_publish.outputs.needed == 'true' && steps.committee_attest.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="decc-$(date -u +%Y%m%d)"
+          python -I scripts/publish_precedents.py --directory release-decc --tag "$tag" --title "$tag" --commit "$GITHUB_SHA"

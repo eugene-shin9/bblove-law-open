@@ -14,7 +14,7 @@ def publish(directory, tag, title, commit, execute=subprocess.run):
     directory = Path(directory)
     info = json.loads((directory / 'release-info.json').read_text())
     kind = info.get('kind')
-    pattern = {'precedent-summary-raw': r'prec-[0-9]{8}(?:-partial-(?:prec|ntsCgmExpc|ttSpecialDecc)(?:-(?:prec|ntsCgmExpc|ttSpecialDecc))*)?',
+    pattern = {'committee-summary-raw': r'decc-[0-9]{8}', 'precedent-summary-raw': r'prec-[0-9]{8}(?:-partial-(?:prec|ntsCgmExpc|ttSpecialDecc)(?:-(?:prec|ntsCgmExpc|ttSpecialDecc))*)?',
                'precedent-fulltext-raw': r'prec-fulltext-[0-9]{8}(?:-partial)?'}.get(kind)
     if not pattern or not re.fullmatch(pattern, tag) or info.get('format_version') != 1:
         raise ValueError('RELEASE_CONTRACT_INVALID')
