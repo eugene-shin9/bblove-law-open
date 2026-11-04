@@ -1,0 +1,112 @@
+name: Collect MOFE tax interpretations (mofe.go.kr)
+# 재정경제부(구 기획재정부) 세법해석 사례 공개 게시판(공공저작물)을 주 1회 증분 수집해 Release로 게시.
+# 인증값 없음. 수집 단계만 law-egress 프록시(한국 출구)를 쓴다.
+on:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Re-walk every list page and re-check every reply (default is incremental)
+        type: boolean
+        default: false
+  schedule:
+    # 매주 수요일 03:10 KST (화요일 18:10 UTC); 다른 수집과 같은 동시성 그룹이라 겹치면 순서대로 실행.
+    - cron: '10 18 * * 2'
+permissions: {}
+concurrency:
+  group: law-go-kr-drf
+  cancel-in-progress: false
+jobs:
+  collect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    env:
+      FULL: ${{ inputs.full == true && '--full' || '' }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install the YAML parser the workflow-contract tests use (pinned)
+        run: python -m pip install --disable-pip-version-check -q PyYAML==6.0.3
+      - name: Offline tests and public-content guard before any request
+        run: |
+          python -I -m unittest discover -s tests
+          python -I scripts/repo_guard.py
+      - name: Restore resumable checkpoint
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: auto/mofe
+          key: mofe-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            mofe-v1-
+      - name: Choose egress and check it answers (fails fast when blocked)
+        id: egress
+        uses: ./.github/actions/law-egress
+        with:
+          client-id: ${{ secrets.TS_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          exit-node: ${{ secrets.TS_EXIT_NODE }}
+      - name: Collect replies (1.5 s pacing; partial resumes next run)
+        id: collect
+        timeout-minutes: 60
+        env:
+          # Only this step goes through the exit node; empty means direct.
+          HTTPS_PROXY: ${{ steps.egress.outputs.https-proxy }}
+        run: python src/bblove_mofe_collect.py collect --out auto/mofe --seconds 3300 --partial-ok $FULL
+      - name: Personal-data pattern scan of the collected text (official replies; fail closed)
+        if: always()
+        run: python -I scripts/mofe_pii_scan.py auto/mofe
+      - name: Save checkpoint
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: auto/mofe
+          key: mofe-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Export, package with release-info
+        if: steps.collect.outputs.complete == 'true'
+        run: |
+          mkdir -p release
+          python src/bblove_mofe_collect.py export --out auto/mofe --dest release
+          python -I scripts/release_info.py --release release --manifest auto/mofe/manifest.json --kind mofe-interpretations-raw
+          (cd release && sha256sum -- * > SHA256SUMS)
+      - name: Build provenance attestation
+        if: steps.collect.outputs.complete == 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: release/*
+      - name: Publish an immutable release (draft until every file is uploaded)
+        if: steps.collect.outputs.complete == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="mofe-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
+          gh release create "$tag" --draft --target "$GITHUB_SHA" --latest=false \
+            --title "재정경제부 세법해석 사례 수집본 $(date -u +%Y-%m-%d)" \
+            --notes "mofe.go.kr 세법해석 사례(공공저작물, 출처: 재정경제부) 수집·검증본. release-info.json·SHA256SUMS·attestation으로 검증."
+          gh release upload "$tag" release/*
+          gh release edit "$tag" --draft=false --latest=false
+          echo "Published $tag" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the newest 4 mofe releases
+        if: steps.collect.outputs.complete == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,createdAt,isDraft \
+            --jq '[.[] | select(.tagName | startswith("mofe-")) | select(.isDraft | not)] | sort_by(.createdAt) | reverse | .[4:] | .[].tagName' |
+          while read -r old; do gh release delete "$old" --yes --cleanup-tag; done
+      - name: Progress (annotation; nothing is committed)
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path('auto/mofe/manifest.json')
+          m = json.loads(p.read_text()) if p.exists() else {}
+          print(f"::notice title=mofe::date={m.get('date')} status={m.get('status')} mode={m.get('mode')} docs={len(m.get('documents', []))} counts={m.get('status_counts')} pages={m.get('pages')} requests={m.get('requests')} stop={m.get('stop_reason')}")
+          PY
