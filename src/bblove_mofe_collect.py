@@ -13,7 +13,6 @@ import argparse
 from datetime import datetime
 import hashlib
 import html
-from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
@@ -96,60 +95,26 @@ def iso_date(value):
     return digits[:4] + '.' + digits[4:6] + '.' + digits[6:] + '.'
 
 
-class _ListParser(HTMLParser):
-    """Collect <li> blocks of ul.explnList: h3>a[fn_egov_select('MOSF_…')], span.depart, span.date."""
-    def __init__(self):
-        super().__init__()
-        self.rows, self.current, self.capture, self.depth = [], None, None, 0
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if tag == 'li':
-            self.depth += 1
-            if self.current is None:
-                self.current = {'id': '', 'title': '', 'doc': '', 'date': '', 'li_depth': self.depth}
-        if self.current is None:
-            return
-        if tag == 'a' and not self.current['id']:
-            target = (attrs.get('href') or '') + (attrs.get('onclick') or '')
-            matched = ID_PATTERN.search(target) if 'fn_egov_select' in target else None
-            if matched:
-                self.current['id'] = matched[0]
-                self.capture = 'title'
-        elif tag == 'span' and 'depart' in (attrs.get('class') or '').split():
-            self.capture = 'doc'
-        elif tag == 'span' and 'date' in (attrs.get('class') or '').split():
-            self.capture = 'date'
-
-    def handle_data(self, data):
-        if self.current is not None and self.capture:
-            self.current[self.capture] += data
-
-    def handle_endtag(self, tag):
-        if tag in ('a', 'span') and self.capture:
-            self.capture = None
-        if tag == 'li' and self.current is not None:
-            if self.depth == self.current['li_depth']:
-                row = self.current
-                self.current = None
-                if row['id']:
-                    self.rows.append(row)
-            self.depth -= 1
-        elif tag == 'li':
-            self.depth -= 1
-
-
 def parse_list(raw):
-    parser = _ListParser()
-    parser.feed(raw.decode('utf-8', errors='strict'))
+    """Rows of ul.explnList only. The site's menu leaves some <li> unclosed, so nesting is not
+    tracked: the list block is cut out by its own markers and each <li> inside it is read alone."""
+    text = raw.decode('utf-8', errors='strict')
+    block = re.search(r'<ul class="[^"]*\bexplnList\b[^"]*"[^>]*>(.*?)</ul>', text, re.S)
+    if not block:
+        raise ValueError('MOFE_LIST_LAYOUT')
     rows = []
-    for row in parser.rows:
-        doc = DOC_PATTERN.search(clean(row['doc']))
-        date = re.search(r'\d{4}\.\s*\d{1,2}\.\s*\d{1,2}', row['date'])
-        title = clean(row['title'])
+    for item in re.split(r'<li[\s>]', block[1])[1:]:
+        anchor = re.search(r"<a[^>]*fn_egov_select\(\s*'(MOSF_[0-9]{15})'\s*\)[^>]*>(.*?)</a>", item, re.S)
+        if not anchor:
+            continue
+        depart = re.search(r'<span class="depart[^"]*"[^>]*>(.*?)</span>', item, re.S)
+        when = re.search(r'<span class="date[^"]*"[^>]*>(.*?)</span>', item, re.S)
+        doc = DOC_PATTERN.search(clean(depart[1])) if depart else None
+        date = re.search(r'\d{4}\.\s*\d{1,2}\.\s*\d{1,2}', clean(when[1])) if when else None
+        title = clean(anchor[2])
         if not (doc and date and title):
             raise ValueError('MOFE_LIST_ROW_INVALID')
-        rows.append(dict(id=row['id'], title=title, doc=doc[0], date=iso_date(date[0])))
+        rows.append(dict(id=anchor[1], title=title, doc=doc[0], date=iso_date(date[0])))
     if len({r['id'] for r in rows}) != len(rows):
         raise ValueError('MOFE_LIST_DUPLICATE')
     return rows
@@ -190,6 +155,8 @@ def collect(client, out, date, full=False, stop=None):
             rows = parse_list(client.get(LIST_URL.format(page=page)))
             manifest['pages'] = page
             if not rows:
+                if page == 1:
+                    raise ValueError('MOFE_LIST_EMPTY')  # the newest page always has rows
                 break
             fresh = [r for r in rows if r['id'] not in seen]
             seen.update(r['id'] for r in rows)

@@ -21,7 +21,8 @@ def list_html(rows):
     <div class="boardInfo"><div class="infoLeft"><span class="depart">{r['doc']}</span>
       <span class="date">회신일자 : {r['date']}</span></div><div class="infoRight"><span>조회 4,459</span></div></div>
   </li>""" for r in rows)
-    return f"""<html><body><ul class="menu"><li><a href="/x">뉴스</a></li></ul>
+    # The real site leaves menu <li> tags unclosed; the parser must not depend on nesting.
+    return f"""<html><body><ul class="menu"><li><a href="/x">뉴스</a><li><a href="/y">정책</a></ul>
 <main><div class="subContainer"><div class="body"><ul class="boardType3 explnList">{items}
 </ul><div class="paging"><a href="?pageIndex=2">2</a></div></div></div></main></body></html>""".encode('utf-8')
 
@@ -85,6 +86,8 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             M.parse_detail(b'<html><body>502 Bad Gateway</body></html>')
         self.assertEqual(M.parse_list(list_html([])), [])
+        with self.assertRaises(ValueError):
+            M.parse_list(b'<html><body>blocked</body></html>')
 
 
 class CollectTests(unittest.TestCase):
@@ -145,6 +148,12 @@ class CollectTests(unittest.TestCase):
         before = len(transport.urls)
         self.assertTrue(M.collect(client(transport), self.out, '20261106', full=True))
         self.assertEqual([u for u in transport.urls[before:] if 'CaseView' in u], [M.DETAIL_URL.format(id=ntt(2))])
+
+    def test_empty_first_page_is_a_failure(self):
+        transport = FakeTransport({}, {})
+        self.assertFalse(M.collect(client(transport), self.out, '20261105'))
+        manifest = json.loads((self.out / 'manifest.json').read_text(encoding='utf-8'))
+        self.assertEqual((manifest['status'], manifest['stop_reason']), ('FAILED', 'MOFE_LIST_EMPTY'))
 
     def test_budget_exhaustion_keeps_a_resumable_manifest(self):
         rows, transport = self.world(n=5)
