@@ -10,6 +10,7 @@ COLLECTORS = {
     'collect-law-all.yml': 'python src/bblove_law_all.py',
     'collect-admrul.yml': 'python src/bblove_admrul.py collect',
     'collect-precedents.yml': 'python scripts/collect_precedents.py',
+    'collect-mofe.yml': 'python src/bblove_mofe_collect.py collect',
 }
 TS_SHA = '064b10558093f38325e838ddea35486bdc6b1d5c'
 
