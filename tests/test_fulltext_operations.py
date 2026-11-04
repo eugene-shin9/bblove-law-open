@@ -69,3 +69,26 @@ class FulltextOperationTests(unittest.TestCase):
         self.assertIn("state == 'PUBLISHED'",save_step['if']);self.assertIn("state == 'NO_DELTA'",save_step['if'])
         self.assertNotIn('FAILED',save_step['if'])
         final=step_by_id(job,'ft_finalize');self.assertIn('FULLTEXT_DELTA',final['env']);self.assertIn('PUBLISH_OUTCOME',final['env'])
+
+
+class SummaryBudgetTests(unittest.TestCase):
+    def test_summary_keeps_full_budget_and_extras_stop_early(self):
+        import collect_precedents as cp
+        from unittest import mock
+        seen = {}
+        def fake_run(out, scope, seconds, factory, **kw):
+            seen['summary_seconds'] = seconds
+            return 'PAUSED'
+        def fake_committee(state, out, deadline, factory, **kw):
+            seen['committee_deadline'] = deadline
+        def fake_fulltext(state, args, deadline, factory):
+            seen['fulltext_deadline'] = deadline
+        argv = ['collect_precedents.py', '--out', 'x', '--seconds', '18000', '--committee', '--fulltext']
+        with mock.patch.object(cp, 'run', fake_run), mock.patch.object(cp, 'run_committee', fake_committee), \
+             mock.patch.object(cp, 'run_fulltext', fake_fulltext), mock.patch.object(cp, 'write_outputs', lambda *a, **k: None), \
+             mock.patch.object(cp, 'summary', lambda out: {}), mock.patch.object(cp.time, 'monotonic', lambda: 1000.0), \
+             mock.patch.dict(cp.os.environ, {'LAW_OC': 'synthetic'}), mock.patch.object(cp.sys, 'argv', argv):
+            cp.main()
+        self.assertEqual(seen['summary_seconds'], 18000)
+        self.assertEqual(seen['committee_deadline'], 1000.0 + 15600)
+        self.assertEqual(seen['fulltext_deadline'], 1000.0 + 15600)

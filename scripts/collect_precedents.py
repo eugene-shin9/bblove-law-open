@@ -365,8 +365,12 @@ def main():
     if args.fulltext and (not 0 < args.fulltext_max_seconds <= 7200 or not 0 < args.seconds <= 18000):
         print('FULLTEXT_ARGUMENT_INVALID')
         return 1
-    seconds = min(args.seconds, 15600) if args.fulltext else min(args.seconds, 16200) if args.committee else args.seconds
-    deadline = time.monotonic() + seconds
+    # The summary collection keeps its full budget (it is the priority and is still unfinished);
+    # only the follow-on decc/fulltext passes stop early so the extra post-steps fit the job timeout.
+    started = time.monotonic()
+    seconds = args.seconds
+    extra = min(args.seconds, 15600) if args.fulltext else min(args.seconds, 16200) if args.committee else args.seconds
+    deadline = started + extra
     state = run(args.out, args.scope, seconds,
                 lambda remaining: Client(credential, seconds=remaining, interval=args.interval), min_days=args.min_days)
     write_outputs(state)
