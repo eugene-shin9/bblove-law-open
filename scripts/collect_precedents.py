@@ -296,6 +296,24 @@ def run_committee(summary_state, out, deadline, factory, clock=time.monotonic, m
     return state
 
 
+def run_fulltext(state, args, deadline, factory, clock=time.monotonic):
+    outcome, count = 'SKIPPED', 0
+    try:
+        remaining = min(args.fulltext_max_seconds, deadline-clock()-1800)
+        if state in ('COMPLETE','PASS_DONE') and remaining > 35 and os.environ.get('FULLTEXT_READY','success') == 'success':
+            outcome = collect_fulltext(factory,args.out,args.fulltext_out,deadline-1800,today(),
+                                      max_seconds=remaining,budget=int(os.environ.get('FULLTEXT_BUDGET_BYTES','8000000000')))
+            delta = json.loads((args.fulltext_out.parent/'fulltext-delta/fulltext-delta/fulltext-delta-manifest.json').read_text())
+            if delta['status']=='READY': count=len(delta['documents'])+len(delta['withdrawn'])
+    except Exception:
+        outcome='FAILED'
+        print('::warning::FULLTEXT_COLLECTION_FAILED')
+    if os.environ.get('GITHUB_OUTPUT'):
+        with open(os.environ['GITHUB_OUTPUT'],'a') as fh:
+            fh.write(f'fulltext_delta={count}\nfulltext_outcome={outcome}\n')
+    return outcome
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--out', type=Path, default=Path('auto/precedent-collection'))
@@ -347,8 +365,12 @@ def main():
     if args.fulltext and (not 0 < args.fulltext_max_seconds <= 7200 or not 0 < args.seconds <= 18000):
         print('FULLTEXT_ARGUMENT_INVALID')
         return 1
-    seconds = min(args.seconds, 16200) if args.committee else args.seconds
-    deadline = time.monotonic() + seconds
+    # The summary collection keeps its full budget (it is the priority and is still unfinished);
+    # only the follow-on decc/fulltext passes stop early so the extra post-steps fit the job timeout.
+    started = time.monotonic()
+    seconds = args.seconds
+    extra = min(args.seconds, 15600) if args.fulltext else min(args.seconds, 16200) if args.committee else args.seconds
+    deadline = started + extra
     state = run(args.out, args.scope, seconds,
                 lambda remaining: Client(credential, seconds=remaining, interval=args.interval), min_days=args.min_days)
     write_outputs(state)
@@ -356,12 +378,8 @@ def main():
         run_committee(state, args.committee_out, deadline,
                       lambda remaining: Client(credential, seconds=remaining, interval=max(1.0, args.interval)),
                       min_days=args.min_days)
-    if args.fulltext and state in ('COMPLETE', 'PASS_DONE'):
-        fulltext_state = collect_fulltext(
-            lambda remaining: Client(credential, seconds=remaining, interval=max(1.0, args.interval)),
-            args.out, args.fulltext_out, deadline, today(), max_seconds=args.fulltext_max_seconds,
-            budget=int(os.environ.get('FULLTEXT_BUDGET_BYTES', '8000000000')))
-        print('FULLTEXT_' + fulltext_state)
+    if args.fulltext:
+        run_fulltext(state,args,deadline,lambda remaining: Client(credential, seconds=remaining, interval=max(1.0,args.interval)))
     print(json.dumps({'outcome': state, **summary(args.out)}, ensure_ascii=False))
     return 1 if state == 'FAILED' else 0
 

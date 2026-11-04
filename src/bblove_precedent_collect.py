@@ -887,125 +887,122 @@ def fulltext_object(row, raw, fetched_at, credential=''):
     return value
 
 
-def fulltext_usage(out):
-    out = Path(out)
-    return sum(p.stat().st_size for p in out.rglob('*') if p.is_file()) if out.exists() else 0
+def fulltext_usage(manifest):
+    """Logical latest+previous size, independent of ephemeral local bodies."""
+    return sum(m.get('bytes', 0)+m.get('prev_bytes', 0) for m in manifest['documents'].values())
 
 
 def store_fulltext(out, value, manifest, budget=FULLTEXT_BUDGET_BYTES, usage=None):
-    """Budget includes both retained generations, manifest and peak temporary object.
-
-    usage, when given, is a {'bytes': int} counter kept in step with the files this function
-    writes and deletes, so a long run does not walk the whole tree once per document."""
-    out = Path(out)
     sid = value['id']
     if not re.fullmatch(r'[0-9]+', sid) or not 0 < budget <= FULLTEXT_BUDGET_BYTES:
         raise ValueError('FULLTEXT_ARGUMENT_INVALID')
-    path = out / 'prec' / (sid + '.json')
-    old = strict_json(path.read_bytes()) if path.exists() else None
-    if old and old['body_sha256'] == value['body_sha256']:
+    old = manifest['documents'].get(sid, {})
+    if old.get('release') and old.get('body_sha256') == value['body_sha256']:
+        old.update(status='PUBLISHED', attempts=0)
+        old.pop('reason', None)
         return False
     raw = json.dumps(value, ensure_ascii=False, indent=2).encode('utf-8')
-    used = fulltext_usage(out) if usage is None else usage['bytes']
-    # Allow space for a new manifest and previous-copy before replacing active data.
-    metadata = dict(sha256=digest(raw), bytes=len(raw), status='SUCCESS')
-    candidate = dict(manifest, documents={**manifest['documents'], sid: metadata})
-    reserve = len(json.dumps(candidate, ensure_ascii=False, indent=2).encode()) + 4096
-    if used + len(raw) + (path.stat().st_size if old else 0) + reserve > budget:
+    used = fulltext_usage(manifest) if usage is None else usage['bytes']
+    # Previous generation is a reference to an immutable earlier delta, not a disk copy.
+    prev_hash = old.get('body_sha256') if old.get('release') else None
+    prev_bytes = old.get('bytes', 0) if prev_hash else 0
+    new_used = used-old.get('bytes', 0)-old.get('prev_bytes', 0)+len(raw)+prev_bytes
+    if new_used + len(raw) + 4096 > budget:
         raise CollectionPaused('FULLTEXT_BYTE_BUDGET')
-    versions = out / 'prec' / 'versions' / sid
-    delta = len(raw)
-    if old:
-        old_raw = path.read_bytes()
-        versions.mkdir(parents=True, exist_ok=True)
-        kept = versions / (old['body_sha256'] + '.json')
-        # old body moves to versions/ (net 0 against the replaced active file);
-        # a same-named copy already there is overwritten.
-        delta -= kept.stat().st_size if kept.exists() else 0
-        put_bytes(out, f"prec/versions/{sid}/{old['body_sha256']}.json", old_raw)
-    put_bytes(out, f'prec/{sid}.json', raw)
-    if versions.exists():
-        keep = old['body_sha256'] if old else None
-        for previous in versions.glob('*.json'):
-            if previous.stem != keep:
-                delta -= previous.stat().st_size
-                previous.unlink()
+    put_bytes(Path(out), f'prec/{sid}.json', raw)
+    manifest['documents'][sid] = dict(body_sha256=value['body_sha256'], prev_body_sha256=prev_hash,
+        bytes=len(raw), prev_bytes=prev_bytes, checked_date=manifest['date'], status='STAGED', release=None, attempts=0)
     if usage is not None:
-        usage['bytes'] = used + delta
-    manifest['documents'][sid] = metadata
+        usage['bytes'] = new_used
     return True
 
 
 def collect_fulltext(client_factory, summary_out, out, deadline, date, clock=time.monotonic,
-                     max_seconds=FULLTEXT_MAX_SECONDS, budget=FULLTEXT_BUDGET_BYTES):
-    """Second pass over validated summary IDs, sharing the caller's absolute deadline."""
+                     max_seconds=FULLTEXT_MAX_SECONDS, budget=FULLTEXT_BUDGET_BYTES,
+                     delta_out=None):
+    from bblove_fulltext_delta import new_manifest, validate_manifest, gate, queue, delta_manifest
     if not 0 < max_seconds <= FULLTEXT_MAX_SECONDS or not 0 < budget <= FULLTEXT_BUDGET_BYTES:
         raise ValueError('FULLTEXT_ARGUMENT_INVALID')
     summary_out, out = Path(summary_out), Path(out)
-    if summary_out.resolve() == out.resolve() or summary_out.resolve() in out.resolve().parents:
+    stage = Path(delta_out) if delta_out is not None else out.parent/'fulltext-delta'/'fulltext-delta'
+    if summary_out.resolve() == out.resolve() or summary_out.resolve() in out.resolve().parents or stage.resolve() == out.resolve():
         raise ValueError('FULLTEXT_DIRECTORY_INVALID')
-    source = strict_json((summary_out / 'manifest.json').read_bytes())
-    verify_cache(summary_out, source)
-    checkpoint = out / 'fulltext-manifest.json'
-    manifest = strict_json(checkpoint.read_bytes()) if checkpoint.exists() else dict(
-        kind='precedent-fulltext-raw', format_version=1, date=date, documents={})
-    if manifest.get('kind') != 'precedent-fulltext-raw' or manifest.get('format_version') != 1:
-        raise ValueError('FULLTEXT_MANIFEST_INVALID')
-    deadline = min(deadline, clock() + max_seconds)
+    source = strict_json((summary_out/'manifest.json').read_bytes()); verify_cache(summary_out, source)
+    checkpoint = out/'fulltext-manifest.json'
+    manifest = strict_json(checkpoint.read_bytes()) if checkpoint.exists() else new_manifest(date)
+    if manifest.get('format_version') == 1:
+        manifest = new_manifest(date)
+    validate_manifest(manifest)
+    # Only files actually present are checked. A manifest-only cache is the normal case.
+    for path in (stage/'prec').glob('*.json'):
+        value = strict_json(path.read_bytes())
+        if value.get('id') != path.stem or digest(value['body'].encode()) != value.get('body_sha256'):
+            raise ValueError('FULLTEXT_CACHE_INVALID')
+    import shutil
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir(parents=True)
+    manifest.update(date=date, status='COMPLETE')
+    manifest.pop('stop_reason', None)
+    deadline = min(deadline, clock()+max_seconds)
+    usage = {'bytes': fulltext_usage(manifest)}
+    eligible = [e for e in source['documents'] if e['target'] in FULLTEXT_TARGETS and e.get('kind') == 'detail' and e['status'] == 'SUCCESS']
+    pending = queue(eligible, manifest, date)
     client, client_until = None, 0
     sizes = list(manifest.get('recent_bytes', []))[-100:]
-    for sid, meta in manifest['documents'].items():
-        if not re.fullmatch(r'[0-9]+', sid):
-            raise ValueError('FULLTEXT_ID_INVALID')
-        raw = (out / 'prec' / (sid + '.json')).read_bytes()
-        if digest(raw) != meta['sha256'] or len(raw) != meta['bytes']:
-            raise ValueError('FULLTEXT_CACHE_INVALID')
-    manifest.pop('stop_reason', None)
-    manifest.update(status='COMPLETE', date=date)
-    usage = {'bytes': fulltext_usage(out)}
-    eligible = [e for e in source['documents'] if e['target'] in FULLTEXT_TARGETS
-                and e.get('kind') == 'detail' and e['status'] == 'SUCCESS']
-    # A date-keyed "checked today" skip alone would restart at the first ID every day and never
-    # reach the rest; fetch IDs without a stored body first (failures included), and recheck stored
-    # bodies for changes only once every ID is stored, oldest check first, after the recheck age.
-    pending = [e for e in eligible if e['id'] not in manifest['documents']]
-    if pending:
-        queue = pending
-    else:
-        today_ = datetime.strptime(date, '%Y%m%d')
-        def age(e):
-            checked = manifest['documents'][e['id']].get('checked_date')
-            return (today_ - datetime.strptime(checked, '%Y%m%d')).days if checked else 10 ** 6
-        queue = sorted((e for e in eligible if age(e) >= FULLTEXT_RECHECK_DAYS), key=age, reverse=True)
+    changed, withdrawn, total, excluded = [], [], 0, 0
+    since_save, saved_at = 0, clock()
     try:
-        for entry in queue:
-            remaining = deadline - clock()
+        for entry in pending:
+            remaining = deadline-clock()
             if remaining < 35:
                 raise CollectionPaused('TIME_BUDGET')
             if client is None or clock() >= client_until:
-                client = client_factory(remaining)
-                client_until = clock() + min(remaining, 3400) - 35
+                client = client_factory(remaining); client_until = clock()+min(remaining,3400)-35
+            sid = entry['id']; old = dict(manifest['documents'].get(sid, {}))
+            total += 1
             try:
-                _, raw = client.get('lawService.do', dict(target='prec', ID=entry['id']), original=True)
-                value = fulltext_object(entry['row'], raw, stamp(), getattr(client, 'credential', ''))
-                store_fulltext(out, value, manifest, budget, usage)
-                manifest['documents'][entry['id']]['checked_date'] = date
-                manifest.get('failures', {}).pop(entry['id'], None)
-                sizes = (sizes + [len(raw)])[-100:]
-                if len(sizes) == 100 and sum(sizes) / 100 > FULLTEXT_WARNING_BYTES:
-                    print('::warning title=Fulltext size::FULLTEXT_MOVING_AVERAGE_EXCEEDED')
+                _, raw = client.get('lawService.do', dict(target='prec',ID=sid), original=True)
+                value = fulltext_object(entry['row'], raw, stamp())
+                codes = gate(value, getattr(client,'credential',''))
+                if codes:
+                    excluded += 1
+                    reason = ','.join(codes)
+                    if old.get('release'):
+                        withdrawn.append(dict(id=sid,reason=reason))
+                    # No newly rejected body or text is retained in either manifest.
+                    manifest['documents'][sid] = dict(old, status='EXCLUDED', checked_date=date, reason=reason,
+                        attempts=0, bytes=old.get('bytes',0), prev_bytes=old.get('prev_bytes',0),
+                        body_sha256=old.get('body_sha256'), prev_body_sha256=old.get('prev_body_sha256'), release=old.get('release'))
+                else:
+                    if store_fulltext(stage,value,manifest,budget,usage):
+                        changed.append(sid)
+                    manifest['documents'][sid]['checked_date'] = date
+                    sizes = (sizes+[len(raw)])[-100:]
+                    if len(sizes)==100 and sum(sizes)/100>FULLTEXT_WARNING_BYTES:
+                        print('::warning title=Fulltext size::FULLTEXT_MOVING_AVERAGE_EXCEEDED')
             except CollectionPaused:
                 raise
             except Exception as exc:
-                if str(exc) == 'COLLECTION_BUDGET_EXHAUSTED':
+                if str(exc)=='COLLECTION_BUDGET_EXHAUSTED':
                     raise CollectionPaused('TIME_BUDGET') from None
-                manifest['status'] = 'INCOMPLETE'
-                manifest.setdefault('failures', {})[entry['id']] = 'FULLTEXT_FETCH_OR_VALIDATION_FAILED'
-            manifest['recent_bytes'] = sizes
-            save(checkpoint, manifest)
+                manifest['status']='INCOMPLETE'
+                manifest['documents'][sid]=dict(old,status='FAILED',checked_date=date,attempts=old.get('attempts',0)+1,
+                    reason='FULLTEXT_FETCH_OR_VALIDATION_FAILED', bytes=old.get('bytes',0),prev_bytes=old.get('prev_bytes',0),
+                    body_sha256=old.get('body_sha256'),prev_body_sha256=old.get('prev_body_sha256'),release=old.get('release'))
+            since_save += 1
+            if since_save>=500 or clock()-saved_at>=60:
+                manifest['recent_bytes']=sizes; save(checkpoint,manifest)
+                since_save,saved_at=0,clock()
     except CollectionPaused as exc:
-        manifest.update(status='PAUSED', stop_reason=str(exc))
-    save(checkpoint, manifest)
+        manifest.update(status='PAUSED',stop_reason=str(exc))
+    manifest['recent_bytes']=sizes
+    delta=delta_manifest(manifest,changed,withdrawn,total,excluded)
+    if delta['status']=='HALTED':
+        manifest['status']='HALTED'
+        print('::error::FULLTEXT_EXCLUSION_THRESHOLD')
+    save(stage/'fulltext-delta-manifest.json',delta)
+    save(checkpoint,manifest)
     return manifest['status']
 
 
@@ -1023,13 +1020,17 @@ def main():
     if args.fulltext and not 0 < args.fulltext_max_seconds <= FULLTEXT_MAX_SECONDS:
         print('FULLTEXT_ARGUMENT_INVALID')
         return 1
-    deadline = time.monotonic() + 18000
+    deadline = time.monotonic() + (15600 if args.fulltext else 18000)
     ok = collect(Client(credential), args.out, today(), args.scope)
     if args.fulltext and ok:
-        collect_fulltext(lambda remaining: Client(credential, seconds=remaining), args.out,
-                         Path('auto/fulltext-collection'), deadline, today(),
-                         max_seconds=args.fulltext_max_seconds,
-                         budget=int(os.environ.get('FULLTEXT_BUDGET_BYTES', '8000000000')))
+        try:
+            remaining = min(args.fulltext_max_seconds, deadline-time.monotonic()-1800)
+            if remaining > 35:
+                collect_fulltext(lambda seconds: Client(credential, seconds=seconds), args.out,
+                                 Path('auto/fulltext-collection'), deadline-1800, today(),
+                                 max_seconds=remaining, budget=int(os.environ.get('FULLTEXT_BUDGET_BYTES', '8000000000')))
+        except Exception:
+            print('::warning::FULLTEXT_COLLECTION_FAILED')
     print('COLLECTION_COMPLETE' if ok else 'COLLECTION_INCOMPLETE')
     return 0 if ok else 1
 

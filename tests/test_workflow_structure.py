@@ -32,10 +32,14 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIs(wf['concurrency']['cancel-in-progress'], False)
         self.assertEqual({r for _, text in strings(wf) for r in re.findall(r'secrets\.([A-Z_]+)', text)},
                          {'LAW_OC', 'TS_CLIENT_ID', 'TS_AUDIENCE', 'TS_EXIT_NODE'})
-        restore = next(s['with'] for s in steps(j) if s.get('uses', '').startswith('actions/cache/restore@'))
-        save = next(s['with'] for s in steps(j) if s.get('uses', '').startswith('actions/cache/save@'))
-        self.assertEqual(save, {k: restore[k] for k in ('path', 'key')})
-        self.assertEqual(restore['restore-keys'].strip(), restore['key'].split('${{ github.run_id }}')[0])
+        restores = [s['with'] for s in steps(j) if s.get('uses', '').startswith('actions/cache/restore@')]
+        saves = [s['with'] for s in steps(j) if s.get('uses', '').startswith('actions/cache/save@')]
+        self.assertEqual(len(restores), 3)
+        self.assertEqual(len(saves), 3)
+        for restore in restores:
+            save = next(s for s in saves if s['path'] == restore['path'])
+            self.assertEqual(save, {k: restore[k] for k in ('path', 'key')})
+            self.assertEqual(restore['restore-keys'].strip(), restore['key'].split('${{ github.run_id }}')[0])
         self.assertEqual(step_by_id(j, 'collect')['env']['LAW_OC'], '${{ secrets.LAW_OC }}')
 
     def test_helpers_preserve_values_and_reference_locations(self):
