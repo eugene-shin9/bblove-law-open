@@ -230,9 +230,15 @@ jobs:
         id: ft_package
         if: always() && steps.ft_scan.outcome == 'success' && steps.collect.outputs.fulltext_delta != '0'
         run: python -I scripts/fulltext_release.py prepare
+      - name: Scan packaged fulltext release (manifest, release-info and archive are written after the source scan)
+        id: ft_release_scan
+        if: always() && steps.ft_package.outcome == 'success'
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+        run: python -I scripts/secret_scan.py release-fulltext
       - name: Attest fulltext delta
         id: ft_attest
-        if: always() && steps.ft_package.outcome == 'success'
+        if: always() && steps.ft_package.outcome == 'success' && steps.ft_release_scan.outcome == 'success'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
         with:
           subject-path: release-fulltext/*

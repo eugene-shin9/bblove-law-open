@@ -21,14 +21,18 @@ def variants(secret):
 def files(paths):
     for raw in paths:
         p = Path(raw)
-        if p.is_file():
+        if p.is_symlink() or p.is_file():
             yield p
         elif p.is_dir():
-            yield from (q for q in p.rglob('*') if q.is_file() and not q.is_symlink())
+            # A symlink is reported as a hit: zip -r and release upload follow links, so its target
+            # would be published without being scanned.
+            yield from (q for q in p.rglob('*') if q.is_symlink() or q.is_file())
 
 
 def contains(path, needles):
     """Case-insensitive streaming search with overlap so matches across chunks are found."""
+    if path.is_symlink():
+        return True
     lowered = [n.lower() for n in needles]
     keep = max(len(n) for n in lowered) - 1
     tail = b''

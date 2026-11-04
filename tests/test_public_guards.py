@@ -57,6 +57,14 @@ class SecretScanTests(unittest.TestCase):
                              capture_output=True, text=True, env={**env, 'LAW_OC': SECRET})
         self.assertEqual(out.returncode, 1)
 
+    def test_symlink_counts_as_hit(self):
+        # zip -r and release upload follow links, so an unscanned link target must not pass.
+        with tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as outside:
+            (Path(outside) / 'secret.txt').write_text('clean')
+            (Path(t) / 'a.json').write_text('{}')
+            (Path(t) / 'link.txt').symlink_to(Path(outside) / 'secret.txt')
+            self.assertEqual(secret_scan.scan([t], SECRET), 1)
+
     def test_clean_tree_passes(self):
         with tempfile.TemporaryDirectory() as t:
             (Path(t) / 'a.json').write_text('{"law": "국세기본법"}')
