@@ -38,7 +38,7 @@ PILOT_DIAGNOSTIC_STEP = '''      - name: Diagnose collection outcome without API
 def credential_markers(raw):
     """Detect credential-shaped values without reading any environment secret."""
     text = raw.decode('utf-8', errors='replace')
-    for match in re.finditer(r'(?i)(?:[?&]|%3[fF]|%26)OC(?:=|%3[dD])([^&\s"<>]+)', text):
+    for match in re.finditer(r'(?i)(?:[?&;]|%3[fF]|%26)OC(?:=|%3[dD])([^&\s"<>]+)', text):
         if match.group(1) not in {'REDACTED', 'test'}:
             return True
     return bool(re.search(r'(?i)"(?:LAW_OC|access_token|api_key|password)"\s*:\s*"(?!REDACTED")[^"\s]+"', text))
