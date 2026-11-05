@@ -3,6 +3,7 @@ from collections import Counter
 import json
 from pathlib import Path
 import re
+import unicodedata
 from bblove_precedent_collect import validated, verify_cache, committee_url
 from bblove_storage import digest, strict_json
 from bblove_v107_pilot import check_date
@@ -24,13 +25,25 @@ PATTERNS = {
 }
 
 
+# Detection runs on a normalized copy (stored bytes never change): full-width digits/hyphens (NFKC),
+# every Unicode dash/minus and spacing variant become ASCII, zero-width characters disappear, so
+# 0１0－1234–5678 or 010\u200b-1234 cannot slip past the ASCII patterns.
+_DASHES = dict.fromkeys(map(ord, '\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe58\ufe63\uff0d\u30fc\u2027'), '-')
+_INVISIBLE = dict.fromkeys(map(ord, '\u200b\u200c\u200d\u2060\ufeff\u00ad'), None)
+
+
+def pii_text(value):
+    text = unicodedata.normalize('NFKC', value).translate(_INVISIBLE).translate(_DASHES)
+    return re.sub(r'[\u00a0\u2000-\u200a\u202f\u3000]', ' ', text)
+
+
 def gate(row):
     codes = set()
     for key, value in row.items():
         if not isinstance(value, str) or key in ('id', 'source', 'decided', 'disposed', 'official_url'):
             continue
         for code, pattern in PATTERNS.items():
-            for match in re.finditer(pattern, value, re.I):
+            for match in re.finditer(pattern, pii_text(value), re.I):
                 if code == 'ACCOUNT' and re.fullmatch(r'\d{4}-\d{2}-\d{2}', match[0]):
                     continue
                 codes.add(code)
