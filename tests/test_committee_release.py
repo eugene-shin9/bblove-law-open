@@ -1,4 +1,6 @@
 """Synthetic publication and scheduling contracts; no private sample text."""
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -58,7 +60,9 @@ class CommitteeReleaseTests(unittest.TestCase):
                         raw=json.dumps(doc).encode()
                     return doc,raw
             collect(Bad(),Path(t)/'s','20261103',targets=('decc',))
-            with self.assertRaisesRegex(ValueError,'EXCLUSION_RATE'): export(Path(t)/'s',Path(t)/'out')
+            # Deliberate failure: capture the ::error:: line so it never becomes a red annotation in Actions.
+            with contextlib.redirect_stdout(io.StringIO()) as log, self.assertRaisesRegex(ValueError,'EXCLUSION_RATE'): export(Path(t)/'s',Path(t)/'out')
+            self.assertIn('::error::COMMITTEE_EXCLUSION_RATE_EXCEEDED',log.getvalue())
             self.assertFalse((Path(t)/'out').exists())
 
     def test_halt_percent_boundary(self):
@@ -85,7 +89,7 @@ class CommitteeReleaseTests(unittest.TestCase):
                     self.assertEqual((m['accepted'],m['excluded']),(95,5))
                     self.assertEqual(len(verify(root/'out')),95)
                 else:
-                    with self.assertRaisesRegex(ValueError,'EXCLUSION_RATE'): export(root/'s',root/'out')
+                    with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError,'EXCLUSION_RATE'): export(root/'s',root/'out')
 
     def test_total_change_reset_uses_explicit_targets(self):
         with tempfile.TemporaryDirectory() as t:
@@ -102,7 +106,9 @@ class CommitteeReleaseTests(unittest.TestCase):
             with patch.object(wrapper,'run',side_effect=RuntimeError('synthetic')) as run:
                 self.assertEqual(wrapper.run_committee('PAUSED',Path(t),100,lambda _:None),'SKIPPED')
                 run.assert_not_called()
-                self.assertEqual(wrapper.run_committee('COMPLETE',Path(t),100,lambda _:None),'FAILED')
+                with contextlib.redirect_stdout(io.StringIO()) as log:
+                    self.assertEqual(wrapper.run_committee('COMPLETE',Path(t),100,lambda _:None),'FAILED')
+                self.assertIn('::warning::COMMITTEE_COLLECTION_FAILED',log.getvalue())
             output=Path(t+'/outputs').read_text()
             self.assertTrue(output.startswith('outcome=COMPLETE\ncomplete=true\n'))
             self.assertIn('committee_outcome=FAILED',output)
