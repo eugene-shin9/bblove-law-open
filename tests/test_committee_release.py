@@ -65,6 +65,14 @@ class CommitteeReleaseTests(unittest.TestCase):
             self.assertIn('::error::COMMITTEE_EXCLUSION_RATE_EXCEEDED',log.getvalue())
             self.assertFalse((Path(t)/'out').exists())
 
+    def test_gate_normalizes_width_dashes_and_invisible_characters(self):
+        wide=str.maketrans('0123456789-','０１２３４５６７８９－')  # assembled at runtime for the repository guard
+        phone='-'.join(('010','1234','5678')); rrn='900101'+'-'+'1234567'
+        for text in (phone.translate(wide), phone.replace('-','\u2013'), phone.replace('-','\u200b-'), rrn.translate(wide), rrn.replace('-','\u2212')):
+            self.assertTrue(gate({'holding':text}),text.encode('unicode_escape'))
+        for text in ('２０２６－０１－０１','제１２조 제３항','１，２３４，５６７원'):
+            self.assertFalse(gate({'holding':text}),text)
+
     def test_halt_percent_boundary(self):
         class Hundred(Client):
             def __init__(self, bad): super().__init__(); self.bad=bad

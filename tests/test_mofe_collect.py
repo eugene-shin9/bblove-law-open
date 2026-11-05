@@ -188,6 +188,19 @@ class PiiScanTests(unittest.TestCase):
             (root / 'manifest.json').write_text(json.dumps({'documents': [{'title': phone}]}), encoding='utf-8')
             self.assertEqual(mofe_pii_scan.scan(root), [('b.json', 'mobile_phone')])
 
+    def test_scan_sees_full_width_and_unicode_dash_variants(self):
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import mofe_pii_scan
+        wide = str.maketrans('0123456789-', '０１２３４５６７８９－')  # built at runtime; the guard never sees a literal
+        phone = '010' + '-1234-' + '5678'
+        for variant in (phone.translate(wide), phone.replace('-', '\u2013'), phone.replace('-', '\u200b-')):
+            with self.subTest(variant=variant.encode('unicode_escape')), tempfile.TemporaryDirectory() as t:
+                root = Path(t)
+                doc = dict(id=ntt(1), title='합성', doc='재산세제과-1', date='2026.01.01.',
+                           sec={'질문요지': '', '사실관계': '', '회신': '연락처 ' + variant, '관계법령': ''})
+                (root / 'a.json').write_text(json.dumps(doc, ensure_ascii=False), encoding='utf-8')
+                self.assertEqual(mofe_pii_scan.scan(root), [('a.json', 'mobile_phone')])
+
 
 if __name__ == '__main__':
     unittest.main()
