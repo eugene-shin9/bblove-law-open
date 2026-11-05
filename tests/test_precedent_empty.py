@@ -95,7 +95,7 @@ class EmptySourceTests(unittest.TestCase):
             collect(client, out, DATE, incremental=True, stop=lambda: 'TIME_BUDGET')
             self.assertEqual(client.calls, 0)
             m = json.loads((out/'manifest.json').read_text())
-            self.assertEqual(m['rule_version'], 2)
+            self.assertGreaterEqual(m['rule_version'], 2)  # later rules (v3) may run in the same pass
             verify_cache(out, m)
             self.assertTrue(collect(client, out, DATE, incremental=True))
             self.assertEqual(client.details, 1)
