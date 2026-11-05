@@ -21,10 +21,10 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
       - name: Install the YAML parser the workflow-contract tests use (pinned)
@@ -43,7 +43,7 @@ jobs:
           fi
           echo "::notice title=LAW_OC::configured"
       - name: Restore resumable collection
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: auto/precedent-collection
           key: precedent-summary-v2-${{ github.run_id }}-${{ github.run_attempt }}
@@ -52,7 +52,7 @@ jobs:
       - name: Restore fulltext manifest only
         id: ft_restore
         continue-on-error: true
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: auto/fulltext-collection/fulltext-manifest.json
           key: fulltext-v2-${{ github.run_id }}-${{ github.run_attempt }}
@@ -66,7 +66,7 @@ jobs:
         run: python -I scripts/fulltext_release.py recover
       - name: Restore committee checkpoint
         continue-on-error: true
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: auto/committee-collection
           key: committee-v1-${{ github.run_id }}-${{ github.run_attempt }}
@@ -96,7 +96,7 @@ jobs:
         run: python -I scripts/secret_scan.py auto/precedent-collection
       - name: Save checkpoint (only after a clean scan)
         if: always() && steps.scan_raw.outcome == 'success'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: auto/precedent-collection
           key: precedent-summary-v2-${{ github.run_id }}-${{ github.run_attempt }}
@@ -155,7 +155,7 @@ jobs:
         run: python -I scripts/secret_scan.py release/precedent-manifest.json release/precedent-summary.json release/release-info.json "${{ steps.tag.outputs.src }}/precedent-collection"
       - name: Build provenance attestation
         if: steps.tag.outputs.tag != '' && steps.tag.outputs.exists == 'false'
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: release/*
       - name: Publish an immutable release (draft until every file is uploaded)
@@ -187,7 +187,7 @@ jobs:
         run: python -I scripts/secret_scan.py auto/committee-collection
       - name: Save committee checkpoint
         if: always() && steps.committee_scan.outcome == 'success'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: auto/committee-collection
           key: committee-v1-${{ github.run_id }}-${{ github.run_attempt }}
@@ -210,7 +210,7 @@ jobs:
       - name: Attest committee release
         id: committee_attest
         if: always() && steps.committee_release_scan.outcome == 'success' && steps.committee_publish.outputs.needed == 'true'
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: release-decc/*
       - name: Publish committee release
@@ -239,7 +239,7 @@ jobs:
       - name: Attest fulltext delta
         id: ft_attest
         if: always() && steps.ft_package.outcome == 'success' && steps.ft_release_scan.outcome == 'success'
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: release-fulltext/*
       - name: Publish fulltext delta
@@ -261,7 +261,7 @@ jobs:
         run: python -I scripts/fulltext_release.py finalize
       - name: Save fulltext manifest after publication or no delta
         if: always() && (steps.ft_finalize.outputs.state == 'PUBLISHED' || steps.ft_finalize.outputs.state == 'NO_DELTA')
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: auto/fulltext-collection/fulltext-manifest.json
           key: fulltext-v2-${{ github.run_id }}-${{ github.run_attempt }}
