@@ -1,4 +1,6 @@
 """Failure isolation and manifest-only workflow cache contracts, all offline."""
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -24,8 +26,9 @@ class FulltextOperationTests(unittest.TestCase):
                 original=wrapper.run_committee
                 def failed_committee(*args,**kwargs):
                     with patch.object(wrapper,'run',side_effect=ValueError('synthetic')):return original(*args,**kwargs)
-                with patch.object(wrapper,'run_committee',side_effect=failed_committee):
+                with patch.object(wrapper,'run_committee',side_effect=failed_committee),contextlib.redirect_stdout(io.StringIO()) as log:
                     self.assertEqual(wrapper.main(),0)
+            self.assertIn('::warning::COMMITTEE_COLLECTION_FAILED',log.getvalue());self.assertIn('::warning::FULLTEXT_COLLECTION_FAILED',log.getvalue())
             result=outputs.read_text()
             self.assertIn('complete=true',result);self.assertIn('committee_outcome=FAILED',result)
             self.assertIn('fulltext_outcome=FAILED',result);self.assertIn('fulltext_delta=0',result)
