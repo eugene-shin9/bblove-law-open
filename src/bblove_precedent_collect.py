@@ -84,6 +84,66 @@ COURT_CASE = re.compile(r'(?P<court>[가-힣]+(?:법원|지원)(?:\([가-힣]+\)
 SAVE_EVERY_SECONDS = 60
 
 
+# Other 국세법령정보시스템 spellings (rule_version 3, 584 rows failed on 2026-11-05): abbreviated courts
+# ('서울고법-92-구-4309'), 고등법원 재판부 ('전주부-', '광주고등법원제주부-', '대전고등법원-청주-'), a trailing
+# 선고일·사건명 ('…-가단-5506074(2025.5.13.)', '…가합-402000사해행위취소'), a split year ('-201-4재구합94'),
+# masked courts ('○○지방법원') and a bare number with no court ('2023구합53621' → '법원 미기재').
+# Used only when the strict form above fails, so every row accepted before keeps the same court/case_no.
+NTS_COURT_ABBR = {'서울고법': '서울고등법원', '서울고등': '서울고등법원', '대구고법': '대구고등법원', '부산고법': '부산고등법원',
+                  '부산고등': '부산고등법원', '광주고법': '광주고등법원', '대전고법': '대전고등법원', '수원고법': '수원고등법원',
+                  '서울중앙지법': '서울중앙지방법원', '서울중앙지방': '서울중앙지방법원', '창원지법': '창원지방법원',
+                  '대전지법': '대전지방법원', '수원지법': '수원지방법원',
+                  '전주부': '광주고등법원(전주)', '제주부': '광주고등법원(제주)'}
+# 고등법원 재판부는 정해진 고등법원에만 있다(다른 짝이면 만들지 않고 거부).
+NTS_BRANCHES = {'전주': '광주고등법원', '제주': '광주고등법원', '창원': '부산고등법원', '청주': '대전고등법원',
+                '춘천': '서울고등법원'}
+# '전주부'·'제주부'만 쓴 표기는 고등법원 사건부호(누·구)일 때만 고등법원 재판부로 읽는다('나'는 지방법원 항소부도 쓴다).
+NTS_BRANCH_ONLY_CODES = ('누', '재누', '구', '재구')
+NTS_TAIL = re.compile(r'(?:\(\d{4}\.\d{1,2}\.\d{1,2}\.?\)|\((?:각)?병합\)|판결|호|[가-힣]*(?:취소|이의|등))$')
+NTS_COURT = re.compile(r'[가-힣]+(?:법원|지원)(?:\([가-힣]+\))?|(?:[○◇△□]+|O+|A+)[가-힣]*지방법원')
+# Year, case type, serial; only a merged list (',764', ',2013고합3') may follow the serial.
+NTS_NUMBER = re.compile(r'(?P<year>\d{4}|\d{2})-?(?P<code>[가-힣]+)-?(?P<serial>\d+)(?:,.*)?')
+NTS_NO_COURT = '법원 미기재'
+
+
+def nts_court_case(raw, listed_court='', decided_year=None):
+    """(court, case_no) for a non-standard 국세법령정보시스템 number, or None. Never guesses a court."""
+    s = re.sub(r'\s', '', raw or '')
+    for _ in range(4):
+        s, n = NTS_TAIL.subn('', s)
+        if not n:
+            break
+    s = re.sub(r'-(\d{3})-(\d)(?=재?[가-힣])', r'-\1\2', s)   # 201-4재구합94 → 2014재구합94
+    s = re.sub(r'-(\d{2})-(\d{2})(?=[가-힣])', r'-\1\2', s)   # 20-24구합20131 → 2024구합20131
+    m = re.fullmatch(r'(?P<court>[^\d]*?)-?(?P<rest>\d.*)', s)
+    number = m and NTS_NUMBER.fullmatch(m['rest'])
+    if not number:
+        return None
+    year = int(number['year']) + (1900 if len(number['year']) == 2 else 0)
+    if not 1948 <= year <= int(decided_year or 9999) or int(number['serial']) < 1:
+        return None
+    court = re.sub(r'행정부$', '', m['court'].strip('-'))
+    b = re.fullmatch(r'(?P<court>[가-힣]+고등법원)-?\(?(?P<b>[가-힣]+?|△+)(?:부)?\)?-?', court)
+    if b and set(b['b']) == {'△'}:
+        court = b['court']   # 재판부가 가려진 표기: 법원만 쓴다
+    elif b:
+        if NTS_BRANCHES.get(b['b']) != b['court']:
+            return None
+        court = f"{b['court']}({b['b']})"
+    else:
+        court = court.replace('-', '')
+        if court in ('전주부', '제주부') and number['code'] not in NTS_BRANCH_ONLY_CODES:
+            return None
+        court = NTS_COURT_ABBR.get(court, court)
+    if court and not NTS_COURT.fullmatch(court):
+        return None
+    listed_court = re.sub(r'\s', '', listed_court or '')
+    if court and listed_court and listed_court != court:
+        return None
+    # Merged cases ('757,764(병합)') keep the first number; 0046 → 46.
+    return court or listed_court or NTS_NO_COURT, number['year'] + number['code'] + str(int(number['serial']))
+
+
 def members(raw):
     """Object members with original lexical JSON values, after strict decoding."""
     source = raw.decode('utf-8-sig')
@@ -259,7 +319,11 @@ def listed(row, target):
         else:
             court, case_no = text(row, '법원명'), number
         if not court or not case_numbers(case_no):
-            raise ValueError('CASE_OR_COURT_INVALID')
+            alternative = (nts_court_case(text(row, '사건번호'), text(row, '법원명'), day[:4])
+                           if text(row, '데이터출처명') == '국세법령정보시스템' else None)
+            if not alternative:
+                raise ValueError('CASE_OR_COURT_INVALID')
+            court, case_no = alternative
         title = page_text(text(row, '사건명').encode('utf-8'))
         if not title:
             raise ValueError('TITLE_MISSING')
@@ -691,6 +755,21 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
             manifest.update(rule_version=2, summary_empty_migrated=migrated)
             if migrated:
                 # Persist the reset first; crash recovery removes the old unrecorded files.
+                checkpoint_now(force=True)
+                discard_unrecorded(out, manifest)
+        # rule_version 3: 국세법령정보시스템 numbers in other spellings are now read (nts_court_case);
+        # their listing-only rows are re-validated once without any request.
+        if incremental and manifest.get('rule_version', 1) == 2:
+            reread = 0
+            for entry in manifest['documents']:
+                if (entry['target'] == 'prec' and entry['status'] == 'FAILED' and entry.get('reason') == 'CASE_OR_COURT_INVALID'
+                        and entry.get('kind') == 'listing'):
+                    entry.update(status='PENDING')
+                    for key in ('reason', 'sha256', 'path'):
+                        entry.pop(key, None)
+                    reread += 1
+            manifest.update(rule_version=3, court_case_reread=reread)
+            if reread:
                 checkpoint_now(force=True)
                 discard_unrecorded(out, manifest)
         if manifest.get('summary_empty_migrated') and incremental and requested_retry != 'all':
