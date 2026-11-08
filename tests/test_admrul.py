@@ -32,6 +32,7 @@ class Fake:
 
     def __init__(self, rows=None, details=None, stop_after=None):
         self.rows=rows if rows is not None else [row(),row(2,'재정경제부','소득세 납세절차','예규')]
+        self.rows=both_orgs(self.rows)
         self.details=details or {}
         self.calls=0
         self.requests=[]
@@ -56,10 +57,13 @@ class Fake:
 
 
 def both_orgs(rows):
-    """Unselected personnel rule keeps each required catalog nonempty."""
-    present = {A.current_org(r['소관부처명']) for r in rows}
-    return rows + [row(900 + i, org, '인사관리규정')
-                   for i, org in enumerate(A.ORG) if org not in present]
+    """Pad valid synthetic catalogs to ten with excluded personnel rules."""
+    rows = list(rows)
+    for i, org in enumerate(A.ORG):
+        count = sum(A.current_org(r['소관부처명']) == org for r in rows)
+        rows += [row(900 + i * 10 + j, org, '인사관리규정')
+                 for j in range(max(0, 10 - count))]
+    return rows
 
 
 def meta(root):
@@ -132,7 +136,7 @@ class AdminRules(unittest.TestCase):
         self.assertEqual({e['reason'] for e in m['excluded']},{'NO_TAX_KEYWORD','CUSTOMS_EXCLUDED','OUTSIDE_KINDS'})
         self.assertEqual(A.exclusion(row(6,'법무부')), 'OUTSIDE_ORGANIZATIONS')
         lists=[p for ep,p,_ in client.requests if ep=='lawSearch.do']
-        self.assertEqual({p['org'] for p in lists},set(A.ORG.values()))
+        self.assertEqual({p['org'] for p in lists},{'1210000', '1053000'})
         self.assertTrue(all(p['target']=='admrul' and p['nw']=='1' for p in lists))
 
     def test_renamed_ministry_and_foreign_ministry_in_filtered_catalog(self):
@@ -273,13 +277,46 @@ class AdminRules(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'DUPLICATE_ID'):
             A.catalog(Fake([row(),row()]),self.raw,DATE)
 
+    def test_small_catalog_blocks_each_org_and_invalidates_previous_complete(self):
+        for org in A.ORG:
+            for count in (0, 1, 9):
+                with self.subTest(org=org, count=count), tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp)
+                    self.assertTrue(A.collect(Fake(), out, DATE))
+                    client = Fake()
+                    client.rows = [r for r in client.rows if A.current_org(r['소관부처명']) != org]
+                    client.rows += [row(800+i, org) for i in range(count)]
+                    self.assertFalse(A.collect(client, out, '20261017'))
+                    manifest = json.loads((out/'manifest.json').read_text())
+                    self.assertEqual(manifest['catalog_failure'], 'ADMRUL_ORG_CATALOG_TOO_SMALL')
+                    self.assertEqual(manifest['status'], 'INCOMPLETE')
+                    with self.assertRaisesRegex(ValueError, 'INCOMPLETE'):
+                        A.build(out, self.dest)
+
+    def test_cached_small_catalog_is_rejected(self):
+        self.collected()
+        checkpoint = json.loads((self.raw/'catalog.json').read_text())
+        page = checkpoint['pages'][-1]
+        path = self.raw/page['path']
+        doc = json.loads(path.read_text())
+        doc['AdmRulSearch']['totalCnt'] = '1'
+        doc['AdmRulSearch']['admrul'] = doc['AdmRulSearch']['admrul'][:1]
+        path.write_bytes(A.encode(doc))
+        page['sha256'] = A.hashlib.sha256(path.read_bytes()).hexdigest()
+        (self.raw/'catalog.json').write_bytes(A.encode(checkpoint))
+        client = Fake(stop_after=0)
+        self.assertFalse(A.collect(client, self.raw, DATE))
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(json.loads((self.raw/'attempt.json').read_text())['reason'],
+                         'ADMRUL_ORG_CATALOG_TOO_SMALL')
+
     def test_multiple_catalog_pages_and_complete_resume(self):
         rows=both_orgs([row(i,title=f'세무조사 규정 {i}') for i in range(1,102)])
         c=Fake(rows)
-        self.assertEqual(len(A.catalog(c,self.raw,DATE)),102)
+        self.assertEqual(len(A.catalog(c,self.raw,DATE)),111)
         self.assertEqual(c.calls,3) # two NTS pages, one nonempty MOEF page
         c=Fake(rows,stop_after=0)
-        self.assertEqual(len(A.catalog(c,self.raw,DATE)),102)
+        self.assertEqual(len(A.catalog(c,self.raw,DATE)),111)
         self.assertEqual(c.calls,0)
 
     def test_partial_budget_resumes_and_catalog_failure_invalidates_complete(self):

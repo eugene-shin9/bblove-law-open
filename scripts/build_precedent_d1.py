@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from bblove_law_all import save
-from bblove_precedent_collect import SCHEMA, DEFAULT_TARGETS as TARGETS, validated, verify_cache
+from bblove_precedent_collect import SCHEMA, TARGETS, DEFAULT_TARGETS, validated, verify_cache
 from bblove_precedent_scope import tax_reasons
 from bblove_storage import digest, strict_json
 
@@ -31,10 +31,11 @@ COLUMNS = {
     'interpretations': ('id', 'number', 'title', 'date', 'question', 'answer', 'laws', 'url'),
     'tribunal_decisions': ('id', 'number', 'date', 'decision_type', 'tax_type', 'title', 'summary', 'laws', 'url'),
 }
-SEARCH = {'precedents': ('title', 'issues', 'holding', 'refs'),
+COLUMNS['committee_decisions'] = ('source', 'id', 'case_no', 'committee', 'agency', 'decided', 'disposed', 'title', 'holding', 'order', 'claim', 'type_name', 'type_code', 'official_url')
+SEARCH = {'committee_decisions': ('title', 'holding', 'order'), 'precedents': ('title', 'issues', 'holding', 'refs'),
           'interpretations': ('title', 'question', 'answer', 'laws'),
           'tribunal_decisions': ('title', 'summary', 'laws', 'decision_type', 'tax_type')}
-TABLES = {'prec': 'precedents', 'ntsCgmExpc': 'interpretations', 'ttSpecialDecc': 'tribunal_decisions'}
+TABLES = {'decc': 'committee_decisions', 'prec': 'precedents', 'ntsCgmExpc': 'interpretations', 'ttSpecialDecc': 'tribunal_decisions'}
 
 
 def schema(tokenizer='trigram'):
@@ -42,24 +43,101 @@ def schema(tokenizer='trigram'):
         raise ValueError('TOKENIZER_INVALID')
     result = []
     for table, columns in COLUMNS.items():
-        definitions = ','.join(c + (' TEXT PRIMARY KEY' if c == 'id' else ' TEXT NOT NULL') for c in columns)
+        definitions = ','.join(('\"order\"' if c == 'order' else c) + (' TEXT PRIMARY KEY' if c == 'id' else ' TEXT' if c == 'disposed' else ' TEXT NOT NULL') for c in columns)
         result.append(f'CREATE TABLE IF NOT EXISTS {table} ({definitions});')
-        fields = ','.join(SEARCH[table])
+        fields = ','.join(('\"order\"' if c == 'order' else c) for c in SEARCH[table])
         result.append(f"CREATE VIRTUAL TABLE IF NOT EXISTS {table}_fts USING fts5({fields}, content='{table}', content_rowid='rowid', tokenize='{tokenizer}');")
         result.append(f'CREATE TRIGGER IF NOT EXISTS {table}_ai AFTER INSERT ON {table} BEGIN '
                       f'INSERT INTO {table}_fts(rowid,{fields}) VALUES(new.rowid,'
-                      + ','.join('new.' + c for c in SEARCH[table]) + '); END;')
+                      + ','.join('new.' + ('\"order\"' if c == 'order' else c) for c in SEARCH[table]) + '); END;')
     return '\n'.join(result) + '\n'
 
 
+# Lookup-key indexes (verify_citations, get_precedent by case number). Each expression must stay
+# byte-for-byte equal to d1KeyExpr() in mcp/src/index.js or SQLite ignores the index and scans the
+# table (D1 bills every row read). Kept out of schema() so the schema fingerprint and the 재정경제부
+# loader's SCHEMA_NOT_READY check are unchanged; remote_load builds them one table at a time under
+# their own reservations. The index name carries a hash of its expression, so changing the
+# expression builds a new index and drops the old one instead of silently keeping a stale index.
+KEY_SYMBOLS = (' ', '-', '.', '_', '/', '·', 'ㆍ', '‐', '‑', '–', '—', '[', ']', '(', ')', '>')
+KEY_COLUMNS = {'committee_decisions': 'case_no', 'interpretations': 'number',
+               'tribunal_decisions': 'number', 'precedents': 'case_no'}
+# Cloudflare D1: building an index writes one row per indexed row. 10% margin plus SCHEMA_RESERVE.
+INDEX_WRITE_FACTOR = Fraction(11, 10)
+
+
+def key_expr(table):
+    column = KEY_COLUMNS[table]
+    # precedents only: a leading branch label ('(춘천)2011누414', ~180 rows) is dropped first; then, for
+    # every table, a trailing '(2020.1.1)' / '(병합)'. Other tables keep their expression (and index):
+    # rebuilding the 심판례 index (~14만 rows) would not fit one day's write limit.
+    base = (f"CASE WHEN substr({column},1,1)='(' AND instr({column},')')>0 THEN substr({column},instr({column},')')+1) ELSE {column} END"
+            if table == 'precedents' else column)
+    field = f"CASE WHEN instr({base},'(')>0 THEN substr({base},1,instr({base},'(')-1) ELSE {base} END"
+    for symbol in KEY_SYMBOLS:
+        field = f"replace({field},'{symbol}','')"
+    for code in (9, 10):
+        field = f"replace({field},char({code}),'')"
+    if table == 'interpretations':
+        field = f"replace({field},'기획재정부','재정경제부')"
+    return field
+
+
+# Write calibration depends on how many key indexes each insert maintains (one per table), not on the
+# exact key expression. Receipts measured under an earlier expression with the same layout stay valid.
+INDEX_LAYOUT = digest(json.dumps(sorted(KEY_COLUMNS)).encode('utf-8'))
+# index_sql() before #193 (2026-11-08: precedents key also drops a leading '(지원)'): same one-index layout.
+EQUIVALENT_INDEX_SHA256 = {'715da9ec65c14b1bf68afcb21c93727bee3e2b6f11a9407228a18e2b5119404b'}
+
+
+def same_index_layout(sample):
+    if 'index_layout' in sample:
+        return sample['index_layout'] == INDEX_LAYOUT
+    return sample.get('index_sha256') in EQUIVALENT_INDEX_SHA256 | {digest(index_sql().encode('utf-8'))}
+
+
+def index_name(table):
+    return f"{table}_key_{digest(key_expr(table).encode('utf-8'))[:8]}"
+
+
+def index_sql(table=None):
+    return ''.join(f'CREATE INDEX IF NOT EXISTS {index_name(t)} ON {t}({key_expr(t)});\n'
+                   for t in ([table] if table else KEY_COLUMNS))
+
+
+def index_cost(rows):
+    return math.ceil(rows * INDEX_WRITE_FACTOR) + SCHEMA_RESERVE
+
+
+# Row counts for /health: the Worker must not COUNT(*) (a full read per request), so the loader,
+# which already holds the authoritative remote ID inventory, stores them in a 4-row table.
+COUNTS_SQL = 'CREATE TABLE IF NOT EXISTS table_counts (tbl TEXT PRIMARY KEY, n INTEGER NOT NULL, counted TEXT NOT NULL);\n'
+COUNTS_RESERVE = 64
+
+
+def record_counts(state, state_file, out, loaded, day, write):
+    counts = {t: len(loaded.get(t, [])) for t in COLUMNS}
+    if state.get('table_counts', {}).get('n') == counts:
+        return  # unchanged: no write (the stored day is the last change)
+    path = out / 'counts.sql'
+    path.write_text(COUNTS_SQL + ''.join(f'INSERT OR REPLACE INTO table_counts (tbl, n, counted) VALUES '
+                                         f'({literal(t)}, {n}, {literal(day)});\n' for t, n in counts.items()),
+                    encoding='utf-8')
+    if write(path, COUNTS_RESERVE):
+        state['table_counts'] = dict(n=counts, day=day)
+        save(state_file, state)
+
+
 def literal(value):
+    if value is None:
+        return 'NULL'
     if '\x00' in value:
         raise ValueError('SQL_NUL_INVALID')
     return "'" + value.replace("'", "''") + "'"
 
 
 def insert_sql(table, row):
-    return f'INSERT OR IGNORE INTO {table} (' + ','.join(COLUMNS[table]) + ') VALUES (' + ','.join(literal(row[c]) for c in COLUMNS[table]) + ');\n'
+    return f'INSERT OR IGNORE INTO {table} (' + ','.join(('\"order\"' if c == 'order' else c) for c in COLUMNS[table]) + ') VALUES (' + ','.join(literal(row[c]) for c in COLUMNS[table]) + ');\n'
 
 
 def write_bound(table, row):
@@ -74,7 +152,7 @@ def write_bound(table, row):
     return 64 + 8 * sum(len(row[c]) for c in SEARCH[table])
 
 
-def budget_model(state, day):
+def budget_model(state, day, table=None):
     """Only successful REMOTE document receipts from earlier UTC dates qualify.
 
     SQLite total_changes, today's receipts, schema writes, different databases
@@ -83,9 +161,20 @@ def budget_model(state, day):
     fingerprint = digest(schema().encode('utf-8'))
     samples = []
     for sample in state.get('measurements', []):
+        if table == 'committee_decisions':
+            if sample.get('table') != table:
+                continue
+        elif sample.get('table') == 'committee_decisions' or (sample.get('scope') == 'committee' and 'table' not in sample):
+            continue
+        elif sample.get('scope') == 'mofe':
+            continue  # 재정경제부 rows (scripts/mofe_interpretations.py) calibrate only their own loader
         if (sample.get('source') != 'remote_meta.rows_written' or sample.get('day', day) >= day
                 or sample.get('database_id') != state.get('database_id')
-                or sample.get('schema_sha256') != fingerprint):
+                or sample.get('schema_sha256') != fingerprint
+                # Each key index adds a write per document: receipts from fewer indexes under-measure.
+                # While a changed index and its predecessor coexist (one run) an insert writes one more
+                # row; the 1.5 multiplier and the per-batch remote rows_written check cover that run.
+                or not same_index_layout(sample)):
             continue
         if (type(sample.get('documents')) is not int or sample['documents'] <= 0
                 or type(sample.get('rows_written')) is not int or sample['rows_written'] <= 0
@@ -100,11 +189,12 @@ def budget_model(state, day):
                 rows_written=writes, rows_per_document=writes / documents,
                 multiplier=1.5, samples=len(samples), measured_through=max(s['day'] for s in samples),
                 schema_sha256=fingerprint,
-                evidence_sha256=digest(json.dumps(samples, sort_keys=True).encode('utf-8')))
+                evidence_sha256=digest(json.dumps(samples, sort_keys=True).encode('utf-8')),
+                **({'table': table} if table else {}))
 
 
 def reservation_cost(table, row, model=None):
-    if not model or model['mode'] == 'conservative':
+    if (table == 'committee_decisions' and (model or {}).get('table') != table) or not model or model['mode'] == 'conservative':
         return Fraction(write_bound(table, row))
     if model['mode'] != 'measured' or model['documents'] <= 0 or model['rows_written'] <= 0:
         raise ValueError('BUDGET_MODEL_INVALID')
@@ -112,15 +202,18 @@ def reservation_cost(table, row, model=None):
     return Fraction(model['rows_written'] * 3, model['documents'] * 2)
 
 
-def load_rows(source, scope='all'):
-    if scope not in ('tax', 'all'):
+def load_rows(source, scope='all', committee_source=None):
+    if scope not in ('tax', 'all', 'committee'):
         raise ValueError('SCOPE_INVALID')
     manifest = strict_json((source / 'manifest.json').read_bytes())
     if manifest.get('schema') != SCHEMA:
         raise ValueError('MANIFEST_SCHEMA_INVALID')
     verify_cache(source, manifest)
     rows, failures, excluded, skipped = [], [], 0, 0
-    for entry in manifest['documents']:
+    for entry in sorted(manifest['documents'], key=lambda e: e['target'] == 'decc'):
+        if entry['target'] == 'decc' and scope != 'committee':
+            excluded += 1
+            continue
         if entry['status'] == 'SKIPPED':
             skipped += 1  # source not collected by design (e.g. rows without case numbers)
             continue
@@ -134,17 +227,20 @@ def load_rows(source, scope='all'):
             excluded += 1
             continue
         rows.append((TABLES[entry['target']], row))
+    if committee_source is not None:
+        from bblove_committee_release import verify
+        rows.extend(('committee_decisions', r) for r in verify(committee_source))
     manifest['scope_selection'] = dict(scope=scope, excluded_documents=excluded, skipped_sources=skipped, rule='tax-v2')
     return manifest, rows, failures
 
 
 def build(source, out, loaded=None, tokenizer='trigram', daily_limit=DAILY_LIMIT,
-          model=None, scope='all', max_batch_documents=None):
+          model=None, scope='all', max_batch_documents=None, committee_source=None, committee_model=None):
     if not 1 <= daily_limit <= DAILY_LIMIT:
         raise ValueError('DAILY_LIMIT_INVALID')
     if max_batch_documents is not None and max_batch_documents < 1:
         raise ValueError('BATCH_DOCUMENT_LIMIT_INVALID')
-    manifest, rows, failures = load_rows(source, scope)
+    manifest, rows, failures = load_rows(source, scope, committee_source)
     loaded = {table: set(ids) for table, ids in (loaded or {}).items()}
     out.mkdir(parents=True, exist_ok=True)
     for old in out.glob('batch-*.sql'):
@@ -166,7 +262,10 @@ def build(source, out, loaded=None, tokenizer='trigram', daily_limit=DAILY_LIMIT
         if row['id'] in loaded.get(table, []):
             skipped += 1
             continue
-        cost = reservation_cost(table, row, model)
+        is_committee = table == 'committee_decisions'
+        if batch and (batch[-1][0] == 'committee_decisions') != is_committee:
+            flush()
+        cost = reservation_cost(table, row, committee_model if is_committee else model)
         if cost > daily_limit or len(insert_sql(table, row).encode('utf-8')) > 90_000:
             raise ValueError('SINGLE_DOCUMENT_EXCEEDS_SAFE_BUDGET')
         # Sum rounded chunk reservations within each day, so fractional rows
@@ -202,7 +301,7 @@ def build(source, out, loaded=None, tokenizer='trigram', daily_limit=DAILY_LIMIT
                   daily_limit=daily_limit, local_total_changes=changes, schema_write_reserve=SCHEMA_RESERVE,
                   # Old two-target snapshots remain buildable; missing tribunal
                   # catalogs are unknown, never reported as a measured zero.
-                  catalog_totals={t: manifest['catalogs'].get(t, {}).get('total') for t in TARGETS},
+                  catalog_totals={t: manifest['catalogs'].get(t, {}).get('total') for t in (TARGETS if scope == 'committee' else DEFAULT_TARGETS)},
                   status='READY' if not failures else 'PARTIAL_WITH_FAILURES')
     save(out / 'build-report.json', report)
     return report
@@ -241,7 +340,7 @@ def utc_day():
 
 
 def remote_load(source, out, state_file, config, database, wrangler, execute=wrangler_json,
-                day=None, clock=None, scope='all'):
+                day=None, clock=None, scope='all', committee_source=None):
     """One serialized loader, one UTC ledger shared across workflow runs.
 
     Reserve admission units BEFORE each remote write. A crash or unknown result
@@ -251,7 +350,7 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
     clock = clock or utc_day
     day = day or clock()
     # Verify all local input before any remote mutation.
-    load_rows(source, scope)
+    load_rows(source, scope, committee_source)
     state = strict_json(state_file.read_bytes()) if state_file.exists() else {'days': {}}
     ledger = state['days'].setdefault(day, {'reserved': 0, 'rows_written': 0})
     model = ledger.setdefault('budget_model', budget_model(state, day))
@@ -259,6 +358,9 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
     if model['mode'] == 'measured' and model.get('schema_sha256') != fingerprint:
         # An existing UTC reservation is never refunded on schema expansion.
         model = ledger['budget_model'] = {'mode': 'conservative', 'formula': '64 + 8 * indexed_characters'}
+    committee_model = ledger.setdefault('committee_budget_model', budget_model(state, day, 'committee_decisions')) if committee_source is not None else None
+    if committee_model and committee_model.get('schema_sha256', fingerprint) != fingerprint:
+        committee_model = ledger['committee_budget_model'] = {'mode': 'conservative'}
     ledger.setdefault('documents_written', 0)
     if ledger.get('halted') or max(ledger['reserved'], ledger['rows_written']) >= DAILY_LIMIT:
         return state
@@ -280,11 +382,16 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
         observed = sum(x['meta']['rows_written'] for x in result)
         ledger['rows_written'] += observed
         if batch:
-            ledger['documents_written'] += batch['documents']
+            is_committee = bool(batch['ids'].get('committee_decisions'))
+            counter = 'committee_documents_written' if is_committee else 'documents_written'
+            ledger[counter] = ledger.get(counter, 0) + batch['documents']
             state.setdefault('measurements', []).append(dict(
                 source='remote_meta.rows_written', day=day, documents=batch['documents'], rows_written=observed,
                 database_id=state.get('database_id'), schema_sha256=digest(schema().encode('utf-8')),
-                sql_sha256=batch['sha256'], reserved=cost, scope=scope))
+                index_sha256=digest(index_sql().encode('utf-8')),
+                index_layout=INDEX_LAYOUT,
+                sql_sha256=batch['sha256'], reserved=cost, scope=scope,
+                table='committee_decisions' if is_committee else 'summary'))
         save(state_file, state)
         if observed > cost:
             ledger['halted'] = 'REMOTE_WRITE_BOUND_EXCEEDED'
@@ -307,7 +414,8 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
             query = f'SELECT id FROM {table} WHERE id > {literal(cursor)} ORDER BY id LIMIT 1000;'
             results = execute(base + ['--command', query])
             page = [str(r['id']) for block in results for r in block['results']]
-            if any(not re.fullmatch(r'[0-9]+', i) for i in page) or (page and page[-1] <= cursor):
+            # DRF ids are numeric; the 재정경제부 loader (scripts/mofe_interpretations.py) shares `interpretations` under mofe-<nttId>.
+            if any(not re.fullmatch(r'[0-9]+|mofe-[0-9]{1,12}', i) for i in page) or (page and page[-1] <= cursor):
                 raise ValueError('REMOTE_ID_PAGE_INVALID')
             ids.extend(page)
             if len(page) < 1000:
@@ -317,6 +425,38 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
     # Cache hint only; every import still reads authoritative remote IDs.
     receipt_file = source / 'd1-loaded.json'
     save(receipt_file, dict(database_id=state.get('database_id'), ids=loaded))
+    if committee_source is not None:
+        save(Path(committee_source) / 'd1-loaded.json', dict(database_id=state.get('database_id'), ids={'committee_decisions': loaded.get('committee_decisions', [])}))
+    # Key indexes before any document: a table indexed after loading (심판례 ~14만) could no longer
+    # be indexed within one day's write limit. The remote catalog, not the state file, decides.
+    existing = {str(r.get('name')) for block in execute(base + ['--command', "SELECT name FROM sqlite_master WHERE type='index';"])
+                for r in block.get('results', [])}
+    for table in KEY_COLUMNS:
+        name = index_name(table)
+        stale = sorted(n for n in existing if n.startswith(table + '_key') and n != name)
+        if name in existing and not stale:
+            continue
+        cost = SCHEMA_RESERVE if name in existing else index_cost(len(loaded.get(table, [])))
+        if cost > DAILY_LIMIT:
+            raise ValueError('INDEX_BUDGET_IMPOSSIBLE')
+        path = out / f'index-{table}.sql'
+        # A new index is built first and the old one is dropped on a later run, so a Worker still sending
+        # the old expression keeps an index seek until the new Worker is deployed.
+        path.write_text(index_sql(table) if name not in existing
+                        else ''.join(f'DROP INDEX IF EXISTS {n};\n' for n in stale), encoding='utf-8')
+        if not write(path, cost):
+            state['index_pending'] = dict(table=table, day=day, cost=cost)
+            save(state_file, state)
+            return state  # nothing else today; the next run starts with this index
+        if table == 'precedents' and name not in existing:
+            # One-time evidence for the exact-match switch: stored case numbers that do not start
+            # with a digit or carry other characters (the old lookup skipped a prefix before the year).
+            odd = execute(base + ['--command', "SELECT case_no FROM precedents WHERE case_no NOT GLOB '[0-9]*' "
+                                  "OR case_no GLOB '*[^0-9가-힣]*' LIMIT 20;"])
+            state['key_outliers'] = dict(day=day, precedents=[str(r.get('case_no')) for b in odd for r in b.get('results', [])])
+    state.pop('index_pending', None)
+    state['index_sha256'] = digest(index_sql().encode('utf-8'))
+    save(state_file, state)
     # Inspect actual DB size before each admission, leaving a conservative SQL
     # payload multiplier for the next FTS index growth.
     # Remote D1 exposes size_after in query metadata. Avoid relying on PRAGMAs
@@ -332,13 +472,20 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
     if model['mode'] == 'conservative':
         chunk_documents = min(chunk_documents, CALIBRATION_DOCUMENTS - ledger['documents_written'])
         if chunk_documents <= 0:
-            return state
+            if committee_source is None:
+                return state
+            chunk_documents = WRITE_CHUNK_DOCUMENTS
     report = build(source, out, loaded, daily_limit=remaining, model=model, scope=scope,
-                   max_batch_documents=chunk_documents)
+                   max_batch_documents=chunk_documents, committee_source=committee_source, committee_model=committee_model)
     for batch in report['batches']:
         if batch['day'] != 1:
             break
-        if model['mode'] == 'conservative' and ledger['documents_written'] + batch['documents'] > CALIBRATION_DOCUMENTS:
+        is_committee = bool(batch['ids'].get('committee_decisions'))
+        active_model = committee_model if is_committee and committee_model else model
+        counter = 'committee_documents_written' if is_committee else 'documents_written'
+        if active_model['mode'] == 'conservative' and ledger.get(counter, 0) + batch['documents'] > CALIBRATION_DOCUMENTS:
+            if not is_committee and committee_source is not None:
+                continue
             break
         file = out / batch['path']
         if digest(file.read_bytes()) != batch['sha256']:
@@ -350,7 +497,10 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
         for table, ids in batch['ids'].items():
             loaded[table].extend(ids)
         save(receipt_file, dict(database_id=state.get('database_id'), ids=loaded))
+        if committee_source is not None:
+            save(Path(committee_source) / 'd1-loaded.json', dict(database_id=state.get('database_id'), ids={'committee_decisions': loaded.get('committee_decisions', [])}))
         size += file.stat().st_size * 16
+    record_counts(state, state_file, out, loaded, day, write)
     # The durable GitHub state stays small: SQL ID inventories belong to the
     # build artifact, not duplicated into the quota/measurement ledger.
     state.update(last_build={k: report[k] for k in ('selected_documents', 'skipped_ids', 'estimated_days',
@@ -369,7 +519,7 @@ def progress(source, out, state_file):
                 if next_policy['mode'] == 'measured' else 'UNMEASURED')
     docs = manifest.get('documents', [])
     loaded_total = sum(d.get('documents_written', 0) for d in state.get('days', {}).values())
-    totals = [manifest.get('catalogs', {}).get(t, {}).get('total') for t in TARGETS]
+    totals = [manifest.get('catalogs', {}).get(t, {}).get('total') for t in (TARGETS if report.get('scope_selection', {}).get('scope') == 'committee' else DEFAULT_TARGETS)]
     estimated_total = sum(totals) if all(type(n) is int for n in totals) else None
     successful_days = [d.get('documents_written', 0) for d in state.get('days', {}).values()
                        if d.get('documents_written', 0) > 0]
@@ -381,8 +531,13 @@ def progress(source, out, state_file):
     summary = (f"- 이번 실행 {state.get('last_run', {}).get('elapsed_minutes', 0):.2f}분 · "
                f"누적 적재 {loaded_total:,}행 / 추정 전체 {estimated_total if estimated_total is not None else '미측정'}행 · "
                f"남은 예상 실행 일수 {remaining_days}일")
-    lines = ['# Precedent D1 progress', summary,
-             '- 적재 행은 문서 행(FTS 쓰기 제외); 전체 카탈로그 수는 tax 범위의 상한. 일수는 관측 일별 처리량 기준 추정이며 초기에는 미측정.', f"- Collection: {manifest.get('status', 'NOT_STARTED')}; documents={len(docs)}, success={sum(e['status']=='SUCCESS' for e in docs)}",
+    skipped = state.get('last_run', {}).get('permanent_failures_skipped', {})
+    skipped_line = f"- Permanent source failures skipped: {sum(skipped.values())}"
+    if skipped:
+        skipped_line += ' (' + ', '.join(f'{reason}={count}' for reason, count in sorted(skipped.items())) + ')'
+    lines = ['# Precedent D1 progress', summary, skipped_line,
+             '- 적재 행은 문서 행(FTS 쓰기 제외); 전체 카탈로그 수는 tax 범위의 상한. 일수는 관측 일별 처리량 기준 추정이며 초기에는 미측정.', f"- Collection: {manifest.get('status', 'NOT_STARTED')}; documents={len(docs)}, success={sum(e['status']=='SUCCESS' for e in docs)}"
+             + (f"; partial public export, catalogs={','.join(manifest['partial_targets'])}" if manifest.get('partial_targets') else ''),
              f"- D1 database ID: {state.get('database_id', 'NOT_PREPARED')}; name={state.get('database_name', 'NOT_PREPARED')}",
              f"- Catalog totals: {json.dumps(report.get('catalog_totals', manifest.get('catalogs', {})), ensure_ascii=False)}",
              f"- Build: {report.get('status', 'NOT_BUILT')}; skipped IDs={report.get('skipped_ids', 0)}; current-window policy plan days={report.get('estimated_days', '?')}",
@@ -408,7 +563,7 @@ def main():
     ap.add_argument('--progress', action='store_true')
     ap.add_argument('--config', type=Path)
     ap.add_argument('--database')
-    ap.add_argument('--scope', choices=('tax', 'all'), default='tax')
+    ap.add_argument('--scope', choices=('tax', 'all', 'committee'), default='tax')
     ap.add_argument('--claimed-day', help='UTC day reserved durably by the workflow')
     ap.add_argument('--wrangler', default='mcp/node_modules/.bin/wrangler')
     args = ap.parse_args()

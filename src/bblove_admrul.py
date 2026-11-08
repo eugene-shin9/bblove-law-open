@@ -24,7 +24,7 @@ from bblove_v107_pilot import check_date, sanitized, text
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from build_mcp_assets_official import encode, iso, META_LIMIT
 
-ORG = {'국세청': '1210000', '재정경제부': '1051000'}
+ORG = {'국세청': '1210000', '재정경제부': '1053000'}
 # 기획재정부 was renamed 재정경제부 (정부조직법 제29조·제30조, 개정 2025.10.1). Rules issued
 # before the rename may still carry the former name; any other ministry still fails closed.
 FORMER = {'기획재정부': '재정경제부'}
@@ -122,10 +122,10 @@ def catalog(client, out, date):
                 raw = encode(clean)  # selection evidence; never claimed as an original
             doc = safe_raw(raw, getattr(client, 'credential', ''))
             batch, count = parse_page(doc, org, page, date)
-            # An empty required ministry may mean a retired org code. Do not
-            # publish the other ministry alone, including from old checkpoints.
-            if count == 0:
-                raise ValueError('ADMRUL_ORG_CATALOG_EMPTY')
+            # Apply to fresh and cached pages before accepting either ministry.
+            # A retired/wrong code must not publish the other ministry alone.
+            if count < 10:
+                raise ValueError('ADMRUL_ORG_CATALOG_TOO_SMALL')
             if total is not None and count != total:
                 raise ValueError('ADMRUL_CATALOG_CHANGED')
             total = count

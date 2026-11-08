@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from bblove_law_all import today
 from bblove_storage import strict_json
 from bblove_annex_assets import verify_assets as verify_annex_assets
+from bblove_addenda_assets import verify_assets as verify_addenda_assets
 from bblove_v107_pilot import check_date
 from build_mcp_assets_official import GROUP_LIMIT, META_LIMIT, REQUIRED, group_id
 
@@ -114,7 +115,8 @@ def verify(assets, date=None, enforce_thresholds=True):
     if enforce_thresholds and (found != set(REQUIRED) or counts['n_docs'] < 4500 or
                                counts['n_articles'] < 170000 or sum(d['k'] == '법률' for d in docs) < 1650):
         raise ValueError('CORPUS_ACCEPTANCE_FAILED')
-    return {**counts, **verify_annex_assets(assets, meta.get('annex'), groups, annex_laws)}
+    return {**counts, **verify_annex_assets(assets, meta.get('annex'), groups, annex_laws),
+            **verify_addenda_assets(assets, meta.get('addenda'), groups, annex_laws, date)}
 
 
 if __name__ == '__main__':

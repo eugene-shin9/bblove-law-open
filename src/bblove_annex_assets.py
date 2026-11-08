@@ -92,13 +92,16 @@ def positions(line, wide=WIDE[0]):
 
 
 def parse_block(lines):
-    """Try each deterministic width model; the first geometry that parses is used (lossless check follows)."""
+    """Try each deterministic width model; the first geometry that parses is used (lossless check follows).
+    The strict full-rule grid goes first so every table it accepts keeps its exact earlier view; the
+    segment grid only handles what it rejects (partial rules, open frames, one-cell border drift)."""
     error = None
-    for wide in WIDE:
-        try:
-            return parse_grid([positions(s, wide) for s in lines])
-        except ValueError as exc:
-            error = error or exc
+    for parser in (parse_grid, parse_segments):
+        for wide in WIDE:
+            try:
+                return parser([positions(s, wide) for s in lines])
+            except ValueError as exc:
+                error = error or exc
     raise error
 
 
@@ -184,6 +187,235 @@ def parse_grid(lines):
                     continue
                 rows[rr][cc] += ('\n' if rows[rr][cc] else '') + value.strip()
     return {'rows': rows, 'merges': merges}
+
+
+SNAP = 2  # HWP export shifts a border by at most one character cell
+
+
+def is_stop(c):
+    return bool(BOX.fullmatch(c)) and c not in HORIZONTAL
+
+
+def is_text(c):
+    return not c.isspace() and not BOX.fullmatch(c)
+
+
+STROKES = set('│┃║┆┇┊┋┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋'
+              '╒╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣╤╥╦╧╨╩╪╫╬╭╮╯╰')
+
+
+def strokes(c):
+    """(up, down) strokes of a junction/border character, from its Unicode name."""
+    name = unicodedata.name(c, '')
+    vertical = 'VERTICAL' in name or c in VERTICAL
+    up = vertical or ' UP' in name or c in '╯╰'
+    down = vertical or ' DOWN' in name or c in '╭╮'
+    return up, down
+
+
+def parse_segments(lines):
+    """Cells from line×column segments: a rule may span only some columns (a cell spanning rows
+    continues through it), the outer frame may be missing, and a border drawn one cell off in
+    other rows is snapped. Anything that would need guessing raises instead."""
+    n = len(lines)
+    if any(BOX.fullmatch(c) and c not in HORIZONTAL and c not in STROKES for line in lines for _, c in line):
+        raise ValueError('unsupported_box_shape')  # diagonals, dashes, half lines: not guessed
+    stop_sets = [{x for x, c in line if is_stop(c)} for line in lines]
+    stops = sorted(set().union(*stop_sets))
+    if not stops:
+        raise ValueError('missing_grid')
+    # A border drawn one cell off in some rows is the same column boundary, provided the two
+    # positions never appear together on one line.
+    clusters = []
+    for x in stops:
+        last = clusters[-1] if clusters else None
+        if (last and x - last[0] <= SNAP and
+                not any(x in s and any(y in s for y in last) for s in stop_sets)):
+            last.append(x)
+        else:
+            clusters.append([x])
+    texts = [x for line in lines for x, c in line if is_text(c)]
+    lo, hi = min(texts, default=stops[0]), max(texts, default=stops[-1])
+    vleft, vright = lo < clusters[0][0], hi > clusters[-1][-1]
+    bounds, present = [], []
+    for i in range(n):
+        b, p = [], []
+        if vleft:
+            b.append(-1); p.append(True)
+        for cl in clusters:
+            hit = [x for x in cl if x in stop_sets[i]]
+            b.append(hit[0] if hit else cl[0]); p.append(bool(hit))
+        if vright:
+            b.append(hi + 2); p.append(True)
+        bounds.append(b); present.append(p)
+    nc = len(bounds[0]) - 1
+    if nc < 1:
+        raise ValueError('missing_grid')
+
+    def col(i, x):
+        b = bounds[i]
+        for c in range(nc):
+            if b[c] < x < b[c + 1]:
+                return c
+        k = next((k for k in range(1, nc) if b[k] == x and not present[i][k]), None)
+        return None if k is None else k - 1  # text on an absent inner border: merged cell
+
+    kind, inside = [], [set() for _ in range(nc)]
+    for i, line in enumerate(lines):
+        segs = [[] for _ in range(nc)]
+        for x, ch in line:
+            b = bounds[i]
+            c = next((c for c in range(nc) if b[c] < x < b[c + 1]), None)
+            if c is not None:
+                segs[c].append(ch)
+                if not ch.isspace():
+                    inside[c].add(i)
+        row = []
+        for c, s in enumerate(segs):
+            # A rule fills its whole span; a fraction bar inside a cell has spaces around it.
+            body = ''.join(s)
+            if vleft and c == 0:
+                body = body.lstrip()
+            if vright and c == nc - 1:
+                body = body.rstrip()
+            if body and all(ch in HORIZONTAL for ch in body):
+                row.append('h')
+                continue
+            # Otherwise a horizontal run is only a fraction bar when spaces surround it; a run that
+            # touches a border or a character is a broken rule and is not guessed.
+            for run in re.finditer('[%s]+' % ''.join(sorted(HORIZONTAL)), body):
+                if (run.start() == 0 or run.end() == len(body) or
+                        not body[run.start() - 1].isspace() or not body[run.end()].isspace()):
+                    raise ValueError('ambiguous_rule')
+            row.append('o')
+        kind.append(row)
+    for c in range(nc):
+        # An empty sliver column is only a double border if both edges are drawn on every line.
+        if not inside[c] and not all(present[i][c] and present[i][c + 1] for i in range(n)):
+            raise ValueError('misaligned_border')
+    rule = [any(k == 'h' for k in row) for row in kind]
+    # A vertical border can only start or stop at a rule line (junction). Between two text lines
+    # the drawn borders must match; otherwise character widths drifted and cells would be guessed.
+    for i in range(n - 1):
+        a, b = present[i], present[i + 1]
+        if not rule[i] and not rule[i + 1] and a != b:
+            raise ValueError('inconsistent_vertical_border')
+        for x, y, r in ((a, b, rule[i + 1]), (b, a, rule[i])):
+            if r and any(x[k] and not y[k] for k in range(len(x))):
+                raise ValueError('inconsistent_vertical_border')
+        for j, t, way in ((i, i + 1, 1), (i + 1, i, 0)):
+            # A junction drawn with a stroke toward a text line means that line has the border too.
+            if rule[j] and not rule[t]:
+                for k, x in enumerate(bounds[j]):
+                    ch = dict(lines[j]).get(x)
+                    if present[j][k] and ch and strokes(ch)[way] and not present[t][k]:
+                        raise ValueError('inconsistent_vertical_border')
+    # A fraction bar counts as cell content, so numerator and denominator stay in one row.
+    blank = [not rule[i] and not any(is_text(ch) or ch in HORIZONTAL for _, ch in line)
+             for i, line in enumerate(lines)]
+    filled = [[any(is_text(ch) or ch in HORIZONTAL for x, ch in lines[i]
+                   if bounds[i][c] < x < bounds[i][c + 1]) for c in range(nc)] for i in range(n)]
+    # Rows: runs of lines between rules. A band is cut further at blank lines only when every
+    # piece fills every column (borderless rate schedules); otherwise a blank line is padding
+    # inside multi-line cells and row spans.
+    band, cut, b, i = [None] * n, [False] * n, -1, 0
+    while i < n:
+        if rule[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not rule[j]:
+            j += 1
+        pieces, current = [], []
+        for t in range(i, j):
+            if blank[t]:
+                if current:
+                    pieces.append(current); current = []
+            else:
+                current.append(t)
+        if current:
+            pieces.append(current)
+        if len(pieces) > 1 and all(all(any(filled[t][c] for t in piece) for c in range(nc)) for piece in pieces):
+            for t in range(i, j):
+                cut[t] = blank[t]
+            for piece in pieces:
+                b += 1
+                for t in piece:
+                    band[t] = b
+        else:
+            b += 1
+            for t in range(i, j):
+                band[t] = b
+        i = j
+    nr = b + 1
+    if nr == 0:
+        raise ValueError('empty_band')
+    parent = list(range(n * nc))
+
+    def root(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = root(a), root(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for c in range(nc - 1):
+            if kind[i][c] == 'o' and kind[i][c + 1] == 'o' and not present[i][c + 1]:
+                union(i * nc + c, i * nc + c + 1)
+        if i + 1 < n and not cut[i] and not cut[i + 1]:
+            for c in range(nc):
+                if kind[i][c] == 'o' and kind[i + 1][c] == 'o':
+                    union(i * nc + c, (i + 1) * nc + c)
+    comps = defaultdict(set)
+    for i in range(n):
+        if band[i] is None:
+            continue
+        for c in range(nc):
+            if kind[i][c] == 'o':
+                comps[root(i * nc + c)].add((band[i], c))
+    anchor, merges = {}, []
+    for key, cells in comps.items():
+        top, left = min(r for r, _ in cells), min(c for _, c in cells)
+        h = max(r for r, _ in cells) - top + 1
+        w = max(c for _, c in cells) - left + 1
+        if len(cells) != h * w:
+            raise ValueError('nonrectangular_merge')
+        anchor[key] = (top, left)
+        if h > 1 or w > 1:
+            merges.append({'row': top, 'col': left, 'rowspan': h, 'colspan': w})
+    rows = [['' for _ in range(nc)] for _ in range(nr)]
+    for i, line in enumerate(lines):
+        frag = defaultdict(str)
+        for x, ch in line:
+            c = col(i, x)
+            if BOX.fullmatch(ch):
+                # Keep a fraction bar inside a cell (numerator above, denominator below); all
+                # other box characters are view markup and excluded from the lossless check.
+                b = bounds[i]
+                if not (ch in HORIZONTAL and c is not None and kind[i][c] == 'o' and b[c] < x < b[c + 1]):
+                    continue
+            if c is None:
+                if is_text(ch):
+                    raise ValueError('text_outside_grid')
+                continue
+            if kind[i][c] != 'o':
+                if is_text(ch):
+                    raise ValueError('text_on_rule')
+                continue
+            key = root(i * nc + c)
+            if key in anchor:
+                frag[anchor[key]] += ch
+            elif is_text(ch):
+                raise ValueError('text_outside_grid')
+        for (r, c), v in frag.items():
+            if v.strip():
+                rows[r][c] += ('\n' if rows[r][c] else '') + v.strip()
+    return {'rows': rows, 'merges': sorted(merges, key=lambda m: (m['row'], m['col']))}
 
 
 def parse_table(raw):

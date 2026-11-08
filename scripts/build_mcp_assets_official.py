@@ -15,6 +15,8 @@ from bblove_law_all import save, today, validate_raw, collection_complete, failu
 from bblove_storage import strict_json
 from bblove_annex_assets import (extract as extract_annex, write_assets as write_annex_assets,
                                  verify_assets as verify_annex_assets)
+from bblove_addenda_assets import (extract as extract_addenda, write_assets as write_addenda_assets,
+                                   verify_assets as verify_addenda_assets)
 from bblove_v107_pilot import records, text
 
 GROUP_LIMIT = 4 * 1024 * 1024
@@ -87,7 +89,8 @@ def iso(value):
     return f'{value[:4]}-{value[4:6]}-{value[6:]}'
 
 
-def load_groups(source, date, annexes=None, annex_skips=None):
+def load_groups(source, date, annexes=None, annex_skips=None, addenda=None, addenda_skips=None,
+                abbreviations=None):
     manifest = strict_json((source / 'manifest.json').read_bytes())
     if manifest.get('status') != 'COMPLETE' or not collection_complete(manifest.get('documents', [])):
         raise ValueError('INCOMPLETE_COLLECTION')
@@ -121,12 +124,29 @@ def load_groups(source, date, annexes=None, annex_skips=None):
                     raise
                 if annex_skips is not None:
                     annex_skips.append({'id': entry['id'], 'title': entry['title'], 'reason': str(exc)[:80]})
+        if addenda is not None:
+            # Like annexes, an addenda problem never blocks the article build (credential markers still fail).
+            try:
+                units = extract_addenda(doc, date)
+            except ValueError as exc:
+                if str(exc) == 'ADDENDA_AUTH_MARKER':
+                    raise
+                units = []
+                if addenda_skips is not None:
+                    addenda_skips.append({'id': entry['id'], 'title': entry['title'], 'reason': str(exc)[:80]})
+            addenda.setdefault(entry['group'], []).append(
+                {'id': entry['id'], 'k': entry['kind'], 't': entry['title'], 'u': units})
+        if abbreviations is not None:
+            # 법제처가 지정한 법령 약칭(청탁금지법·국가계약법 등). 검색 별칭으로만 쓴다.
+            short = (doc.get('법령', {}).get('기본정보') or {}).get('법령명약칭')
+            if isinstance(short, str) and short.strip():
+                abbreviations.setdefault(entry['group'], set()).add(short.strip())
         arts = articles(doc)
         if count != len(arts) or count != entry['articles']:
             raise ValueError('ARTICLE_COUNT_MISMATCH')
         groups.setdefault(entry['group'], []).append({'k': entry['kind'],
             'kc': text(row, '법령구분명'), 't': entry['title'], 'id': entry['id'],
-            'eff': iso(entry['effective']), 'pub': iso(entry['published']), 'st': '시행',
+            'eff': iso(entry['effective']), 'pub': iso(entry['published']), 'mst': entry['mst'], 'st': '시행',
             'url': 'https://www.law.go.kr/법령/' + quote(entry['title']), 'a': arts,
             **({'eff2': iso(w['detail'])} if (w := next((w for w in warnings if w.get('code') in
                 {'effective_date_differs_from_catalog', 'detail_date_after_today'}), None)) else {})})
@@ -138,11 +158,17 @@ def load_groups(source, date, annexes=None, annex_skips=None):
             if d['k'] == '시행령' and not has_law:
                 d['k'] = '대통령령'
         docs.sort(key=lambda d: (['법률', '시행령', '시행규칙', '대통령령'].index(d['k']), d['id']))
+    by_id = {d['id']: d for values in groups.values() for d in values}
     if annexes is not None:
-        by_id = {d['id']: d for values in groups.values() for d in values}
         for values in annexes.values():
             for item in values:
                 item['kind'] = by_id[item['law_id']]['k']
+    if addenda is not None:
+        # Kinds are normalized above (시행령 without a 법률 becomes 대통령령); keep addenda in step with groups.
+        for values in addenda.values():
+            for item in values:
+                item['k'] = by_id[item['id']]['k']
+                item['t'] = by_id[item['id']]['t']
     return manifest, dict(sorted(groups.items()))
 
 
@@ -152,8 +178,8 @@ def group_id(name):
 
 def build(source, repo, out, date=None, enforce_thresholds=True):
     date = date or today()
-    annexes, annex_skips = {}, []
-    manifest, groups = load_groups(source, date, annexes, annex_skips)
+    annexes, annex_skips, addenda, addenda_skips, abbreviations = {}, [], {}, [], {}
+    manifest, groups = load_groups(source, date, annexes, annex_skips, addenda, addenda_skips, abbreviations)
     docs = [d for values in groups.values() for d in values]
     checks = {title: any(d['t'] == title and d['k'] == '법률' and
                         any(a[0] == no and a[2].strip() for a in d['a']) for d in docs)
@@ -185,6 +211,11 @@ def build(source, repo, out, date=None, enforce_thresholds=True):
             light[group] = [identifier, law['t'], law['eff'], 0]
         annex_index, annex_report = write_annex_assets(stage, annexes,
                                                       {g: group_id(g) for g in groups})
+        addenda_index = write_addenda_assets(stage, {g: v for g, v in addenda.items() if g in groups},
+                                             {g: group_id(g) for g in groups})
+        addenda_report = verify_addenda_assets(stage, addenda_index, {g: group_id(g) for g in groups},
+                                               {d['id']: {**d, 'group': g} for g, values in groups.items() for d in values},
+                                               date)
         verify_annex_assets(stage, annex_index, {g: group_id(g) for g in groups},
                             {d['id']: {**d, 'group': g} for g, values in groups.items() for d in values})
         alias = {}
@@ -192,12 +223,17 @@ def build(source, repo, out, date=None, enforce_thresholds=True):
         for group, values in groups.items():
             # Manual keys are space-free folder names; official group names keep spaces.
             names = set(manual.get(group, [])) | set(manual.get(group.replace(' ', ''), []))
+            for short in abbreviations.get(group, ()):
+                names.update((short, short.replace(' ', '')))
             for d in values:
                 title = d['t']
                 names.update((title, title.replace(' ', '')))
                 match = re.match(r'^(.*?)(에 관한|의) (특별법|법률|특례법|기본법|보호법)$', title)
                 if match:
                     names.add(match[1].replace(' ', '') + '법')
+                    # 통용 약칭은 '등'도 뺀다: 특정범죄 가중처벌 등에 관한 법률 → 특정범죄가중처벌법.
+                    if match[1].endswith(' 등'):
+                        names.add(match[1][:-2].replace(' ', '') + '법')
             for name in sorted(names):
                 alias.setdefault(name, group)
         routes = {f.stem.replace('route_map_', ''): f.read_text(encoding='utf-8')
@@ -210,7 +246,7 @@ def build(source, repo, out, date=None, enforce_thresholds=True):
                 routes[name] = (repo / 'packs' / file).read_text(encoding='utf-8')
         warnings = [{'id': e['id'], 'title': e['title'], 'mst': e['mst'], 'warnings': e['warnings']}
                     for e in manifest['documents'] if e['status'] == 'SUCCESS' and e.get('warnings')]
-        meta = {**stats, 'annex': annex_index, 'warnings': warnings, 'groups': light, 'alias': alias, 'routes': routes,
+        meta = {**stats, 'annex': annex_index, 'addenda': addenda_index, 'warnings': warnings, 'groups': light, 'alias': alias, 'routes': routes,
                 'precedents': [p.read_text(encoding='utf-8') for p in sorted(
                     (repo / 'auto/precedents').glob('*.md')) if p.name != 'INDEX.md'],
                 # Compact form {group: [[no, title], ...]}: the group name is not repeated per article.
@@ -227,7 +263,7 @@ def build(source, repo, out, date=None, enforce_thresholds=True):
             shutil.rmtree(out)
         shutil.move(str(stage), out)
     annex_report['skipped_documents'] = annex_skips
-    return {**stats, 'annex': annex_report, 'required_articles': checks, 'future_documents': 0, 'empty_documents': 0,
+    return {**stats, 'annex': annex_report, 'addenda': {**addenda_report, 'skipped_documents': addenda_skips}, 'required_articles': checks, 'future_documents': 0, 'empty_documents': 0,
             'shards': 0, 'group_files': len(sizes), 'max_group_bytes': max(sizes),
             'meta_bytes': len(meta_raw), 'warning_documents': len(warnings),
             'excluded_documents': len(failure_report(manifest['documents'])),
@@ -240,9 +276,11 @@ def main():
     ap.add_argument('--repo', type=Path, default=Path('.'))
     ap.add_argument('--out', type=Path, default=Path('mcp/assets'))
     ap.add_argument('--report', type=Path, default=Path('official-assets-report.json'))
+    ap.add_argument('--date', help='YYYYMMDD validation date; pass the collection date when building a '
+                    'Release collected on an earlier day (date-dependent warnings must match the RAW receipt)')
     args = ap.parse_args()
     try:
-        result = build(args.source, args.repo, args.out)
+        result = build(args.source, args.repo, args.out, args.date)
         # Run the deploy-time verifier now so a Release that deploy would reject is never published.
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from verify_mcp_assets_official import verify
