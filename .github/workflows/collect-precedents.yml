@@ -1,6 +1,11 @@
 name: Collect precedent, NTS interpretation and tax-tribunal summaries (law.go.kr DRF)
 on:
   workflow_dispatch:
+    inputs:
+      reconcile_only:
+        description: Full catalog comparison only; no detail collection or Release publication
+        type: boolean
+        default: false
   schedule:
     # 매일 22:40 KST (13:40 UTC). GitHub 예약은 3~6시간씩 늦게 시작하므로(10/27~11/3 실측 22:25~01:31 UTC 시작)
     # 당겨 둔다: 6.5시간 늦어도 05:10 KST 시작, 5시간 예산이면 10:10 KST 전 종료 → 비공개 D1(10:07 KST+지연) 전.
@@ -16,6 +21,8 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    env:
+      RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
     permissions:
       contents: write
       id-token: write
@@ -83,11 +90,16 @@ jobs:
         id: collect
         timeout-minutes: 320
         env:
+          WEEKLY_RECONCILE: ${{ github.event_name == 'schedule' }}
           LAW_OC: ${{ secrets.LAW_OC }}
           FULLTEXT_READY: ${{ steps.ft_recover.outcome }}
           # Only this step goes through the exit node; empty means direct.
           HTTPS_PROXY: ${{ steps.egress.outputs.https-proxy }}
-        run: python scripts/collect_precedents.py --out auto/precedent-collection --scope all --seconds 18000 --committee --fulltext
+        run: |
+          flags=()
+          if [ "$RECONCILE_ONLY" = "true" ]; then flags+=(--reconcile-only); fi
+          if [ "$WEEKLY_RECONCILE" = "true" ]; then flags+=(--weekly-reconcile); fi
+          python scripts/collect_precedents.py --out auto/precedent-collection --scope all --seconds 18000 --committee --fulltext "${flags[@]}"
       - name: Credential scan before caching or uploading anything
         id: scan_raw
         if: always()
@@ -102,7 +114,7 @@ jobs:
           key: precedent-summary-v2-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Which finished catalogs could be published early (no network, no copy)
         id: finished
-        if: steps.collect.outcome == 'success' && steps.collect.outputs.complete != 'true'
+        if: steps.collect.outcome == 'success' && steps.collect.outputs.complete != 'true' && steps.collect.outputs.outcome != 'RECONCILED' && steps.collect.outputs.reconcile_mode != 'true'
         run: python -I scripts/collect_precedents.py --out auto/precedent-collection --finished-targets
       - name: Decide what to publish and whether it is already published
         id: tag

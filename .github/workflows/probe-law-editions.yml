@@ -1,0 +1,34 @@
+name: Compare traffic-energy tax law editions (manual, at most 10 calls)
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: law-go-kr-drf
+  cancel-in-progress: false
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Choose law.go.kr egress and check it answers (fails fast when blocked)
+        id: egress
+        uses: ./.github/actions/law-egress
+        with:
+          client-id: ${{ secrets.TS_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          exit-node: ${{ secrets.TS_EXIT_NODE }}
+      - name: Compare edition article counts; no RAW or Release publication
+        env:
+          LAW_OC: ${{ secrets.LAW_OC }}
+          HTTPS_PROXY: ${{ steps.egress.outputs.https-proxy }}
+        run: python -I scripts/probe_law_editions.py

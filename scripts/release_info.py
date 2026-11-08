@@ -37,6 +37,11 @@ def build(release_dir, manifest_path, kind):
         'commit': os.environ.get('GITHUB_SHA', ''),
         'run_id': os.environ.get('GITHUB_RUN_ID', ''),
         'files': files,
+        **({'completeness': manifest.get('completeness', 'incremental'),
+            'reconciliation': manifest.get('reconciliation'),
+            'changed': manifest.get('reconciliation', {}).get('changed', []),
+            'refresh_pending': sum('refresh_row' in d for d in manifest.get('documents', []))}
+           if kind == 'precedent-summary-raw' else {}),
     }
 
 
