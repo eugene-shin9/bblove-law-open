@@ -79,7 +79,9 @@ def reset_catalog(out, targets=TARGET_ORDER):
         pages = [p for p in m.get('pages', []) if active(p)]
         m['pages'] = [p for p in m.get('pages', []) if not active(p)]
         m['documents'] = [d for d in m.get('documents', []) if not active(d)]
-        catalogs[target]['increments'][-1] = {'next_page': 1, 'complete': False}
+        previous = catalogs[target]['increments'][-1]
+        catalogs[target]['increments'][-1] = {'next_page': 1, 'complete': False,
+            **{k: previous[k] for k in ('overlap_rule', 'overlap_limit', 'full_scan') if k in previous}}
         inc['new_documents'] -= len(removed)
         inc['per_target'][target] -= len(removed)
         m.pop('stop_reason', None)
@@ -101,7 +103,7 @@ def reset_catalog(out, targets=TARGET_ORDER):
     return target
 
 
-def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect_fn=collect, date=None, min_days=1, targets=None):
+def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect_fn=collect, date=None, min_days=1, targets=None, reconcile=False):
     out = Path(out)
     deadline = clock() + total_seconds
     stop = lambda: 'TIME_BUDGET' if clock() >= deadline else None  # noqa: E731
@@ -115,7 +117,7 @@ def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect
         if attempt.exists():
             attempt.unlink()  # only this invocation's failures count
         collect_fn(client_factory(remaining), out, date, scope, stop=stop,
-                   **({'incremental': True, 'min_days': min_days} if collect_fn is collect else {}),
+                   **({'incremental': True, 'min_days': min_days, 'reconcile': reconcile} if collect_fn is collect else {}),
                    **({'targets': targets} if targets is not None else {}))
         if attempt.exists():
             reason = json.loads(attempt.read_text(encoding='utf-8')).get('reason')
@@ -124,6 +126,10 @@ def run(out, scope, total_seconds, client_factory, clock=time.monotonic, collect
                 print(f'CATALOG_RESET {reason} ({resets}/{MAX_RESETS})')
                 continue
             return 'FAILED'
+        if reconcile:
+            m = json.loads((out / 'manifest.json').read_text())
+            if m.get('incremental', {}).get('reconciled'):
+                return 'RECONCILED'
         state = outcome(out)
         if state != 'PAUSED':
             return state
@@ -216,6 +222,9 @@ def summary(out):
             **({'partial_targets': m['partial_targets']} if m.get('partial_targets') else {}),
             'catalogs': {t: {k: c.get(k) for k in ('total', 'complete')} for t, c in m.get('catalogs', {}).items()},
             **({'incremental': m['incremental']} if m.get('incremental') else {}),
+            'completeness': m.get('completeness', 'incremental'),
+            'reconciliation': m.get('reconciliation'),
+            'refresh_pending': sum('refresh_row' in d for d in m['documents']),
             'counts': counts, 'failure_reasons': failures, 'transient_failures': transient_failures(m)}
 
 
@@ -273,7 +282,9 @@ def should_publish(manifest):
     inc = manifest.get('incremental')
     migrated = (manifest.get('summary_empty_migrated', 0) > 0
                 and manifest.get('summary_empty_completed_date') == manifest.get('date'))
-    return not inc or (inc.get('complete', False) and inc.get('recovery', {}).get('complete', True) and (inc['new_documents'] > 0 or migrated or inc.get('recovery', {}).get('successes', 0) > 0))
+    refreshed = any(x.get('date') == manifest.get('date') for x in manifest.get('reconciliation', {}).get('changed', []))
+    reconciled = manifest.get('reconciliation', {}).get('date') == manifest.get('date')
+    return not inc or (inc.get('complete', False) and inc.get('recovery', {}).get('complete', True) and (inc['new_documents'] > 0 or refreshed or reconciled or migrated or inc.get('recovery', {}).get('successes', 0) > 0))
 
 
 def run_committee(summary_state, out, deadline, factory, clock=time.monotonic, min_days=1):
@@ -317,6 +328,8 @@ def run_fulltext(state, args, deadline, factory, clock=time.monotonic):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--out', type=Path, default=Path('auto/precedent-collection'))
+    ap.add_argument('--reconcile-only', action='store_true', help='full catalog listing only; details queued for the next run')
+    ap.add_argument('--weekly-reconcile', action='store_true', help='full listing when the previous reconciliation is at least seven days old')
     ap.add_argument('--committee', action='store_true')
     ap.add_argument('--committee-out', type=Path, default=Path('auto/committee-collection'))
     ap.add_argument('--fulltext', action='store_true')
@@ -371,9 +384,27 @@ def main():
     seconds = args.seconds
     extra = min(args.seconds, 15600) if args.fulltext else min(args.seconds, 16200) if args.committee else args.seconds
     deadline = started + extra
+    reconcile = args.reconcile_only
+    if args.weekly_reconcile and (args.out / 'manifest.json').exists():
+        from datetime import datetime
+        m = json.loads((args.out / 'manifest.json').read_text())
+        previous = m.get('reconciliation', {}).get('date')
+        due = bool(previous) and (datetime.strptime(today(), '%Y%m%d') - datetime.strptime(previous, '%Y%m%d')).days >= 7
+        reconcile = reconcile or (due and outcome(args.out) in ('COMPLETE', 'PASS_DONE'))
+        reconcile = reconcile or (m.get('incremental', {}).get('full_scan', False) and not m['incremental'].get('reconciled'))
+    if os.environ.get('GITHUB_OUTPUT'):
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+            fh.write(f'reconcile_mode={str(reconcile).lower()}\n')
     state = run(args.out, args.scope, seconds,
-                lambda remaining: Client(credential, seconds=remaining, interval=args.interval), min_days=args.min_days)
+                lambda remaining: Client(credential, seconds=remaining, interval=max(1.0, args.interval)), min_days=args.min_days, reconcile=reconcile)
     write_outputs(state)
+    if reconcile:
+        report = summary(args.out)
+        if os.environ.get('GITHUB_STEP_SUMMARY'):
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as fh:
+                fh.write('\n### Catalog reconciliation\n```json\n' + json.dumps(report.get('reconciliation'), ensure_ascii=False) + '\n```\n')
+        print(json.dumps({'outcome': state, **report}, ensure_ascii=False))
+        return 1 if state == 'FAILED' else 0
     if args.committee:
         run_committee(state, args.committee_out, deadline,
                       lambda remaining: Client(credential, seconds=remaining, interval=max(1.0, args.interval)),

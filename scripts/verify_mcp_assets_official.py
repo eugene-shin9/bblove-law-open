@@ -53,6 +53,11 @@ def verify(assets, date=None, enforce_thresholds=True):
             annex_laws[d['id']] = {**d, 'group': group}
             if d['id'] in ids or not d['a'] or d['st'] != '시행':
                 raise ValueError('DUPLICATE_EMPTY_OR_NONCURRENT_DOCUMENT')
+            # A body-only law is exactly one article '본문' with no title; no other document uses that number.
+            body = len(d['a']) == 1 and d['a'][0][0] == '본문'
+            if bool(d.get('body')) != body or (body and (d['a'][0][1] or not d['a'][0][2].strip())) or (
+                    not body and any(a[0] == '본문' for a in d['a'])):
+                raise ValueError('BODY_ONLY_DOCUMENT_INVALID')
             ids.add(d['id'])
             check_date(d['eff'].replace('-', ''), 'effective', date)
             check_date(d['pub'].replace('-', ''), 'published', date)

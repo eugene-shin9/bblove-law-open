@@ -53,7 +53,7 @@ ROW_KEYS = {'decc': ('decc',), 'prec': ('prec',), 'ntsCgmExpc': ('cgmExpc', 'exp
 ID_KEYS = {'decc': ('행정심판재결례일련번호', '행정심판례일련번호'), 'prec': ('판례일련번호', '판례정보일련번호'),
            'ntsCgmExpc': ('법령해석일련번호', '법령해석례일련번호', '일련번호'),
            'ttSpecialDecc': ('특별행정심판재결례일련번호',)}
-ERROR_CODES = frozenset(('CATALOG_ROOT_INVALID', 'CATALOG_COUNT_CHANGED', 'CATALOG_ROW_INVALID',
+ERROR_CODES = frozenset(('RECONCILE_REQUIRES_FINISHED_BASE', 'CATALOG_ROOT_INVALID', 'CATALOG_COUNT_CHANGED', 'CATALOG_ROW_INVALID',
     'CATALOG_DUPLICATE_ID', 'CATALOG_INCOMPLETE', 'ID_INVALID', 'DATE_FORMAT_INVALID',
     'TITLE_MISSING', 'CASE_OR_COURT_INVALID', 'INTERPRETATION_NUMBER_MISSING',
     'LIST_DETAIL_MISMATCH', 'SUMMARY_EMPTY', 'SUMMARY_OBJECT_MISSING', 'NONSCALAR_SUMMARY_FIELD',
@@ -430,16 +430,28 @@ def discard_unrecorded(out, manifest):
                 page.unlink()
             if page.stem.isdigit() and int(page.stem) >= state['next_page'] and not page.is_symlink():
                 page.unlink()
-    for entry in manifest.get('documents', []):
-        if 'sha256' not in entry:
-            file = out / 'summaries' / entry['target'] / f"{entry['id']}.json"
-            if file.is_file() and not file.is_symlink():
+    referenced = {e.get('path') for e in manifest.get('documents', [])}
+    identities = {(e.get('target'), e.get('id')) for e in manifest.get('documents', [])}
+    # Walk once, not once per ID (hundreds of thousands of files in production).
+    for target in TARGETS:
+        folder = out / 'summaries' / target
+        if folder.is_symlink():
+            raise ValueError('CACHE_PATH_INVALID')
+        for file in folder.glob('*.json') if folder.exists() else ():
+            match = re.fullmatch(r'([0-9]+)(?:-r[0-9a-f]{64})?\.json', file.name)
+            if (match and (target, match[1]) in identities and
+                    str(file.relative_to(out)) not in referenced and not file.is_symlink()):
                 file.unlink()
 
 
 def verify_cache(out, manifest):
     """Check the entire inventory before any network request or SQL build."""
     if manifest.get('schema') != SCHEMA:
+        raise ValueError('MANIFEST_SCHEMA_INVALID')
+    budget = manifest.get('refresh_budget')
+    if budget is not None and (not isinstance(budget, dict) or
+            not re.fullmatch(r'[0-9]{8}', str(budget.get('date', ''))) or
+            type(budget.get('attempts')) is not int or not 0 <= budget['attempts'] <= 500):
         raise ValueError('MANIFEST_SCHEMA_INVALID')
     declared = manifest.get('collection_targets', list(TARGETS))
     if not isinstance(declared, list) or not declared or len(set(declared)) != len(declared) or not set(declared) <= set(TARGETS):
@@ -457,7 +469,7 @@ def verify_cache(out, manifest):
         if 'sha256' not in item:
             continue
         path = item['path']
-        if not re.fullmatch(r'(?:pages/(?:prec|ntsCgmExpc|ttSpecialDecc|decc)/(?:inc-[1-9][0-9]*-)?[0-9]+|summaries/(?:prec|ntsCgmExpc|ttSpecialDecc|decc)/[0-9]+)\.json', path) or path in expected:
+        if not re.fullmatch(r'(?:pages/(?:prec|ntsCgmExpc|ttSpecialDecc|decc)/(?:inc-[1-9][0-9]*-)?[0-9]+|summaries/(?:prec|ntsCgmExpc|ttSpecialDecc|decc)/[0-9]+(?:-r[0-9a-f]{64})?)\.json', path) or path in expected:
             raise ValueError('CACHE_PATH_INVALID_OR_DUPLICATE')
         expected.add(path)
         file = out / path
@@ -475,7 +487,7 @@ def verify_cache(out, manifest):
               for p in (out / folder).rglob('*') if p.is_file()}
     if actual != expected:
         raise ValueError('CACHE_INVENTORY_MISMATCH')
-    listed_rows = {}
+    listed_rows, row_versions = {}, {}
     for target, state in manifest.get('catalogs', {}).items():
         rounds = [state] + state.get('increments', [])
         target_pages = [p for p in manifest.get('pages', []) if p['target'] == target]
@@ -488,6 +500,7 @@ def verify_cache(out, manifest):
             prior = set(listed_rows)
             round_seen = set()
             overlap = None
+            streak = 0
             for page in pages:
                 expected_path = (f"pages/{target}/inc-{number}-{page['page']}.json" if number
                                  else f"pages/{target}/{page['page']}.json")
@@ -502,15 +515,20 @@ def verify_cache(out, manifest):
                 round_seen |= keys
                 if len(round_seen) > snapshot['total'] or (len(round_seen) < snapshot['total'] and len(keys) != 100):
                     raise ValueError('CACHE_CATALOG_TOTAL_MISMATCH')
-                if number and keys <= prior and overlap is None:
-                    overlap = page['page']
+                if number:
+                    streak = streak + 1 if keys <= prior else 0
+                    if snapshot.get('overlap_rule') == 2:
+                        overlap = page['page'] - streak + 1 if streak else None
+                    elif keys <= prior and overlap is None:
+                        overlap = page['page']
                 for row in value['rows']:
                     key = (target, identifier(row, target))
+                    row_versions.setdefault(key, []).append(row)
                     listed_rows.setdefault(key, row)  # older document snapshots stay immutable
             if number and snapshot.get('overlap_page') != overlap:
                 raise ValueError('CACHE_CATALOG_TOTAL_MISMATCH')
             if snapshot['complete'] and not (len(round_seen) == snapshot['total'] or
-                    (number and overlap is not None and snapshot['next_page'] == overlap + 2)):
+                    (number and not snapshot.get('full_scan') and overlap is not None and snapshot['next_page'] == overlap + snapshot.get('overlap_limit', 2))):
                 raise ValueError('CACHE_CATALOG_TOTAL_MISMATCH')
     for e in manifest.get('documents', []):
         if (type(e.get('attempts', 0)) is not int or e.get('attempts', 0) < 0
@@ -518,7 +536,8 @@ def verify_cache(out, manifest):
             raise ValueError('MANIFEST_SCHEMA_INVALID')
         key = (e['target'], e['id'])
         if (key in seen or identifier(e['row'], e['target']) != e['id']
-                or listed_rows.get(key) != e['row']):
+                or e['row'] not in row_versions.get(key, [])
+                or ('refresh_row' in e and e['refresh_row'] not in row_versions.get(key, []))):
             raise ValueError('CACHE_ID_DUPLICATE_OR_MISMATCH')
         seen.add(key)
         if (e.get('kind') not in allowed_kinds(e['row'], e['target'])
@@ -526,7 +545,7 @@ def verify_cache(out, manifest):
                 or (e['kind'] == 'skipped' and 'sha256' in e)
                 or e['status'] not in ('PENDING', 'SUCCESS', 'FAILED', 'SKIPPED')):
             raise ValueError('CACHE_KIND_INVALID')
-        if 'sha256' in e and e['path'] != f"summaries/{e['target']}/{e['id']}.json":
+        if 'sha256' in e and e['path'] not in (f"summaries/{e['target']}/{e['id']}.json", f"summaries/{e['target']}/{e['id']}-r{e['sha256']}.json"):
             raise ValueError('CACHE_PATH_INVALID')
         if e['status'] == 'SUCCESS':
             validated(e['row'], strict_json((out / e['path']).read_bytes()), e['target'], e['kind'])
@@ -679,8 +698,73 @@ def recover_transient(client, out, manifest, date, check_budget, checkpoint, lim
     checkpoint(force=True)
 
 
+def finish_reconciliation(out, manifest, date, targets):
+    """Compare a completed full listing; preserve missing documents and queue changed metadata."""
+    inc = manifest['incremental']
+    report = {'date': date, 'catalogs': {}, 'changed': [], 'api_calls': inc.get('list_attempts', 0)}
+    for target in targets:
+        current = {}
+        pages = [p for p in manifest['pages'] if p['target'] == target and p.get('round') == inc['round']]
+        for p in pages:
+            for row in strict_json((out / p['path']).read_bytes())['rows']:
+                current[identifier(row, target)] = row
+        old = {e['id']: e for e in manifest['documents'] if e['target'] == target and e.get('round', 0) < inc['round']}
+        changed = sorted(sid for sid in current.keys() & old.keys() if current[sid] != old[sid]['row'])
+        for entry in old.values():
+            entry.pop('refresh_row', None)
+        for sid in changed:
+            old[sid]['refresh_row'] = current[sid]
+        report['catalogs'][target] = {'new_missing': len(current.keys() - old.keys()),
+            'disappeared': len(old.keys() - current.keys()), 'metadata_changed': len(changed),
+            'list_calls': len(pages)}
+    manifest['reconciliation'] = report
+    manifest['completeness'] = 'reconciled:' + date
+
+
+def refresh_changed(client, out, manifest, date, check_budget, checkpoint, limit):
+    """A durable daily cap; a failed replacement leaves the previous verified summary intact."""
+    ledger = manifest.setdefault('refresh_budget', {'date': date, 'attempts': 0})
+    if ledger['date'] != date:
+        ledger.update(date=date, attempts=0)
+    for entry in manifest['documents']:
+        if 'refresh_row' not in entry or entry.get('refresh_attempt_date') == date:
+            continue
+        if ledger['attempts'] >= limit:
+            break
+        check_budget()
+        ledger['attempts'] += 1
+        entry['refresh_attempt_date'] = date
+        checkpoint(force=True)  # Reserve before the request, including failed/interrupted requests.
+        candidate = dict(entry, row=entry['refresh_row'], kind=default_kind(entry['refresh_row'], entry['target']))
+        try:
+            if candidate['kind'] == 'skipped':
+                raise ValueError('REFRESH_SOURCE_UNSUPPORTED')
+            with tempfile.TemporaryDirectory() as stage:
+                raw = store_entry(client, Path(stage), candidate, date, check_budget)
+                validated(candidate['row'], strict_json(raw), candidate['target'], candidate['kind'])
+            old_hash = entry.get('sha256')
+            old_path = entry.get('path')
+            new_hash = digest(raw)
+            path = f"summaries/{entry['target']}/{entry['id']}-r{new_hash}.json"
+            put_bytes(out, path, raw)
+            entry.update(row=candidate['row'], kind=candidate['kind'], path=path, sha256=new_hash, status='SUCCESS')
+            for k in ('refresh_row', 'refresh_error', 'reason'):
+                entry.pop(k, None)
+            if new_hash != old_hash:
+                manifest.setdefault('reconciliation', {}).setdefault('changed', []).append(
+                    {'target': entry['target'], 'id': entry['id'], 'old_sha256': old_hash, 'sha256': new_hash, 'date': date})
+            checkpoint(force=True)
+            if old_path and old_path != path:
+                (out / old_path).unlink(missing_ok=True)
+        except CollectionPaused:
+            raise
+        except Exception:
+            entry['refresh_error'] = 'REFRESH_VALIDATION_OR_REQUEST_FAILED'
+            checkpoint(force=True)
+
+
 def collect(client, out, date, scope='all', stop=None, account=None, clock=time.monotonic,
-            retry_failed='transient', skipped_failures=None, incremental=False, min_days=1, transient_limit=TRANSIENT_RETRY_LIMIT, targets=None):
+            retry_failed='transient', skipped_failures=None, incremental=False, min_days=1, transient_limit=TRANSIENT_RETRY_LIMIT, targets=None, reconcile=False, overlap_limit=2, refresh_limit=500):
     """Resume one pass; report skipped permanent failures separately from the manifest.
 
     incremental opts the public producer into daily discovery; consumers keep it off.
@@ -691,6 +775,8 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
     callback or a completion result. 'all' refreshes failed details even if cached;
     'none' leaves every FAILED entry untouched. SUCCESS/SKIPPED always stay cached.
     """
+    if type(overlap_limit) is not int or overlap_limit < 1 or type(refresh_limit) is not int or not 0 <= refresh_limit <= 500:
+        raise ValueError("RECONCILE_ARGUMENT_INVALID")
     requested_retry = retry_failed
     if type(transient_limit) is not int or transient_limit < 0:
         raise ValueError('TRANSIENT_LIMIT_INVALID')
@@ -782,15 +868,17 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
         last_date = manifest.get('last_catalog_date', manifest['date'])
         if (incremental and ready and (not inc or inc.get('complete'))
                 and (not inc or inc.get('recovery', {}).get('complete', True))
-                and (datetime.strptime(date, '%Y%m%d') - datetime.strptime(last_date, '%Y%m%d')).days >= min_days):
+                and (reconcile or (datetime.strptime(date, '%Y%m%d') - datetime.strptime(last_date, '%Y%m%d')).days >= min_days)):
             number = (inc['round'] if inc else 0) + 1
-            inc = dict(round=number, new_documents=0, per_target={t: 0 for t in targets}, complete=False)
+            inc = dict(round=number, full_scan=reconcile, new_documents=0, per_target={t: 0 for t in targets}, complete=False)
             manifest['incremental'] = inc
             manifest['date'] = date
             for c in manifest['catalogs'].values():
-                c.setdefault('increments', []).append(dict(next_page=1, complete=False))
+                c.setdefault('increments', []).append(dict(next_page=1, complete=False, overlap_rule=2, overlap_limit=overlap_limit, full_scan=reconcile))
             checkpoint_now(force=True)
         active_inc = bool(inc and not inc.get('complete'))
+        if reconcile and (not active_inc or not inc.get('full_scan')):
+            raise ValueError('RECONCILE_REQUIRES_FINISHED_BASE')
         if incremental and (inc or ready) and requested_retry != 'all':
             retry_failed = 'none'
 
@@ -814,7 +902,12 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
             while not state['complete']:
                 check_budget()
                 page = state['next_page']
-                doc, _ = client.get('lawSearch.do', dict(target=target, display=100, page=page))
+                calls_before = client.calls
+                try:
+                    doc, _ = client.get('lawSearch.do', dict(target=target, display=100, page=page))
+                finally:
+                    if active_inc:
+                        inc['list_attempts'] = inc.get('list_attempts', 0) + client.calls - calls_before
                 roots = [v for v in doc.values() if isinstance(v, dict) and 'totalCnt' in v]
                 if len(roots) != 1:
                     raise ValueError('CATALOG_ROOT_INVALID')
@@ -863,13 +956,28 @@ def collect(client, out, date, scope='all', stop=None, account=None, clock=time.
                     manifest['documents'].append(entry)
                 known |= fresh
                 round_seen |= fresh
-                if active_inc and fresh <= prior:
-                    state.setdefault('overlap_page', page)
-                done = (len(round_seen) == total or page == state.get('overlap_page', -2) + 1) if active_inc else len(known) == total
+                if active_inc:
+                    # Upgrade resumed legacy rounds only after their existing pages have verified.
+                    if state.get('overlap_rule') != 2:
+                        state.update(overlap_rule=2, overlap_limit=overlap_limit)
+                    if fresh <= prior:
+                        state.setdefault('overlap_page', page)
+                    else:
+                        state.pop('overlap_page', None)
+                done = (len(round_seen) == total or (not state.get('full_scan') and 'overlap_page' in state
+                        and page - state['overlap_page'] + 1 >= state.get('overlap_limit', 2))) if active_inc else len(known) == total
                 state.update(total=total, next_page=page + 1, complete=done)
                 checkpoint_now(force=state['complete'])
         if active_inc or 'last_catalog_date' not in manifest:
             manifest['last_catalog_date'] = date
+        if active_inc and inc.get('full_scan') and not inc.get('reconciled'):
+            finish_reconciliation(out, manifest, date, targets)
+            inc['reconciled'] = True
+            checkpoint_now(force=True)
+        if reconcile:
+            return True  # Listing-only: PENDING/new and refresh queues are consumed next run.
+        if incremental:
+            refresh_changed(client, out, manifest, date, check_budget, checkpoint_now, refresh_limit)
         entries = [e for e in manifest['documents'] if e['target'] in targets]
         entries.sort(key=lambda e: e['target'] == 'decc')
         if scope == 'tax':
