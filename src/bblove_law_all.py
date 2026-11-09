@@ -107,8 +107,8 @@ class Client:
                     return
             time.sleep(delay)
 
-    def get(self, endpoint, params, *, original=False):
-        for attempt in range(4):
+    def get(self, endpoint, params, *, original=False, attempts=4):
+        for attempt in range(attempts):
             with self.slots:
                 self._admit()
                 with self.lock:
@@ -131,7 +131,7 @@ class Client:
                         with self.lock:
                             self.cooldown_until = max(self.cooldown_until, time.monotonic() + 2 ** attempt)
                             self.stats['global_backoffs'] += 1
-                    if attempt == 3:
+                    if attempt == attempts - 1:
                         raise PilotBlocked('REQUEST_FAILED_AFTER_RETRIES') from None
             delay = 2 ** attempt
             if time.monotonic() + delay + 32 >= self.deadline:
@@ -320,6 +320,36 @@ def failure_distribution(documents):
     return result
 
 
+def repeal_only(raw):
+    """Only a single non-article preamble containing the repeal declaration."""
+    law = strict_json(raw).get('법령', {})
+    section = law.get('조문', {}) if isinstance(law, dict) else {}
+    units = records(section.get('조문단위')) if isinstance(section, dict) else []
+    return (len(units) == 1 and text(units[0], '조문여부') in {'N', '전문'}
+            and '이를 폐지한다' in text(units[0], '조문내용'))
+
+
+def validate_fallback(raw, original, entry, date):
+    doc, count, warnings = validate_raw(raw, entry['row'], date, with_warnings=True)
+    law = doc['법령']
+    previous = strict_json(original)['법령']
+    # DRF normally omits MST: bind the same-MST request to the original edition
+    # via 법령키 (ID + promulgation date + number), never interpret it as MST.
+    mst = text(law, '법령일련번호') or text(law['기본정보'], '법령일련번호')
+    if mst and mst != entry['mst']:
+        raise ValueError('EFLAW_MST_MISMATCH')
+    if not mst:
+        key = text(law, '법령키')
+        if not key or key != text(previous, '법령키'):
+            raise ValueError('EFLAW_EDITION_MISMATCH')
+        for field in ('법령ID', '공포일자', '공포번호'):
+            if text(law['기본정보'], field) != text(previous['기본정보'], field):
+                raise ValueError('EFLAW_EDITION_MISMATCH')
+    if count < 1:
+        raise ValueError('EFLAW_ARTICLES_MISSING')
+    return count, warnings
+
+
 def collect_entry(client, out, entry, old, date):
     entry = dict(entry)
     phase = 'RAW_CACHE_READ_FAILED'
@@ -331,6 +361,8 @@ def collect_entry(client, out, entry, old, date):
                   or old.get('raw_status') in {'SUCCESS', 'DETAIL_VALIDATION_FAILED'}) and
                  old.get('sha256') == hashlib.sha256(raw).hexdigest())
         if not reuse:
+            entry.pop('detail_source', None)
+            entry.pop('fallback_reason', None)
             phase = 'DETAIL_FETCH_FAILED'
             _, raw = client.get('lawService.do', {'target': 'law', 'MST': entry['mst']}, original=True)
             # Persist safe RAW before semantic validation, including failing originals.
@@ -344,6 +376,20 @@ def collect_entry(client, out, entry, old, date):
         entry.update(sha256=hashlib.sha256(raw).hexdigest(),
                      collected_at=old.get('collected_at', stamp()) if reuse else stamp(), reused=reuse)
         phase = 'DETAIL_VALIDATION_FAILED'
+        if reuse:
+            entry.update({k: old[k] for k in ('detail_source', 'fallback_reason') if k in old})
+        if repeal_only(raw):
+            _, candidate = client.get('lawService.do',
+                {'target': 'eflaw', 'MST': entry['mst'], 'efYd': entry['effective']},
+                original=True, attempts=1)
+            validate_fallback(candidate, raw, entry, date)
+            tmp = file.with_suffix('.tmp')
+            tmp.write_bytes(candidate)
+            tmp.replace(file)
+            raw = candidate
+            entry.update(sha256=hashlib.sha256(raw).hexdigest(), collected_at=stamp(),
+                         reused=False, detail_source='eflaw-fallback',
+                         fallback_reason='LAW_TARGET_REPEAL_ONLY')
         _, count, warnings = validate_raw(raw, entry['row'], date, with_warnings=True)
         entry.update(status='SUCCESS', raw_status='SUCCESS', articles=count, warnings=warnings)
     except Exception as exc:
@@ -379,7 +425,7 @@ def collect(client, out, date, *, outcome=None):
             state = old.get('raw_status') or (old.get('reason') if old.get('status') == 'FAILED' else old.get('status'))
             if old.get('mst') == text(row, '법령일련번호') and state in {'SUCCESS', 'DETAIL_VALIDATION_FAILED'}:
                 # Preserve known RAW receipts even if this run stops before replaying this entry.
-                manifest['documents'][-1].update({k: old[k] for k in ('sha256', 'collected_at') if k in old})
+                manifest['documents'][-1].update({k: old[k] for k in ('sha256', 'collected_at', 'detail_source', 'fallback_reason') if k in old})
                 manifest['documents'][-1]['raw_status'] = state
     except Exception as exc:
         outcome['budget_only'] = isinstance(exc, PilotBlocked) and str(exc) == 'COLLECTION_BUDGET_EXHAUSTED'

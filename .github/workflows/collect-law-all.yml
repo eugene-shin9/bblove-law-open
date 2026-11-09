@@ -135,6 +135,9 @@ jobs:
           rs = collections.Counter(d.get('detail', d.get('reason')) for d in docs if d.get('status') == 'FAILED')
           print(f"## 수집 진행 ({m.get('date')}) status={m.get('status')} list={m.get('list_count')} api_calls={m.get('api_calls')} elapsed={m.get('elapsed_seconds')}s")
           print(f"- documents: {len(docs)} / SUCCESS {st.get('SUCCESS', 0)} / FAILED {st.get('FAILED', 0)} / PENDING {st.get('PENDING', 0)}")
+          fallbacks = [d for d in docs if d.get('detail_source') == 'eflaw-fallback']
+          print(f"- eflaw fallback: {len(fallbacks)}")
+          for d in fallbacks: print(f"- {d['title']} ({d['mst']}): {d['fallback_reason']}")
           for k, v in rs.most_common(10): print(f"- FAILED[{k}]: {v}")
           print(f"- reused: {m.get('reused_documents')} / fetched: {m.get('fetched_documents')}")
           r = pathlib.Path('official-assets-report.json')
