@@ -39,8 +39,16 @@ def public_names(names):
     """Ministry names only (Hangul, short) for progress reports; nothing else is echoed."""
     return sorted(n for n in set(names) if re.fullmatch(r'[가-힣]{2,20}', n))[:20]
 KINDS = {'훈령', '예규', '고시'}
-KEYWORDS = ('세', '조세', '국세', '조사', '징수', '체납', '부가', '소득', '법인', '상속', '증여')
+KEYWORDS = ('세', '조세', '국세', '조사', '징수', '체납', '부가', '소득', '법인', '상속', '증여',
+            # Tax rules of 재정경제부 whose titles carry none of the words above. Short
+            # words are avoided ('인지' would also match '확인지침').
+            '정보교환', '성실신고', '수입인지', '손금')
+# Every 훈령·예규·고시 of this ministry is tax administration; titles are not filtered.
+ALL_TITLES = '국세청'
 POLICY = 'tax-admrul-v1-no-customs'
+# Scope edition, added to manifest and index. POLICY is unchanged so caches and
+# readers keep working; verify accepts any value or none (older assets).
+SCOPE = 'nts-all+mofe-keywords-2'
 FILE_LIMIT = 8 * 1024 * 1024
 NOTICE = '법원·납세자를 직접 구속하지 않을 수 있음'
 NOT_YET_EFFECTIVE = 'NOT_YET_EFFECTIVE'
@@ -148,13 +156,18 @@ def catalog_row(row, date):
 
 
 def exclusion(row):
-    if current_org(row['소관부처명']) not in ORG:
+    """Scope from 소관부처명·종류·제목 only, so list rows, details, build and verify agree."""
+    org = current_org(row['소관부처명'])
+    if org not in ORG:
         return 'OUTSIDE_ORGANIZATIONS'
     if row['행정규칙종류'] not in KINDS:
         return 'OUTSIDE_KINDS'
+    if org == ALL_TITLES:
+        return None
     title = row['행정규칙명']
-    # Initial scope is domestic tax administration, not customs/trade remedies.
-    if '관세' in title:
+    # Domestic tax administration, not customs/trade remedies; a title naming
+    # 국세 as well (e.g. 국세 및 관세 해석 지침) stays in scope.
+    if '관세' in title and '국세' not in title:
         return 'CUSTOMS_EXCLUDED'
     if not any(k in title for k in KEYWORDS):
         return 'NO_TAX_KEYWORD'
@@ -400,7 +413,7 @@ def collect(client, out, date):
     old = {e['id']: e for e in previous.get('documents', [])}
     old_pending = {e['id']: e for e in previous.get('excluded', [])
                    if e.get('reason') == NOT_YET_EFFECTIVE and e.get('previous_edition_dropped')}
-    manifest = {'schema': 2, 'policy': POLICY, 'date': date, 'status': 'INCOMPLETE',
+    manifest = {'schema': 2, 'policy': POLICY, 'scope': SCOPE, 'date': date, 'status': 'INCOMPLETE',
                 'started_at': stamp(), 'documents': [], 'excluded': [], 'api_calls': 0}
     try:
         rows = catalog(client, out, date)
@@ -539,7 +552,7 @@ def build(source, dest):
             raise ValueError('ADMRUL_NO_SUCCESSFUL_DOCUMENTS')
         failures = [{k: e[k] for k in ('id', 'mst', 'title', 'reason') if k in e}
                     for e in manifest['documents'] if e['status'] == 'FAILED']
-        save(stage / 'admrul/index.json', {'schema': 1, 'policy': POLICY,
+        save(stage / 'admrul/index.json', {'schema': 1, 'policy': POLICY, 'scope': SCOPE,
             'date': iso(manifest['date']), 'documents': entries, 'failures': failures,
             'excluded': [{k: e[k] for k in ('id', 'title', 'reason')} for e in manifest['excluded']]})
         result = verify(stage)

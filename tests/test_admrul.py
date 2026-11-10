@@ -57,11 +57,15 @@ class Fake:
 
 
 def both_orgs(rows):
-    """Pad valid synthetic catalogs to ten with excluded personnel rules."""
+    """Pad valid synthetic catalogs to ten with excluded personnel rules.
+
+    국세청 rules are in scope whatever the title, so its padding is an out-of-scope kind.
+    """
     rows = list(rows)
     for i, org in enumerate(A.ORG):
         count = sum(A.current_org(r['소관부처명']) == org for r in rows)
-        rows += [row(900 + i * 10 + j, org, '인사관리규정')
+        kind = '지침' if org == A.ALL_TITLES else '훈령'
+        rows += [row(900 + i * 10 + j, org, '인사관리규정', kind)
                  for j in range(max(0, 10 - count))]
     return rows
 
@@ -130,7 +134,9 @@ class AdminRules(unittest.TestCase):
               row(3,'국세청','인사관리규정'),row(4,'기획재정부','관세 징수 규정'),
               row(5,'국세청','소득세 지침','지침'),row(6,'법무부','조세 조사 규정')]
         client,m=self.collected(Fake(rows))
-        self.assertEqual(len(m['documents']),2)
+        # 국세청 rules need no tax word in the title (인사관리규정 is collected).
+        self.assertEqual(len(m['documents']),3)
+        self.assertIn('인사관리규정',{e['title'] for e in m['documents']})
         # Former ministry name (기획재정부) is accepted as 재정경제부; others stay excluded.
         self.assertEqual({A.current_org(e['row']['소관부처명']) for e in m['documents']},set(A.ORG))
         self.assertEqual({e['reason'] for e in m['excluded']},{'NO_TAX_KEYWORD','CUSTOMS_EXCLUDED','OUTSIDE_KINDS'})
@@ -881,7 +887,7 @@ class PendingPair(unittest.TestCase):
         self.assertEqual(self.manifest()['catalog_failure'], 'ADMRUL_DUPLICATE_ID')
 
     def test_out_of_scope_in_force_row_gets_no_listed_mark(self):
-        current = row(1, title='인사관리규정')  # no tax keyword: excluded by scope
+        current = row(1, '재정경제부', '인사관리규정')  # 재정경제부 without a tax word: excluded by scope
         pending = self.pending(current, 행정규칙명='세무 인사관리규정')
         client = Fake([current, pending, row(2, title='국세 징수 사무처리규정'),
                        row(3, '재정경제부', '소득세 납세절차', '예규')])
@@ -1011,6 +1017,207 @@ class PendingPair(unittest.TestCase):
                       'same_serial:None/None/None', out)
         for leaked in (self.SECRET, 'http', '세무조사'):
             self.assertNotIn(leaked, out)
+
+
+
+def old_exclusion(row):
+    """Scope before 국세청 took every title (current Release assets were built with it)."""
+    org = A.current_org(row['소관부처명'])
+    if org not in A.ORG:
+        return 'OUTSIDE_ORGANIZATIONS'
+    if row['행정규칙종류'] not in A.KINDS:
+        return 'OUTSIDE_KINDS'
+    if '관세' in row['행정규칙명']:
+        return 'CUSTOMS_EXCLUDED'
+    words = ('세', '조세', '국세', '조사', '징수', '체납', '부가', '소득', '법인', '상속', '증여')
+    return None if any(k in row['행정규칙명'] for k in words) else 'NO_TAX_KEYWORD'
+
+
+class Scope(unittest.TestCase):
+    """국세청: every 훈령·예규·고시. 재정경제부: title words, '관세' out unless '국세' too."""
+    SECRET = 'fixture-credential-only'
+    NTS_NO_WORD = [('홈택스 이용에 관한 규정', '훈령'), ('간편장부 고시', '고시'),
+                   ('공동주택 기준시가', '고시'), ('소송사무처리규정', '훈령')]
+    MOFE_NEW = ['정보교환협정에 따른 금융정보자동교환 이행규정', '성실신고확인서',
+                '전자수입인지제도 운영에 관한 고시', '고유목적사업준비금 손금산입특례대상 문화예술단체']
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def rows(self):
+        rows = [row(i, '국세청', t, k) for i, (t, k) in enumerate(self.NTS_NO_WORD, 1)]
+        rows.append(row(5, '국세청', '관세 환급 사무 협조 규정', '훈령'))
+        rows += [row(10 + i, '재정경제부', t, '고시') for i, t in enumerate(self.MOFE_NEW)]
+        rows.append(row(20, '재정경제부', '국세 및 관세 관계법규 해석에 관한 업무처리지침'))
+        rows.append(row(21, '기획재정부', '성실신고확인서 작성 요령', '예규'))
+        rows += [row(30, '재정경제부', '회계처리지침'), row(31, '재정경제부', '관세 품목분류 고시', '고시'),
+                 row(32, '재정경제부', '보조금 확인지침'), row(33, '국세청', '세무 업무 지침', '지침')]
+        return rows
+
+    IN_SCOPE = {'101', '102', '103', '104', '105', '110', '111', '112', '113', '120', '121'}
+
+    def test_nts_titles_are_not_filtered_but_kinds_are(self):
+        for title in ('홈택스 이용에 관한 규정', '관세 환급 사무 협조 규정', '인사관리규정'):
+            for kind in sorted(A.KINDS):
+                self.assertIsNone(A.exclusion(row(1, '국세청', title, kind)), (title, kind))
+            self.assertEqual(A.exclusion(row(1, '국세청', title, '지침')), 'OUTSIDE_KINDS')
+            self.assertEqual(A.exclusion(row(1, '국세청', title, '공고')), 'OUTSIDE_KINDS')
+
+    def test_mofe_words_and_customs(self):
+        for org in ('재정경제부', '기획재정부'):
+            ex = lambda t, k='고시': A.exclusion(row(1, org, t, k))
+            self.assertEqual(ex('회계처리지침'), 'NO_TAX_KEYWORD')
+            # '인지' alone is not a word: it would match 확인지침.
+            self.assertEqual(ex('보조금 확인지침'), 'NO_TAX_KEYWORD')
+            for word in ('정보교환', '성실신고', '수입인지', '손금'):
+                self.assertIn(word, A.KEYWORDS)
+                self.assertIsNone(ex(f'{word} 처리 기준'), word)
+            self.assertEqual(ex('관세 품목분류 고시'), 'CUSTOMS_EXCLUDED')
+            self.assertEqual(ex('관세 징수 규정'), 'CUSTOMS_EXCLUDED')  # tax word does not lift customs
+            self.assertIsNone(ex('국세 및 관세 관계법규 해석에 관한 업무처리지침', '훈령'))
+            self.assertEqual(ex('성실신고확인서', '지침'), 'OUTSIDE_KINDS')
+
+    def test_sub_agency_and_other_ministries_stay_out(self):
+        for title in ('국세상담 운영 규정', '세무 상담 사무처리규정'):
+            self.assertEqual(A.exclusion(row(1, '국세상담센터', title)), 'OUTSIDE_ORGANIZATIONS')
+        self.assertEqual(A.exclusion(row(1, '관세청', '관세 조사 규정')), 'OUTSIDE_ORGANIZATIONS')
+
+    def test_four_paths_agree_end_to_end(self):
+        work = self.root / 'work'
+        raw = work / 'auto/admrul'
+        client = Fake(self.rows())
+        client.credential = self.SECRET
+        self.assertTrue(A.collect(client, raw, DATE))
+        m = json.loads((raw / 'manifest.json').read_text(encoding='utf-8'))
+        # 1. list rows (with 요청부처)
+        listed = {e['id'] for e in m['documents']}
+        self.assertTrue(self.IN_SCOPE <= listed)
+        self.assertFalse({'130', '131', '132', '133'} & listed)
+        self.assertEqual({e['id']: e['reason'] for e in m['excluded'] if e['id'] in {'130', '131', '132', '133'}},
+                         {'130': 'NO_TAX_KEYWORD', '131': 'CUSTOMS_EXCLUDED', '132': 'NO_TAX_KEYWORD',
+                          '133': 'OUTSIDE_KINDS'})
+        # 2. validate_raw on the detail during collect
+        self.assertTrue(all(e['status'] == 'SUCCESS' for e in m['documents']))
+        # validate_raw directly with a row that has no 요청부처 (the build/verify shape)
+        for e in m['documents']:
+            r = A.checked_row(e['row'], DATE)
+            self.assertNotIn('요청부처', r)
+            actual, _ = A.validate_raw((raw / e['path']).read_bytes(), r, DATE)
+            self.assertIsNone(A.exclusion(actual))
+        # 3. build and 4. verify
+        dest = work / 'admrul-assets'
+        stats = A.build(raw, dest)
+        self.assertEqual(stats['documents'], len(m['documents']))
+        meta(dest)
+        A.verify(dest, merge_meta=True)
+        index = json.loads((dest / 'admrul/index.json').read_text(encoding='utf-8'))
+        self.assertEqual({e['id'] for e in index['documents'].values()}, listed)
+        groups = json.loads((dest / 'meta.json').read_text(encoding='utf-8'))['groups']
+        self.assertIn('홈택스 이용에 관한 규정 (국세청 훈령 101)', groups)
+        self.assertIn('국세 및 관세 관계법규 해석에 관한 업무처리지침 (재정경제부 훈령 120)', groups)
+        env = {**os.environ, 'LAW_OC': self.SECRET}
+        for target in (raw, dest):
+            scan = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/secret_scan.py'), str(target)],
+                                  env=env, capture_output=True, text=True)
+            self.assertEqual(scan.returncode, 0, scan.stdout + scan.stderr)
+
+    def test_out_of_scope_rule_is_rejected_after_the_list(self):
+        raw = self.root / 'raw'
+        self.assertTrue(A.collect(Fake(self.rows()), raw, DATE))
+        m = json.loads((raw / 'manifest.json').read_text(encoding='utf-8'))
+        e = next(e for e in m['documents'] if e['id'] == '110')
+        out = A.checked_row(dict(e['row'], 행정규칙명='회계처리지침'), DATE)
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_METADATA_MISMATCH$'):
+            A.validate_raw(A.encode(detail(dict(e['row'], 행정규칙명='회계처리지침'))), out, DATE)
+        dest = self.root / 'assets'
+        A.build(raw, dest)
+        index = json.loads((dest / 'admrul/index.json').read_text(encoding='utf-8'))
+        group = next(g for g, v in index['documents'].items() if v['id'] == '110')
+        item = index['documents'].pop(group)
+        item['org'] = '국세상담센터'
+        index['documents'][f"{item['t']} (국세상담센터 {item['kc']} {item['id']})"] = item
+        (dest / 'admrul/index.json').write_bytes(A.encode(index))
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_ASSET_METADATA$'):
+            A.verify(dest)
+
+    def test_mofe_pair_in_scope(self):
+        current = row(1, '재정경제부', '정보교환협정에 따른 금융정보자동교환 이행규정', '고시')
+        pending = dict(current, 행정규칙일련번호='2100000000777', 시행일자='20270101')
+        raw = self.root / 'raw'
+        client = Fake([pending, current, row(2, title='국세 징수 사무처리규정')])
+        self.assertTrue(A.collect(client, raw, LATER))
+        m = json.loads((raw / 'manifest.json').read_text(encoding='utf-8'))
+        doc = next(e for e in m['documents'] if e['id'] == '101')
+        self.assertEqual((doc['mst'], doc['status']), ('2100000000001', 'SUCCESS'))
+        [p] = [e for e in m['excluded'] if e['reason'] == 'NOT_YET_EFFECTIVE']
+        self.assertEqual((p['id'], p['mst'], p['current_edition_listed'], p['current_edition_mst']),
+                         ('101', '2100000000777', True, '2100000000001'))
+        self.assertNotIn('2100000000777', [q['ID'] for ep, q, _ in client.requests if ep == 'lawService.do'])
+
+    def test_scope_field_in_manifest_and_index_and_optional_in_verify(self):
+        raw, dest = self.root / 'raw', self.root / 'assets'
+        self.assertTrue(A.collect(Fake(self.rows()), raw, DATE))
+        m = json.loads((raw / 'manifest.json').read_text(encoding='utf-8'))
+        self.assertEqual((m['policy'], m['scope']), ('tax-admrul-v1-no-customs', 'nts-all+mofe-keywords-2'))
+        A.build(raw, dest)
+        path = dest / 'admrul/index.json'
+        index = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual((index['policy'], index['scope']), (A.POLICY, A.SCOPE))
+        expected = A.verify(dest)
+        for value in ('missing', 'other-scope', None):
+            changed = dict(index)
+            if value == 'missing':
+                changed.pop('scope')
+            else:
+                changed['scope'] = value
+            path.write_bytes(A.encode(changed))
+            self.assertEqual(A.verify(dest), expected)
+        path.write_bytes(A.encode(dict(index, policy='other')))
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_INDEX_INVALID$'):
+            A.verify(dest)
+
+    def test_assets_built_with_the_old_scope_still_verify(self):
+        raw, dest = self.root / 'raw', self.root / 'assets'
+        rows = self.rows() + [row(40, '국세청', '세무조사 사무처리규정'), row(41, '재정경제부', '소득세 납세절차', '예규')]
+        with patch.object(A, 'exclusion', old_exclusion), patch.object(A, 'SCOPE', None):
+            self.assertTrue(A.collect(Fake(rows), raw, DATE))
+            A.build(raw, dest)
+        index = json.loads((dest / 'admrul/index.json').read_text(encoding='utf-8'))
+        index.pop('scope')  # current Release form: no scope field
+        (dest / 'admrul/index.json').write_bytes(A.encode(index))
+        self.assertEqual({e['id'] for e in index['documents'].values()}, {'140', '141'})
+        meta(dest)
+        self.assertEqual(A.verify(dest, merge_meta=True)['documents'], 2)
+
+    def test_workflow_reports_documents_by_ministry_and_exclusions_by_reason(self):
+        work = self.root / 'work'
+        raw = work / 'auto/admrul'
+        client = Fake(self.rows())
+        client.credential = self.SECRET
+        self.assertTrue(A.collect(client, raw, DATE))
+        helper = NotYetEffective()
+        out, summary = helper.run_script(helper.workflow_script('Progress'), work)
+        expected = ('scope=nts-all+mofe-keywords-2 docs_by_org={"국세청": 5, "기획재정부": 1, "재정경제부": 5} '
+                    'excluded_by_reason={"CUSTOMS_EXCLUDED": 1, "NO_TAX_KEYWORD": 3, "OUTSIDE_KINDS": 5}')
+        self.assertIn(f'::notice title=admrul 범위::{expected}', out)
+        self.assertIn(f'`{expected}`', summary)
+        for blob in (out, summary):
+            for leaked in (self.SECRET, 'http', 'OC=', '홈택스', '회계처리'):
+                self.assertNotIn(leaked, blob)
+        # Unexpected values are replaced, not echoed.
+        m = json.loads((raw / 'manifest.json').read_text(encoding='utf-8'))
+        m['scope'] = 'https://x.invalid/?OC=' + self.SECRET
+        m['documents'][0]['row']['소관부처명'] = 'OC=' + self.SECRET
+        m['excluded'][0]['reason'] = '홈택스 이용'
+        (raw / 'manifest.json').write_text(json.dumps(m, ensure_ascii=False), encoding='utf-8')
+        out, summary = helper.run_script(helper.workflow_script('Progress'), work)
+        self.assertIn('scope=None docs_by_org={"국세청": 4, "기타": 1,', out)
+        self.assertIn('"OTHER": 1', out)
+        for blob in (out, summary):
+            for leaked in (self.SECRET, 'http', 'OC=', '홈택스'):
+                self.assertNotIn(leaked, blob)
 
 
 if __name__=='__main__':unittest.main()
