@@ -156,13 +156,21 @@ jobs:
           hist = sorted({word(e.get('history_class'), 20) for e in pend})
           titles = [f"{word(e.get('title'), 120)} (시행 {word(e.get('effective'), 8)}{', 현행판 함께 수집' if e.get('current_edition_listed') is True else ''}{', 옛 판 빠짐' if e.get('previous_edition_dropped') is True else ''})" for e in pend[:30]]
           line = f"date={m.get('date')} status={m.get('status')} docs={len(docs)} counts={st} attempt={att.get('status')}/{att.get('reason')}{error} org_observed={json.dumps(m.get('org_observed'), ensure_ascii=False)} excluded={len(m.get('excluded', []))} not_yet_effective={len(pend)} current_edition_listed={paired} previous_edition_dropped={dropped} history_class={json.dumps(hist, ensure_ascii=False)}"
+          # 범위: 부처별 문서 수와 제외 사유별 건수(숫자·부처명·사유 코드만).
+          org = lambda v: v if isinstance(v, str) and re.fullmatch(r'[가-힣]{2,20}', v) else '기타'
+          code = lambda v: v if isinstance(v, str) and re.fullmatch(r'[A-Z_]{1,40}', v) else 'OTHER'
+          scope = m.get('scope') if isinstance(m.get('scope'), str) and re.fullmatch(r'[a-z0-9+-]{1,40}', m.get('scope')) else None
+          by_org = dict(sorted(collections.Counter(org(d['row'].get('소관부처명') if isinstance(d.get('row'), dict) else None) for d in docs if isinstance(d, dict)).items()))
+          by_reason = dict(sorted(collections.Counter(code(e.get('reason')) for e in m.get('excluded', []) if isinstance(e, dict)).items()))
+          scope_line = f"scope={scope} docs_by_org={json.dumps(by_org, ensure_ascii=False)} excluded_by_reason={json.dumps(by_reason)}"
           print(f"::notice title=admrul::{line}")
+          print(f"::notice title=admrul 범위::{scope_line}")
           if titles:
               print(f"::notice title=admrul 시행 전 제외::{'; '.join(titles)}")
           summary = os.environ.get('GITHUB_STEP_SUMMARY')
           if summary:
               with open(summary, 'a', encoding='utf-8') as f:
-                  f.write(f"### 행정규칙 수집\n\n`{line}`\n")
+                  f.write(f"### 행정규칙 수집\n\n`{line}`\n\n`{scope_line}`\n")
                   if titles:
                       f.write(f"\n시행 전이라 이번 게시에서 뺀 규칙 {len(pend)}건(현행판 함께 수집 {paired}건, 옛 판 빠짐 {dropped}건):\n\n")
                       f.write(''.join(f"- {t}\n" for t in titles))
