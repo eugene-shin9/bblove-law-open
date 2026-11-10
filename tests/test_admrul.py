@@ -640,8 +640,9 @@ class NotYetEffective(unittest.TestCase):
 
     def test_pending_rows_still_count_for_pages_totals_and_duplicates(self):
         rows = both_orgs(self.rows('20270101'))
-        with self.assertRaisesRegex(ValueError, '^ADMRUL_DUPLICATE_ID$'):
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_DUPLICATE_ID$') as caught:
             A.catalog(Fake(rows + [dict(rows[0])]), self.root / 'dup', LATER)
+        self.assertEqual(caught.exception.details['duplicate_kind'], ['same_serial'])
         class Short(Fake):
             def get(self, endpoint, params, original=False):
                 doc, raw = super().get(endpoint, params, original)
@@ -746,14 +747,270 @@ class NotYetEffective(unittest.TestCase):
         # Progress notice and Job Summary: counts, history values and titles only.
         out, summary = self.run_script(self.workflow_script('Progress'), work)
         for text in (out, summary):
-            self.assertIn('not_yet_effective=1 previous_edition_dropped=1 history_class=["현행"]', text)
+            self.assertIn('not_yet_effective=1 current_edition_listed=0 previous_edition_dropped=1 history_class=["현행"]', text)
             self.assertIn('세무조사 사무처리규정 (시행 20270101, 옛 판 빠짐)', text)
             for leaked in ('fixture-credential-only', 'http', 'OC=', '제1조'):
                 self.assertNotIn(leaked, text)
         # Release notes carry counts only, never titles.
         notes, _ = self.run_script(self.workflow_script('Publish', "pending=$(python3 -I - <<'PY'\n"), work)
-        self.assertEqual(notes.strip(), '시행 전 제외 1건(옛 판 빠짐 1건).')
+        self.assertEqual(notes.strip(), '시행 전 제외 1건(현행판 함께 수집 0건, 옛 판 빠짐 1건).')
         self.assertNotIn('세무조사', notes)
+
+
+
+class PendingPair(unittest.TestCase):
+    """In-force + not-yet-effective edition of one rule under one 행정규칙ID."""
+    SECRET = 'fixture-credential-only'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.raw = self.root / 'raw'
+
+    @staticmethod
+    def pending(base, mst='2100000000777', **changes):
+        r = dict(base, 행정규칙일련번호=mst, 시행일자='20270101', **changes)
+        return r
+
+    def rows(self, pending_first=False):
+        current = row(1, title='세무조사 사무처리규정')
+        pair = [self.pending(current), current]
+        if not pending_first:
+            pair.reverse()
+        return pair + [row(2, title='국세 징수 사무처리규정'), row(3, '재정경제부', '소득세 납세절차', '예규')]
+
+    def manifest(self):
+        return json.loads((self.raw / 'manifest.json').read_text(encoding='utf-8'))
+
+    def details_requested(self, client):
+        return [p['ID'] for e, p, _ in client.requests if e == 'lawService.do']
+
+    def assert_pair(self, client):
+        m = self.manifest()
+        self.assertEqual(m['status'], 'COMPLETE')
+        doc = next(e for e in m['documents'] if e['id'] == '101')
+        self.assertEqual((doc['mst'], doc['status']), ('2100000000001', 'SUCCESS'))
+        self.assertEqual(doc['row'], {**{k: v for k, v in row(1, title='세무조사 사무처리규정').items()
+                                         if k != '현행연혁구분'}, '요청부처': '국세청'})
+        [p] = [e for e in m['excluded'] if e['reason'] == 'NOT_YET_EFFECTIVE']
+        self.assertEqual((p['id'], p['mst'], p['current_edition_listed'], p['current_edition_mst']),
+                         ('101', '2100000000777', True, '2100000000001'))
+        self.assertNotIn('previous_edition_dropped', p)
+        self.assertNotIn('2100000000777', self.details_requested(client))
+        self.assertIn('2100000000001', self.details_requested(client))
+        return m
+
+    def test_pair_collects_in_force_edition_and_excludes_pending(self):
+        client = Fake(self.rows())
+        self.assertTrue(A.collect(client, self.raw, LATER))
+        self.assert_pair(client)
+
+    def test_pair_order_and_pages_do_not_matter(self):
+        client = Fake(self.rows(pending_first=True))
+        self.assertTrue(A.collect(client, self.raw, LATER))
+        self.assert_pair(client)
+        # The two editions on different pages (101 rows for 국세청).
+        filler = [row(10 + i, title=f'인사 규정 {i}') for i in range(99)]
+        current = row(1, title='세무조사 사무처리규정')
+        rows = [current] + filler + [row(2, title='국세 징수 사무처리규정'), self.pending(current)]
+        rows.append(row(3, '재정경제부', '소득세 납세절차', '예규'))
+        self.raw = self.root / 'paged'
+        client = Fake(rows)
+        self.assertTrue(A.collect(client, self.raw, LATER))
+        self.assertEqual(sum(e == 'lawSearch.do' and p['org'] == '1210000' for e, p, _ in client.requests), 2)
+        self.assert_pair(client)
+
+    def kinds(self, rows):
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_DUPLICATE_ID$') as caught:
+            A.check_duplicates(rows)
+        return caught.exception.details
+
+    def test_each_rejected_duplicate_kind(self):
+        current = dict(row(1, title='세무조사 사무처리규정'), 요청부처='국세청')
+        pend = dict(self.pending(current), **{A.NOT_YET_EFFECTIVE: True})
+        def other(r, **kw):
+            return dict(r, 행정규칙일련번호=kw.pop('mst', '2100000000999'), **kw)
+        cases = {
+            'more_than_two': [current, pend, other(pend)],
+            'same_serial': [current, dict(current)],
+            'cross_org': [current, other(pend, 요청부처='재정경제부')],
+            'pending_pending': [pend, other(pend)],
+            'effective_effective': [current, other(current)],
+            'pending_effective_mismatch': [current, other(pend, 소관부처명='국세상담센터')],
+        }
+        for kind, rows in cases.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(self.kinds([dict(r) for r in rows])['duplicate_kind'], [kind])
+        self.assertEqual(self.kinds([current, other(pend, 행정규칙종류='고시')])['duplicate_kind'],
+                         ['pending_effective_mismatch'])
+        # Priority when two kinds overlap.
+        overlaps = {
+            'more_than_two': [current, dict(current), other(current, 요청부처='재정경제부')],
+            'same_serial': [current, dict(pend, 행정규칙일련번호=current['행정규칙일련번호'], 요청부처='재정경제부')],
+            'cross_org': [pend, other(pend, 요청부처='재정경제부')],
+            'pending_pending': [pend, other(pend, 소관부처명='국세상담센터')],
+            'effective_effective': [current, other(current, 행정규칙종류='고시')],
+        }
+        for kind, rows in overlaps.items():
+            with self.subTest(overlap=kind):
+                self.assertEqual(self.kinds([dict(r) for r in rows])['duplicate_kind'], [kind])
+        # Several repeated IDs: sorted kinds, ID count and per-kind same_org/same_title counts.
+        second = dict(row(2, title='국세 징수 사무처리규정'), 요청부처='국세청')
+        third = dict(row(3, title='부가 규정'), 요청부처='국세청')
+        details = self.kinds([current, other(current), second, other(second, 행정규칙명='다른 제목'),
+                              third, dict(third), pend])
+        self.assertEqual(details, {'duplicate_kind': ['effective_effective', 'more_than_two', 'same_serial'],
+                                   'duplicate_ids': 3,
+                                   'duplicate_detail': {
+                                       'more_than_two': {'ids': 1, 'same_org': 1, 'same_title': 1},
+                                       'effective_effective': {'ids': 1, 'same_org': 1, 'same_title': 0},
+                                       'same_serial': {'ids': 1, 'same_org': 1, 'same_title': 1}}})
+        # An accepted pair next to a bad repeat does not hide the failure.
+        self.assertEqual(self.kinds([current, pend, second, other(second)])['duplicate_kind'],
+                         ['effective_effective'])
+
+    def test_both_in_force_editions_still_fail_after_effective_date(self):
+        # Fixed on purpose: no rule picks one of two in-force editions (needs a design decision).
+        rows = self.rows()
+        client = Fake(rows)
+        self.assertFalse(A.collect(client, self.raw, '20270101'))
+        att = json.loads((self.raw / 'attempt.json').read_text())
+        self.assertEqual((att['reason'], att['duplicate_kind'], att['duplicate_ids']),
+                         ('ADMRUL_DUPLICATE_ID', ['effective_effective'], 1))
+        self.assertEqual(self.manifest()['catalog_failure'], 'ADMRUL_DUPLICATE_ID')
+
+    def test_out_of_scope_in_force_row_gets_no_listed_mark(self):
+        current = row(1, title='인사관리규정')  # no tax keyword: excluded by scope
+        pending = self.pending(current, 행정규칙명='세무 인사관리규정')
+        client = Fake([current, pending, row(2, title='국세 징수 사무처리규정'),
+                       row(3, '재정경제부', '소득세 납세절차', '예규')])
+        self.assertTrue(A.collect(client, self.raw, LATER))
+        m = self.manifest()
+        [p] = [e for e in m['excluded'] if e['reason'] == 'NOT_YET_EFFECTIVE']
+        self.assertNotIn('current_edition_listed', p)
+        self.assertNotIn('previous_edition_dropped', p)
+        self.assertNotIn('101', {e['id'] for e in m['documents']})
+
+    def test_previous_dropped_mark_is_not_carried_into_a_pair(self):
+        current = row(1, title='세무조사 사무처리규정')
+        # Run 1: only the pending edition is listed after the old one was collected -> dropped mark.
+        self.assertTrue(A.collect(Fake([current] + self.rows()[2:]), self.raw, DATE))
+        self.assertTrue(A.collect(Fake([self.pending(current)] + self.rows()[2:]), self.raw, LATER))
+        self.assertTrue(next(e for e in self.manifest()['excluded']
+                             if e['reason'] == 'NOT_YET_EFFECTIVE')['previous_edition_dropped'])
+        # Run 2: both editions listed -> pair, no carried dropped mark.
+        client = Fake(self.rows())
+        self.assertTrue(A.collect(client, self.raw, '20261111'))
+        self.assert_pair(client)
+
+    def test_rerun_reuses_in_force_original(self):
+        self.assertTrue(A.collect(Fake(self.rows()), self.raw, LATER))
+        client = Fake(self.rows())
+        self.assertTrue(A.collect(client, self.raw, '20261111'))
+        self.assertEqual(self.details_requested(client), [])
+        self.assertTrue(all(e.get('reused') for e in self.manifest()['documents']))
+        same_day = Fake(self.rows(), stop_after=0)
+        self.assertTrue(A.collect(same_day, self.raw, '20261111'))
+        self.assertEqual(same_day.calls, 0)
+
+    def test_pair_keeps_page_and_total_checks(self):
+        rows = both_orgs(self.rows())
+        class Short(Fake):
+            def get(self, endpoint, params, original=False):
+                doc, raw = super().get(endpoint, params, original)
+                if endpoint == 'lawSearch.do':
+                    doc['AdmRulSearch']['totalCnt'] = str(int(doc['AdmRulSearch']['totalCnt']) + 1)
+                    raw = A.encode(doc)
+                return doc, raw
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_CATALOG_INCOMPLETE$'):
+            A.catalog(Short(rows), self.root / 'short', LATER)
+        class Moved(Fake):
+            def get(self, endpoint, params, original=False):
+                doc, raw = super().get(endpoint, params, original)
+                if endpoint == 'lawSearch.do':
+                    doc['AdmRulSearch']['page'] = '9'
+                    raw = A.encode(doc)
+                return doc, raw
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_CATALOG_COUNT_OR_PAGE$'):
+            A.catalog(Moved(rows), self.root / 'moved', LATER)
+        # The pair counts toward the ministry total and the ten-row minimum.
+        nts = [r for r in rows if A.current_org(r['소관부처명']) == '국세청']
+        self.assertEqual(len(A.catalog(Fake(rows), self.root / 'ok', LATER)), len(rows))
+        self.assertGreaterEqual(len(nts), 10)
+
+    def test_build_verify_package_and_reports_with_a_pair(self):
+        work = self.root / 'work'
+        self.raw = work / 'auto/admrul'
+        client = Fake(self.rows())
+        client.credential = self.SECRET
+        self.assertTrue(A.collect(client, self.raw, LATER))
+        m = self.manifest()
+        self.assertEqual(len({e['id'] for e in m['documents']}), len(m['documents']))
+        self.assertIn('101', {e['id'] for e in m['excluded']})
+        self.assertTrue(A.collection_complete(m['documents']))
+        dest = work / 'admrul-assets'
+        A.build(self.raw, dest)
+        meta(dest)
+        A.verify(dest, merge_meta=True)
+        index = json.loads((dest / 'admrul/index.json').read_text(encoding='utf-8'))
+        published = {e['mst'] for e in index['documents'].values()}
+        self.assertIn('2100000000001', published)
+        self.assertNotIn('2100000000777', published)
+        self.assertFalse((dest / 'admrul/docs/2100000000777.json').exists())
+        release = work / 'release'
+        release.mkdir()
+        (release / 'admrul-manifest.json').write_bytes((self.raw / 'manifest.json').read_bytes())
+        subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/release_info.py'), '--release', str(release),
+                        '--manifest', str(self.raw / 'manifest.json'), '--kind', 'admrul'],
+                       check=True, capture_output=True)
+        env = {**os.environ, 'LAW_OC': self.SECRET}
+        for target in (self.raw, dest, release):
+            scan = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/secret_scan.py'), str(target)],
+                                  env=env, capture_output=True, text=True)
+            self.assertEqual(scan.returncode, 0, scan.stdout + scan.stderr)
+        helper = NotYetEffective()
+        out, summary = helper.run_script(helper.workflow_script('Progress'), work)
+        for text in (out, summary):
+            self.assertIn('not_yet_effective=1 current_edition_listed=1 previous_edition_dropped=0', text)
+            self.assertIn('세무조사 사무처리규정 (시행 20270101, 현행판 함께 수집)', text)
+        notes, _ = helper.run_script(helper.workflow_script('Publish', "pending=$(python3 -I - <<'PY'\n"), work)
+        self.assertEqual(notes.strip(), '시행 전 제외 1건(현행판 함께 수집 1건, 옛 판 빠짐 0건).')
+
+    def test_duplicate_report_has_no_ids_titles_urls_or_secrets(self):
+        class Echo(Fake):
+            def get(self, endpoint, params, original=False):
+                doc, raw = super().get(endpoint, params, original)
+                if endpoint == 'lawSearch.do':
+                    doc['echo'] = 'https://test.invalid/?OC=' + self.credential
+                return doc, A.encode(doc)
+        work = self.root / 'work'
+        self.raw = work / 'auto/admrul'
+        rows = self.rows()
+        rows.append(dict(rows[-1], 행정규칙일련번호='2100000000555'))  # 재정경제부 effective_effective
+        self.assertFalse(A.collect(Echo(rows), self.raw, LATER))
+        text = (self.raw / 'attempt.json').read_text(encoding='utf-8')
+        att = json.loads(text)
+        self.assertEqual(set(att), {'status', 'reason', 'api_calls', 'duplicate_kind', 'duplicate_ids',
+                                    'duplicate_detail'})
+        helper = NotYetEffective()
+        out, summary = helper.run_script(helper.workflow_script('Progress'), work)
+        for blob in (text, out, summary):
+            for leaked in (self.SECRET, 'http', 'OC=', '103', '2100000000', '소득세', '세무조사'):
+                self.assertNotIn(leaked, blob)
+        for blob in (out, summary):
+            self.assertIn('attempt=FAILED/ADMRUL_DUPLICATE_ID duplicate_ids=1 '
+                          'duplicate_kind(ids/same_org/same_title)=effective_effective:1/1/1', blob)
+        # Unexpected shapes in attempt.json are filtered, not echoed.
+        (self.raw / 'attempt.json').write_text(json.dumps({
+            'status': 'FAILED', 'reason': 'ADMRUL_DUPLICATE_ID', 'duplicate_ids': 'https://x.invalid',
+            'duplicate_kind': ['세무조사 규정', 'same_serial'],
+            'duplicate_detail': {'same_serial': {'ids': 'x?OC=' + self.SECRET}}}))
+        out, _ = helper.run_script(helper.workflow_script('Progress'), work)
+        self.assertIn('duplicate_ids=None duplicate_kind(ids/same_org/same_title)=None:None/None/None,'
+                      'same_serial:None/None/None', out)
+        for leaked in (self.SECRET, 'http', '세무조사'):
+            self.assertNotIn(leaked, out)
 
 
 if __name__=='__main__':unittest.main()

@@ -109,7 +109,8 @@ jobs:
           import json
           m = json.load(open('auto/admrul/manifest.json', encoding='utf-8'))
           e = [x for x in m.get('excluded', []) if x.get('reason') == 'NOT_YET_EFFECTIVE']
-          print(f"시행 전 제외 {len(e)}건(옛 판 빠짐 {sum(x.get('previous_edition_dropped') is True for x in e)}건).")
+          paired = sum(x.get('current_edition_listed') is True for x in e)
+          print(f"시행 전 제외 {len(e)}건(현행판 함께 수집 {paired}건, 옛 판 빠짐 {sum(x.get('previous_edition_dropped') is True for x in e)}건).")
           PY
           )
           gh release create "$tag" --draft --target "$GITHUB_SHA" --latest=false \
@@ -140,13 +141,21 @@ jobs:
           # 예상 밖 오류는 예외 종류·발생 위치(파일:함수:줄)만 보인다. 메시지·응답 본문·URL은 기록되지 않는다.
           safe = lambda v: v if isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9_.:<>]{1,160}', v) else None
           error = f" exception={safe(att.get('exception'))} where={safe(att.get('where'))} admrul_where={safe(att.get('admrul_where'))}" if att.get('exception') else ''
+          # 중복 ID 실패: 종류·개수·같은 부처/제목 집계(숫자)만. ID·제목은 기록되지 않는다.
+          count = lambda v: v if type(v) is int and 0 <= v < 10**6 else None
+          kinds = att.get('duplicate_kind') if isinstance(att.get('duplicate_kind'), list) else []
+          detail = att.get('duplicate_detail') if isinstance(att.get('duplicate_detail'), dict) else {}
+          by_kind = ','.join(f"{safe(k)}:{count((detail.get(k) or {}).get('ids'))}/{count((detail.get(k) or {}).get('same_org'))}/{count((detail.get(k) or {}).get('same_title'))}" for k in kinds[:6] if isinstance(k, str))
+          if kinds or 'duplicate_ids' in att:
+              error += f" duplicate_ids={count(att.get('duplicate_ids'))} duplicate_kind(ids/same_org/same_title)={by_kind}"
           # 시행 전이라 뺀 규칙: 건수·옛 판 빠짐 건수·현행연혁구분 값·제목(공개 법령 정보)만. 본문·URL은 없다.
           pend = [e for e in m.get('excluded', []) if isinstance(e, dict) and e.get('reason') == 'NOT_YET_EFFECTIVE']
           dropped = sum(e.get('previous_edition_dropped') is True for e in pend)
+          paired = sum(e.get('current_edition_listed') is True for e in pend)
           word = lambda v, n: re.sub(r'[\x00-\x1f\x7f`|<>\[\]]', ' ', v)[:n].strip() if isinstance(v, str) else ''
           hist = sorted({word(e.get('history_class'), 20) for e in pend})
-          titles = [f"{word(e.get('title'), 120)} (시행 {word(e.get('effective'), 8)}{', 옛 판 빠짐' if e.get('previous_edition_dropped') is True else ''})" for e in pend[:30]]
-          line = f"date={m.get('date')} status={m.get('status')} docs={len(docs)} counts={st} attempt={att.get('status')}/{att.get('reason')}{error} org_observed={json.dumps(m.get('org_observed'), ensure_ascii=False)} excluded={len(m.get('excluded', []))} not_yet_effective={len(pend)} previous_edition_dropped={dropped} history_class={json.dumps(hist, ensure_ascii=False)}"
+          titles = [f"{word(e.get('title'), 120)} (시행 {word(e.get('effective'), 8)}{', 현행판 함께 수집' if e.get('current_edition_listed') is True else ''}{', 옛 판 빠짐' if e.get('previous_edition_dropped') is True else ''})" for e in pend[:30]]
+          line = f"date={m.get('date')} status={m.get('status')} docs={len(docs)} counts={st} attempt={att.get('status')}/{att.get('reason')}{error} org_observed={json.dumps(m.get('org_observed'), ensure_ascii=False)} excluded={len(m.get('excluded', []))} not_yet_effective={len(pend)} current_edition_listed={paired} previous_edition_dropped={dropped} history_class={json.dumps(hist, ensure_ascii=False)}"
           print(f"::notice title=admrul::{line}")
           if titles:
               print(f"::notice title=admrul 시행 전 제외::{'; '.join(titles)}")
@@ -155,7 +164,7 @@ jobs:
               with open(summary, 'a', encoding='utf-8') as f:
                   f.write(f"### 행정규칙 수집\n\n`{line}`\n")
                   if titles:
-                      f.write(f"\n시행 전이라 이번 게시에서 뺀 규칙 {len(pend)}건(옛 판 빠짐 {dropped}건):\n\n")
+                      f.write(f"\n시행 전이라 이번 게시에서 뺀 규칙 {len(pend)}건(현행판 함께 수집 {paired}건, 옛 판 빠짐 {dropped}건):\n\n")
                       f.write(''.join(f"- {t}\n" for t in titles))
                       if len(pend) > len(titles):
                           f.write(f"- 외 {len(pend) - len(titles)}건(manifest 참고)\n")
