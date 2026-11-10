@@ -458,4 +458,101 @@ class AdminRules(unittest.TestCase):
 
 
 
+
+def source_line(module, needle):
+    """Line number of the unique source line containing needle (keeps tests line-shift proof)."""
+    lines = Path(module.__file__).read_text(encoding='utf-8').splitlines()
+    found = [i for i, l in enumerate(lines, 1) if needle in l]
+    assert len(found) == 1, found
+    return found[0]
+
+
+class CatalogFailureDiagnostics(unittest.TestCase):
+    """Unexpected catalog errors record class and location only, never message/body/URL/OC."""
+    SECRET = 'fixture-credential-only'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.raw = Path(self.temp.name) / 'raw'
+
+    def attempt(self):
+        text = (self.raw / 'attempt.json').read_text(encoding='utf-8')
+        for leaked in (self.SECRET, 'http', 'OC=', 'future-effective', 'admrul effective', '조사'):
+            self.assertNotIn(leaked, text)
+        return json.loads(text)
+
+    def test_future_effective_row_on_first_page_matches_observed_failure(self):
+        # 2026-11-10 symptom: one 200 catalog response, then ADMRUL_CATALOG_FAILED with docs=0.
+        future = row(1, title='세무조사 사무처리규정')
+        future['시행일자'] = '20261101'  # after DATE: check_date rejects with a non-ADMRUL message
+        client = Fake([future, row(2, '재정경제부', '소득세 납세절차', '예규')])
+        self.assertFalse(A.collect(client, self.raw, DATE))
+        self.assertEqual(client.calls, 1)
+        att = self.attempt()
+        import bblove_v107_pilot as P
+        self.assertEqual(att['status'], 'FAILED')
+        self.assertEqual(att['reason'], 'ADMRUL_CATALOG_FAILED')
+        self.assertEqual(att['exception'], 'ValueError')
+        self.assertEqual(att['where'], 'bblove_v107_pilot.py:check_date:%d'
+                         % source_line(P, 'future-effective law excluded'))
+        self.assertEqual(att['admrul_where'], 'bblove_admrul.py:checked_row:%d'
+                         % source_line(A, "check_date(result['시행일자']"))
+        manifest = json.loads((self.raw / 'manifest.json').read_text())
+        self.assertEqual((manifest['status'], manifest['documents'], manifest['catalog_failure']),
+                         ('INCOMPLETE', [], 'ADMRUL_CATALOG_FAILED'))
+
+    def test_unexpected_error_message_with_url_and_credential_is_not_recorded(self):
+        class Broken(Fake):
+            def get(self, *args, **kwargs):
+                self.calls += 1
+                raise RuntimeError(f'https://test.invalid/DRF/lawSearch.do?OC={self.credential} body')
+        self.assertFalse(A.collect(Broken(), self.raw, DATE))
+        att = self.attempt()
+        self.assertEqual(set(att), {'status', 'reason', 'api_calls', 'exception', 'where', 'admrul_where'})
+        self.assertEqual(att['exception'], 'RuntimeError')
+        self.assertRegex(att['where'], r'^test_admrul\.py:get:\d+$')
+        self.assertRegex(att['admrul_where'], r'^bblove_admrul\.py:catalog:\d+$')
+
+    def test_coded_failure_adds_no_exception_fields(self):
+        self.assertFalse(A.collect(Fake(stop_after=0), self.raw, DATE))
+        self.assertEqual(self.attempt(), {'status': 'INCOMPLETE', 'reason': 'COLLECTION_BUDGET_EXHAUSTED',
+                                          'api_calls': 1})
+
+    def test_unusual_frame_names_are_dropped(self):
+        frame = A.traceback.FrameSummary('/x/evil name?OC=1.py', 3, 'f', lookup_line=False)
+        self.assertIsNone(A._site(frame))
+        frame = A.traceback.FrameSummary('/x/ok.py', 3, 'f(x)', lookup_line=False)
+        self.assertIsNone(A._site(frame))
+        self.assertEqual(A._site(A.traceback.FrameSummary('/x/ok.py', 3, '<genexpr>', lookup_line=False)), 'ok.py:<genexpr>:3')
+
+    def test_stale_attempt_from_restored_cache_is_cleared_on_success(self):
+        self.raw.mkdir()
+        (self.raw / 'attempt.json').write_text('{"status": "FAILED", "reason": "ADMRUL_CATALOG_FAILED"}')
+        self.assertTrue(A.collect(Fake(), self.raw, DATE))
+        self.assertFalse((self.raw / 'attempt.json').exists())
+
+    def test_workflow_progress_reports_only_filtered_class_and_location(self):
+        import yaml
+        flow = yaml.safe_load((ROOT / '.github/workflows/collect-admrul.yml').read_text(encoding='utf-8'))
+        step = next(s for s in flow['jobs']['collect']['steps'] if s.get('name', '').startswith('Progress'))
+        script = step['run'].split("<<'PY'\n", 1)[1].rsplit('PY', 1)[0]
+        work = Path(self.temp.name) / 'work'
+        (work / 'auto/admrul').mkdir(parents=True)
+        (work / 'auto/admrul/manifest.json').write_text('{"date": "20261110", "status": "INCOMPLETE", "documents": []}')
+        (work / 'auto/admrul/attempt.json').write_text(json.dumps({
+            'status': 'FAILED', 'reason': 'ADMRUL_CATALOG_FAILED', 'exception': 'ValueError',
+            'where': 'bblove_v107_pilot.py:check_date:57',
+            'admrul_where': f'https://x.invalid/?OC={self.SECRET}'}))
+        summary = work / 'summary.md'
+        env = {k: v for k, v in os.environ.items() if k != 'GITHUB_STEP_SUMMARY'}
+        env['GITHUB_STEP_SUMMARY'] = str(summary)
+        out = subprocess.run([sys.executable, '-I', '-c', script], cwd=work, env=env,
+                             capture_output=True, text=True, check=True).stdout
+        for text in (out, summary.read_text(encoding='utf-8')):
+            self.assertIn('exception=ValueError where=bblove_v107_pilot.py:check_date:57 admrul_where=None', text)
+            self.assertNotIn(self.SECRET, text)
+            self.assertNotIn('http', text)
+
+
 if __name__=='__main__':unittest.main()
