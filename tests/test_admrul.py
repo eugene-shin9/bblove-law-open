@@ -265,15 +265,17 @@ class AdminRules(unittest.TestCase):
 
     def test_catalog_unknown_envelope_bad_page_other_org_duplicate_and_date_fail(self):
         # 'org' no longer aborts: a sub-agency name under the requested code is excluded (see sub-agency test).
-        for damage in ('envelope','page','duplicate','date'):
+        for damage in ('envelope','page','duplicate','date','publication'):
             with self.subTest(damage=damage):
                 d={'AdmRulSearch':{'totalCnt':'1','page':'1','admrul':[row()]}}
                 if damage=='envelope':d={'unknown':d['AdmRulSearch']}
                 elif damage=='page':d['AdmRulSearch']['page']='2'
                 elif damage=='org':d['AdmRulSearch']['admrul'][0]['소관부처명']='법무부'
                 elif damage=='date':d['AdmRulSearch']['admrul'][0]['시행일자']='20250230'
+                elif damage=='publication':d['AdmRulSearch']['admrul'][0]['발령일자']='20261017'
                 else:d['AdmRulSearch']['admrul']='bad'
-                with self.assertRaises(ValueError):A.parse_page(d,'국세청',1,DATE)
+                code={'date':'^ADMRUL_DATE_INVALID$','publication':'^ADMRUL_PUBLICATION_FUTURE$'}.get(damage,'')
+                with self.assertRaisesRegex(ValueError,code):A.parse_page(d,'국세청',1,DATE)
         with self.assertRaisesRegex(ValueError,'DUPLICATE_ID'):
             A.catalog(Fake([row(),row()]),self.raw,DATE)
 
@@ -482,25 +484,20 @@ class CatalogFailureDiagnostics(unittest.TestCase):
             self.assertNotIn(leaked, text)
         return json.loads(text)
 
-    def test_future_effective_row_on_first_page_matches_observed_failure(self):
-        # 2026-11-10 symptom: one 200 catalog response, then ADMRUL_CATALOG_FAILED with docs=0.
-        future = row(1, title='세무조사 사무처리규정')
-        future['시행일자'] = '20261101'  # after DATE: check_date rejects with a non-ADMRUL message
-        client = Fake([future, row(2, '재정경제부', '소득세 납세절차', '예규')])
-        self.assertFalse(A.collect(client, self.raw, DATE))
-        self.assertEqual(client.calls, 1)
-        att = self.attempt()
-        import bblove_v107_pilot as P
-        self.assertEqual(att['status'], 'FAILED')
-        self.assertEqual(att['reason'], 'ADMRUL_CATALOG_FAILED')
-        self.assertEqual(att['exception'], 'ValueError')
-        self.assertEqual(att['where'], 'bblove_v107_pilot.py:check_date:%d'
-                         % source_line(P, 'future-effective law excluded'))
-        self.assertEqual(att['admrul_where'], 'bblove_admrul.py:checked_row:%d'
-                         % source_line(A, "check_date(result['시행일자']"))
-        manifest = json.loads((self.raw / 'manifest.json').read_text())
-        self.assertEqual((manifest['status'], manifest['documents'], manifest['catalog_failure']),
-                         ('INCOMPLETE', [], 'ADMRUL_CATALOG_FAILED'))
+    def test_bad_list_dates_are_coded_failures_without_exception_fields(self):
+        # Before: a not-yet-effective row failed the whole list as ADMRUL_CATALOG_FAILED (11/10).
+        for field, value, reason in (('시행일자', '20250230', 'ADMRUL_DATE_INVALID'),
+                                     ('시행일자', '2025.02.01', 'ADMRUL_DATE_INVALID'),
+                                     ('발령일자', '20261017', 'ADMRUL_PUBLICATION_FUTURE')):
+            with self.subTest(field=field, value=value):
+                bad = row(1, title='세무조사 사무처리규정')
+                bad[field] = value
+                client = Fake([bad, row(2, '재정경제부', '소득세 납세절차', '예규')])
+                self.assertFalse(A.collect(client, self.raw, DATE))
+                self.assertEqual(client.calls, 1)
+                self.assertEqual(self.attempt(), {'status': 'FAILED', 'reason': reason, 'api_calls': 1})
+                manifest = json.loads((self.raw / 'manifest.json').read_text())
+                self.assertEqual(manifest['catalog_failure'], reason)
 
     def test_unexpected_error_message_with_url_and_credential_is_not_recorded(self):
         class Broken(Fake):
@@ -553,6 +550,210 @@ class CatalogFailureDiagnostics(unittest.TestCase):
             self.assertIn('exception=ValueError where=bblove_v107_pilot.py:check_date:57 admrul_where=None', text)
             self.assertNotIn(self.SECRET, text)
             self.assertNotIn('http', text)
+
+
+
+LATER = '20261110'
+
+
+class NotYetEffective(unittest.TestCase):
+    """A list row whose 시행일자 is after the collection date is excluded, never published."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.raw = self.root / 'raw'
+
+    def rows(self, effective=None, history='현행', mst=None):
+        target = row(1, title='세무조사 사무처리규정')
+        if effective:
+            target['시행일자'] = effective
+            target['현행연혁구분'] = history
+        if mst:
+            target['행정규칙일련번호'] = mst
+        return [target, row(2, title='국세 징수 사무처리규정'),
+                row(3, '재정경제부', '소득세 납세절차', '예규')]
+
+    def manifest(self):
+        return json.loads((self.raw / 'manifest.json').read_text(encoding='utf-8'))
+
+    def pending(self, manifest):
+        return [e for e in manifest['excluded'] if e['reason'] == 'NOT_YET_EFFECTIVE']
+
+    def details_requested(self, client):
+        return [p['ID'] for e, p, _ in client.requests if e == 'lawService.do']
+
+    def test_pending_row_is_excluded_and_its_body_is_never_requested(self):
+        client = Fake(self.rows('20270101'))
+        self.assertTrue(A.collect(client, self.raw, LATER))
+        m = self.manifest()
+        self.assertEqual(m['status'], 'COMPLETE')
+        [p] = self.pending(m)
+        self.assertEqual((p['id'], p['mst'], p['title'], p['effective'], p['history_class']),
+                         ('101', '2100000000001', '세무조사 사무처리규정', '20270101', '현행'))
+        self.assertNotIn('previous_edition_dropped', p)  # no previous manifest: exclusion only
+        self.assertNotIn('2100000000001', self.details_requested(client))
+        self.assertFalse((self.raw / p['path']).exists())
+        self.assertEqual({e['id'] for e in m['documents']}, {'102', '103'})
+        self.assertTrue(all(e['status'] == 'SUCCESS' for e in m['documents']))
+
+    def test_previous_edition_is_marked_dropped_not_kept(self):
+        self.assertTrue(A.collect(Fake(self.rows()), self.raw, DATE))
+        old_mst = '2100000000001'
+        self.assertIn('101', {e['id'] for e in self.manifest()['documents']})
+        # New edition of the same rule (same 행정규칙ID), not yet in force.
+        client = Fake(self.rows('20270101', mst='2100000000777'))
+        self.assertTrue(A.collect(client, self.raw, LATER))
+        m = self.manifest()
+        [p] = self.pending(m)
+        self.assertEqual((p['previous_edition_dropped'], p['previous_mst'], p['mst']),
+                         (True, old_mst, '2100000000777'))
+        self.assertNotIn('101', {e['id'] for e in m['documents']})
+        dest = self.root / 'assets'
+        A.build(self.raw, dest)
+        index = json.loads((dest / 'admrul/index.json').read_text(encoding='utf-8'))
+        self.assertNotIn('101', {e['id'] for e in index['documents'].values()})
+        self.assertIn({'id': '101', 'title': '세무조사 사무처리규정', 'reason': 'NOT_YET_EFFECTIVE'},
+                      index['excluded'])
+        # The mark stays on later runs (and through a failed list) until the edition takes effect.
+        self.assertTrue(A.collect(Fake(client.rows), self.raw, '20261111'))
+        self.assertTrue(self.pending(self.manifest())[0]['previous_edition_dropped'])
+        broken = Fake(client.rows)
+        broken.rows = broken.rows[:1]
+        self.assertFalse(A.collect(broken, self.raw, '20261112'))
+        self.assertTrue(A.collect(Fake(client.rows), self.raw, '20261113'))
+        self.assertEqual(self.pending(self.manifest())[0]['previous_mst'], old_mst)
+
+    def test_rule_is_collected_once_effective(self):
+        rows = self.rows('20261111')
+        self.assertTrue(A.collect(Fake(rows), self.raw, LATER))
+        self.assertEqual(len(self.pending(self.manifest())), 1)
+        client = Fake(rows)
+        self.assertTrue(A.collect(client, self.raw, '20261111'))
+        m = self.manifest()
+        self.assertEqual(self.pending(m), [])
+        self.assertIn('2100000000001', self.details_requested(client))
+        entry = next(e for e in m['documents'] if e['id'] == '101')
+        self.assertEqual(entry['status'], 'SUCCESS')
+        self.assertNotIn(A.NOT_YET_EFFECTIVE, entry['row'])
+
+    def test_pending_rows_still_count_for_pages_totals_and_duplicates(self):
+        rows = both_orgs(self.rows('20270101'))
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_DUPLICATE_ID$'):
+            A.catalog(Fake(rows + [dict(rows[0])]), self.root / 'dup', LATER)
+        class Short(Fake):
+            def get(self, endpoint, params, original=False):
+                doc, raw = super().get(endpoint, params, original)
+                if endpoint == 'lawSearch.do':
+                    doc['AdmRulSearch']['totalCnt'] = str(int(doc['AdmRulSearch']['totalCnt']) + 1)
+                    raw = A.encode(doc)
+                return doc, raw
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_CATALOG_INCOMPLETE$'):
+            A.catalog(Short(rows), self.root / 'short', LATER)
+        page = {'AdmRulSearch': {'totalCnt': '1', 'page': '2', 'admrul': [rows[0]]}}
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_CATALOG_COUNT_OR_PAGE$'):
+            A.parse_page(page, '국세청', 1, LATER)
+        # A ministry below ten stays blocked even when one of its rows is pending.
+        small = [r for r in rows if A.current_org(r['소관부처명']) == '국세청'][:9]
+        small += [r for r in rows if A.current_org(r['소관부처명']) == '재정경제부']
+        client = Fake(small)
+        client.rows = small
+        self.assertFalse(A.collect(client, self.raw, LATER))
+        self.assertEqual(json.loads((self.raw / 'attempt.json').read_text())['reason'],
+                         'ADMRUL_ORG_CATALOG_TOO_SMALL')
+
+    def test_history_class_check_skipped_only_for_pending_rows(self):
+        page = lambda r: {'AdmRulSearch': {'totalCnt': '1', 'page': '1', 'admrul': [r]}}
+        pending = self.rows('20270101', history='연혁')[0]
+        [item], _ = A.parse_page(page(pending), '국세청', 1, LATER)
+        self.assertEqual((item[A.NOT_YET_EFFECTIVE], item['현행연혁구분']), (True, '연혁'))
+        self.assertTrue(A.collect(Fake(self.rows('20270101', history='연혁')), self.raw, LATER))
+        self.assertEqual(self.pending(self.manifest())[0]['history_class'], '연혁')
+        in_force = dict(self.rows()[0], 현행연혁구분='연혁')
+        with self.assertRaisesRegex(ValueError, '^ADMRUL_NOT_CURRENT$'):
+            A.parse_page(page(in_force), '국세청', 1, LATER)
+
+    def test_publication_gates_still_reject_future_effective_bodies(self):
+        r = row(1, title='세무조사 사무처리규정')
+        future = dict(r, 시행일자='20270101')
+        with self.assertRaisesRegex(ValueError, 'future-effective'):
+            A.validate_raw(A.encode(detail(future)), future, LATER)
+        with self.assertRaisesRegex(ValueError, 'future-effective'):
+            A.checked_row(future, LATER)
+        # A details response whose 시행일자 is future fails that document, never publishes it.
+        client = Fake(self.rows(), {r['행정규칙일련번호']: detail(future)})
+        self.assertTrue(A.collect(client, self.raw, LATER))
+        entry = next(e for e in self.manifest()['documents'] if e['id'] == '101')
+        self.assertEqual((entry['status'], entry['reason']), ('FAILED', 'ADMRUL_DETAIL_FAILED'))
+        # build: a manifest row that is not yet effective is refused.
+        self.raw2 = self.root / 'raw2'
+        self.assertTrue(A.collect(Fake(self.rows()), self.raw2, LATER))
+        m = json.loads((self.raw2 / 'manifest.json').read_text(encoding='utf-8'))
+        m['documents'][0]['row']['시행일자'] = '20270101'
+        (self.raw2 / 'manifest.json').write_bytes(A.encode(m))
+        with self.assertRaisesRegex(ValueError, 'future-effective'):
+            A.build(self.raw2, self.root / 'assets-x')
+        # verify: an index entry that is not yet effective is refused.
+        dest = self.root / 'assets'
+        self.assertTrue(A.collect(Fake(self.rows()), self.root / 'raw3', LATER))
+        A.build(self.root / 'raw3', dest)
+        index = json.loads((dest / 'admrul/index.json').read_text(encoding='utf-8'))
+        next(iter(index['documents'].values()))['eff'] = '2027-01-01'
+        (dest / 'admrul/index.json').write_bytes(A.encode(index))
+        with self.assertRaisesRegex(ValueError, 'future-effective'):
+            A.verify(dest)
+
+    def workflow_script(self, step_prefix, marker="<<'PY'\n"):
+        import yaml
+        flow = yaml.safe_load((ROOT / '.github/workflows/collect-admrul.yml').read_text(encoding='utf-8'))
+        step = next(s for s in flow['jobs']['collect']['steps'] if s.get('name', '').startswith(step_prefix))
+        return step['run'].split(marker, 1)[1].split('\nPY\n', 1)[0]
+
+    def run_script(self, script, cwd):
+        env = {k: v for k, v in os.environ.items() if k != 'GITHUB_STEP_SUMMARY'}
+        env['GITHUB_STEP_SUMMARY'] = str(cwd / 'summary.md')
+        out = subprocess.run([sys.executable, '-I', '-c', script], cwd=cwd, env=env,
+                             capture_output=True, text=True, check=True).stdout
+        summary = cwd / 'summary.md'
+        return out, summary.read_text(encoding='utf-8') if summary.exists() else ''
+
+    def test_build_verify_package_and_reports_with_pending_rows(self):
+        work = self.root / 'work'
+        self.raw = work / 'auto/admrul'
+        self.assertTrue(A.collect(Fake(self.rows()), self.raw, DATE))
+        client = Fake(self.rows('20270101', history='현행', mst='2100000000777'))
+        client.credential = 'fixture-credential-only'
+        self.assertTrue(A.collect(client, self.raw, LATER))
+        dest = work / 'admrul-assets'
+        A.build(self.raw, dest)
+        meta(dest)
+        A.verify(dest, merge_meta=True)
+        # Package as the workflow does and write release-info.
+        release = work / 'release'
+        release.mkdir()
+        (release / 'admrul-manifest.json').write_bytes((self.raw / 'manifest.json').read_bytes())
+        subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/release_info.py'), '--release', str(release),
+                        '--manifest', str(self.raw / 'manifest.json'), '--kind', 'admrul'],
+                       check=True, capture_output=True)
+        info = json.loads((release / 'release-info.json').read_text(encoding='utf-8'))
+        self.assertEqual((info['collection_status'], info['collected_date']), ('COMPLETE', LATER))
+        env = {**os.environ, 'LAW_OC': 'fixture-credential-only'}
+        for target in (self.raw, dest, release):
+            scan = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/secret_scan.py'), str(target)],
+                                  env=env, capture_output=True, text=True)
+            self.assertEqual(scan.returncode, 0, scan.stdout + scan.stderr)
+        # Progress notice and Job Summary: counts, history values and titles only.
+        out, summary = self.run_script(self.workflow_script('Progress'), work)
+        for text in (out, summary):
+            self.assertIn('not_yet_effective=1 previous_edition_dropped=1 history_class=["현행"]', text)
+            self.assertIn('세무조사 사무처리규정 (시행 20270101, 옛 판 빠짐)', text)
+            for leaked in ('fixture-credential-only', 'http', 'OC=', '제1조'):
+                self.assertNotIn(leaked, text)
+        # Release notes carry counts only, never titles.
+        notes, _ = self.run_script(self.workflow_script('Publish', "pending=$(python3 -I - <<'PY'\n"), work)
+        self.assertEqual(notes.strip(), '시행 전 제외 1건(옛 판 빠짐 1건).')
+        self.assertNotIn('세무조사', notes)
 
 
 if __name__=='__main__':unittest.main()

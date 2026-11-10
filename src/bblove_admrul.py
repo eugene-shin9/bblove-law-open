@@ -43,6 +43,7 @@ KEYWORDS = ('세', '조세', '국세', '조사', '징수', '체납', '부가', '
 POLICY = 'tax-admrul-v1-no-customs'
 FILE_LIMIT = 8 * 1024 * 1024
 NOTICE = '법원·납세자를 직접 구속하지 않을 수 있음'
+NOT_YET_EFFECTIVE = 'NOT_YET_EFFECTIVE'
 
 
 def safe_raw(raw, credential=''):
@@ -53,7 +54,7 @@ def safe_raw(raw, credential=''):
     return doc
 
 
-def checked_row(row, date):
+def metadata(row):
     names = ('행정규칙ID', '행정규칙일련번호', '행정규칙명', '행정규칙종류', '소관부처명', '발령일자', '시행일자')
     if not isinstance(row, dict) or any(not text(row, n) for n in names):
         raise ValueError('ADMRUL_METADATA_MISSING')
@@ -61,9 +62,33 @@ def checked_row(row, date):
     for n in names[:2]:
         if not re.fullmatch(r'[0-9]{1,20}', result[n]):
             raise ValueError('ADMRUL_ID_INVALID')
+    return result
+
+
+def checked_row(row, date):
+    """Publication gate (details, build, verify): a not-yet-effective rule always fails."""
+    result = metadata(row)
     check_date(result['발령일자'], 'admrul publication', date)
     check_date(result['시행일자'], 'admrul effective', date)
     return result
+
+
+def catalog_row(row, date):
+    """List-row check. Returns (row, not_yet_effective).
+
+    Only the list tolerates a future 시행일자: the row is reported and excluded,
+    its body is never requested, and checked_row still blocks it everywhere else.
+    """
+    result = metadata(row)
+    for n in ('발령일자', '시행일자'):
+        try:
+            check_date(result[n], 'admrul catalog')
+        except ValueError:
+            raise ValueError('ADMRUL_DATE_INVALID') from None
+    # Valid YYYYMMDD strings order like dates.
+    if result['발령일자'] > date:
+        raise ValueError('ADMRUL_PUBLICATION_FUTURE')
+    return result, result['시행일자'] > date
 
 
 def exclusion(row):
@@ -91,15 +116,20 @@ def parse_page(doc, org, page, date):
     rows = [value] if isinstance(value, dict) else value
     if not isinstance(rows, list) or len(rows) > 100 or (count and not rows):
         raise ValueError('ADMRUL_CATALOG_ROWS')
-    checked = [checked_row(r, date) for r in rows]
-    # The org-code filter also returns the ministry's sub-agencies (e.g. 국세상담센터 under 국세청).
-    # Those rows are kept for exclusion() to list transparently; the detail's 소관부처코드 is
-    # checked against the requested code in validate_raw, so a wrong code never publishes.
-    for item in checked:
-        item['요청부처'] = org
+    checked = []
     for r in rows:
-        if text(r, '현행연혁구분') not in {'현행', '1'}:
+        item, pending = catalog_row(r, date)
+        # The org-code filter also returns the ministry's sub-agencies (e.g. 국세상담센터 under 국세청).
+        # Those rows are kept for exclusion() to list transparently; the detail's 소관부처코드 is
+        # checked against the requested code in validate_raw, so a wrong code never publishes.
+        item['요청부처'] = org
+        if pending:
+            # Not yet effective: the 현행 check is not applied, the observed value is recorded.
+            item[NOT_YET_EFFECTIVE] = True
+            item['현행연혁구분'] = text(r, '현행연혁구분')
+        elif text(r, '현행연혁구분') not in {'현행', '1'}:
             raise ValueError('ADMRUL_NOT_CURRENT')
+        checked.append(item)
     return checked, count
 
 
@@ -313,6 +343,8 @@ def collect(client, out, date):
     (out / 'attempt.json').unlink(missing_ok=True)
     previous = strict_json(path.read_bytes()) if path.exists() else {}
     old = {e['id']: e for e in previous.get('documents', [])}
+    old_pending = {e['id']: e for e in previous.get('excluded', [])
+                   if e.get('reason') == NOT_YET_EFFECTIVE and e.get('previous_edition_dropped')}
     manifest = {'schema': 2, 'policy': POLICY, 'date': date, 'status': 'INCOMPLETE',
                 'started_at': stamp(), 'documents': [], 'excluded': [], 'api_calls': 0}
     try:
@@ -327,6 +359,8 @@ def collect(client, out, date):
         # Never let a previous complete checkpoint publish after a list failure.
         manifest['catalog_failure'] = reason
         manifest['documents'] = previous.get('documents', [])
+        # Carried like documents, so a not-yet-effective mark survives a failed run.
+        manifest['excluded'] = previous.get('excluded', [])
         save(path, manifest)
         return False
     manifest['org_observed'] = public_names(r['소관부처명'] for r in rows)
@@ -335,7 +369,18 @@ def collect(client, out, date):
                  'title': row['행정규칙명'], 'row': row, 'status': 'PENDING',
                  'images_removed': 0, 'scripts_removed': 0,
                  'path': f"raw/{row['행정규칙ID']}/{row['행정규칙일련번호']}.json"}
-        reason = exclusion(row)
+        # Scope exclusions first, so the not-yet-effective list holds only rules
+        # this collection would otherwise publish.
+        reason = exclusion(row) or (NOT_YET_EFFECTIVE if row.get(NOT_YET_EFFECTIVE) else None)
+        if reason == NOT_YET_EFFECTIVE:
+            entry.update(effective=row['시행일자'], history_class=row['현행연혁구분'])
+            # The edition in force is not kept: replaying an un-refetched old
+            # original as today's 현행 could publish a wrong edition. The mark stays
+            # on later runs until the new edition takes effect.
+            dropped = old.get(entry['id']) or old_pending.get(entry['id'])
+            if dropped:
+                entry.update(previous_edition_dropped=True,
+                             previous_mst=dropped.get('previous_mst', dropped.get('mst')))
         if reason:
             manifest['excluded'].append({**entry, 'reason': reason})
         else:
