@@ -122,12 +122,20 @@ jobs:
         if: always()
         run: |
           python3 - <<'PY'
-          import json, collections, pathlib
+          import json, collections, os, pathlib, re
           p = pathlib.Path('auto/admrul/manifest.json')
           m = json.loads(p.read_text()) if p.exists() else {}
           docs = m.get('documents', [])
           st = dict(collections.Counter(d.get('status') for d in docs))
           a = pathlib.Path('auto/admrul/attempt.json')
           att = json.loads(a.read_text()) if a.exists() else {}
-          print(f"::notice title=admrul::date={m.get('date')} status={m.get('status')} docs={len(docs)} counts={st} attempt={att.get('status')}/{att.get('reason')} org_observed={json.dumps(m.get('org_observed'), ensure_ascii=False)} excluded={len(m.get('excluded', []))}")
+          # 예상 밖 오류는 예외 종류·발생 위치(파일:함수:줄)만 보인다. 메시지·응답 본문·URL은 기록되지 않는다.
+          safe = lambda v: v if isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9_.:<>]{1,160}', v) else None
+          error = f" exception={safe(att.get('exception'))} where={safe(att.get('where'))} admrul_where={safe(att.get('admrul_where'))}" if att.get('exception') else ''
+          line = f"date={m.get('date')} status={m.get('status')} docs={len(docs)} counts={st} attempt={att.get('status')}/{att.get('reason')}{error} org_observed={json.dumps(m.get('org_observed'), ensure_ascii=False)} excluded={len(m.get('excluded', []))}"
+          print(f"::notice title=admrul::{line}")
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a', encoding='utf-8') as f:
+                  f.write(f"### 행정규칙 수집\n\n`{line}`\n")
           PY

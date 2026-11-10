@@ -14,6 +14,7 @@ import re
 import shutil
 import sys
 import tempfile
+import traceback
 
 from bblove_law_all import Client, save, today, stamp, write_step_output, collection_complete
 from bblove_quality import credential_markers
@@ -279,10 +280,37 @@ def code(exc, fallback):
     return value if re.fullmatch(r'(?:ADMRUL|CREDENTIAL|COLLECTION)_[A-Z_]+', value) else fallback
 
 
+def _site(frame):
+    """'file.py:function:line' from one traceback frame, or None if any part looks unusual."""
+    name, func = Path(frame.filename).name, frame.name
+    if (re.fullmatch(r'[A-Za-z0-9_]{1,64}\.py', name) and re.fullmatch(r'<?[A-Za-z_][A-Za-z0-9_]{0,63}>?', func)
+            and isinstance(frame.lineno, int)):
+        return f'{name}:{func}:{frame.lineno}'
+    return None
+
+
+def failure_site(exc):
+    """Exception class and raise location only, for unexpected errors.
+
+    Never the message, arguments, response body, URL or credential: a message may
+    echo request parameters. 'where' is the innermost frame; 'admrul_where' is the
+    deepest frame in this module (e.g. which checked_row field reached check_date).
+    """
+    cls = type(exc).__name__
+    frames = traceback.extract_tb(exc.__traceback__)
+    own = [f for f in frames if Path(f.filename).name == Path(__file__).name]
+    return {'exception': cls if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}', cls) else 'UNKNOWN',
+            'where': _site(frames[-1]) if frames else None,
+            'admrul_where': _site(own[-1]) if own else None}
+
+
 def collect(client, out, date):
     out = Path(out)
     check_date(date, 'collection date')
     path = out / 'manifest.json'
+    # A restored checkpoint may hold an earlier run's failure; it must not be
+    # reported (or released) as this run's outcome.
+    (out / 'attempt.json').unlink(missing_ok=True)
     previous = strict_json(path.read_bytes()) if path.exists() else {}
     old = {e['id']: e for e in previous.get('documents', [])}
     manifest = {'schema': 2, 'policy': POLICY, 'date': date, 'status': 'INCOMPLETE',
@@ -291,8 +319,11 @@ def collect(client, out, date):
         rows = catalog(client, out, date)
     except Exception as exc:
         reason = code(exc, 'ADMRUL_CATALOG_FAILED')
-        save(out / 'attempt.json', {'status': 'INCOMPLETE' if reason == 'COLLECTION_BUDGET_EXHAUSTED' else 'FAILED',
-             'reason': reason, 'api_calls': client.calls})
+        attempt = {'status': 'INCOMPLETE' if reason == 'COLLECTION_BUDGET_EXHAUSTED' else 'FAILED',
+                   'reason': reason, 'api_calls': client.calls}
+        if reason == 'ADMRUL_CATALOG_FAILED':
+            attempt.update(failure_site(exc))
+        save(out / 'attempt.json', attempt)
         # Never let a previous complete checkpoint publish after a list failure.
         manifest['catalog_failure'] = reason
         manifest['documents'] = previous.get('documents', [])
