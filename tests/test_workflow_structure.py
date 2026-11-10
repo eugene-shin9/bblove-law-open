@@ -13,6 +13,19 @@ class WorkflowStructureTests(unittest.TestCase):
     def test_empty_env_fixture_rejected(self):
         with self.assertRaises(AssertionError):
             assert_step_envs(load_workflow(ROOT / 'tests/fixtures/workflow_empty_env.yml'))
+    def test_drf_workflows_queue_instead_of_cancelling_pending_runs(self):
+        # One concurrency group serialises every law.go.kr caller. Without queue: max a newly queued run
+        # cancels the pending one (11/9: the weekly law collection was cancelled by a manual probe).
+        users = []
+        for path in sorted((ROOT / '.github/workflows').glob('*.y*ml')):
+            wf = load_workflow(path)
+            text = path.read_text(encoding='utf-8')
+            if 'law-go-kr-drf' in text or 'law-egress' in text:
+                users.append(path.name)
+                with self.subTest(path=path.name):
+                    self.assertEqual(wf.get('concurrency'), {'group': 'law-go-kr-drf', 'cancel-in-progress': False,
+                                                             'queue': 'max'})
+        self.assertGreaterEqual(len(users), 6)
     def test_scheduled_raw_input_fixture_rejected(self):
         wf = load_workflow(ROOT / 'tests/fixtures/workflow_schedule_inputs.yml')
         self.assertIn('schedule', wf['on'])
