@@ -44,6 +44,62 @@ POLICY = 'tax-admrul-v1-no-customs'
 FILE_LIMIT = 8 * 1024 * 1024
 NOTICE = '법원·납세자를 직접 구속하지 않을 수 있음'
 NOT_YET_EFFECTIVE = 'NOT_YET_EFFECTIVE'
+# Set only on the not-yet-effective row of an accepted pair; the in-force row is untouched
+# so its manifest row still equals the previous one and its original is reused.
+CURRENT_EDITION = 'current_edition_mst'
+DUPLICATE_KINDS = ('more_than_two', 'same_serial', 'cross_org', 'pending_pending',
+                   'effective_effective', 'pending_effective_mismatch')
+
+
+class CatalogDuplicate(ValueError):
+    """ADMRUL_DUPLICATE_ID with counts only (kinds, ID count, same_org/same_title per kind)."""
+
+    def __init__(self, details):
+        super().__init__('ADMRUL_DUPLICATE_ID')
+        self.details = details
+
+
+def duplicate_kind(group):
+    """None for the one accepted pair: in force + not yet effective edition of one rule."""
+    if len(group) > 2:
+        return 'more_than_two'
+    a, b = group
+    if a['행정규칙일련번호'] == b['행정규칙일련번호']:
+        return 'same_serial'
+    if a['요청부처'] != b['요청부처']:
+        return 'cross_org'
+    pending = bool(a.get(NOT_YET_EFFECTIVE)) + bool(b.get(NOT_YET_EFFECTIVE))
+    if pending == 2:
+        return 'pending_pending'
+    if pending == 0:
+        # No rule picks one of two in-force editions; that needs a design decision.
+        return 'effective_effective'
+    if any(a[n] != b[n] for n in ('소관부처명', '행정규칙종류')):
+        return 'pending_effective_mismatch'
+    return None
+
+
+def check_duplicates(rows):
+    """Judge repeated 행정규칙IDs after every page of both ministries was read."""
+    groups = {}
+    for row in rows:
+        groups.setdefault(row['행정규칙ID'], []).append(row)
+    repeated = {i: g for i, g in groups.items() if len(g) > 1}
+    kinds = {i: duplicate_kind(g) for i, g in repeated.items()}
+    bad = {i: k for i, k in kinds.items() if k}
+    if bad:
+        detail = {}
+        for i, kind in bad.items():
+            group = repeated[i]
+            item = detail.setdefault(kind, {'ids': 0, 'same_org': 0, 'same_title': 0})
+            item['ids'] += 1
+            item['same_org'] += len({r['소관부처명'] for r in group}) == 1
+            item['same_title'] += len({r['행정규칙명'] for r in group}) == 1
+        raise CatalogDuplicate({'duplicate_kind': sorted(detail), 'duplicate_ids': len(bad),
+                                'duplicate_detail': detail})
+    for group in repeated.values():
+        pending, current = sorted(group, key=lambda r: not r.get(NOT_YET_EFFECTIVE))
+        pending[CURRENT_EDITION] = current['행정규칙일련번호']
 
 
 def safe_raw(raw, credential=''):
@@ -138,7 +194,7 @@ def catalog(client, out, date):
     checkpoint = out / 'catalog.json'
     cached = strict_json(checkpoint.read_bytes()) if checkpoint.exists() else {}
     reuse = cached.get('date') == date and cached.get('policy') == POLICY
-    receipts, rows, seen = [], [], set()
+    receipts, rows = [], []
     for org, code in ORG.items():
         total, received = None, 0
         for page in range(1, 102):
@@ -166,11 +222,7 @@ def catalog(client, out, date):
                              'role': 'sanitized_selection_evidence'})
             # Persist complete pages immediately, including before budget exhaustion.
             save(checkpoint, {'date': date, 'policy': POLICY, 'pages': receipts})
-            for row in batch:
-                if row['행정규칙ID'] in seen:
-                    raise ValueError('ADMRUL_DUPLICATE_ID')
-                seen.add(row['행정규칙ID'])
-                rows.append(row)
+            rows.extend(batch)
             received += len(batch)
             if received == total:
                 break
@@ -178,6 +230,9 @@ def catalog(client, out, date):
                 raise ValueError('ADMRUL_CATALOG_INCOMPLETE')
         else:
             raise ValueError('ADMRUL_CATALOG_PAGE_LIMIT')
+    # Duplicates are judged once both ministries are fully read, so an accepted
+    # pair may sit on different pages; every other repeat still fails the list.
+    check_duplicates(rows)
     return rows
 
 
@@ -355,6 +410,8 @@ def collect(client, out, date):
                    'reason': reason, 'api_calls': client.calls}
         if reason == 'ADMRUL_CATALOG_FAILED':
             attempt.update(failure_site(exc))
+        if isinstance(exc, CatalogDuplicate):
+            attempt.update(exc.details)
         save(out / 'attempt.json', attempt)
         # Never let a previous complete checkpoint publish after a list failure.
         manifest['catalog_failure'] = reason
@@ -377,7 +434,8 @@ def collect(client, out, date):
             # The edition in force is not kept: replaying an un-refetched old
             # original as today's 현행 could publish a wrong edition. The mark stays
             # on later runs until the new edition takes effect.
-            dropped = old.get(entry['id']) or old_pending.get(entry['id'])
+            # A listed in-force edition is a pair, not a dropped edition.
+            dropped = None if row.get(CURRENT_EDITION) else old.get(entry['id']) or old_pending.get(entry['id'])
             if dropped:
                 entry.update(previous_edition_dropped=True,
                              previous_mst=dropped.get('previous_mst', dropped.get('mst')))
@@ -389,6 +447,13 @@ def collect(client, out, date):
                 # Preserve receipts for entries not reached before this run's budget.
                 entry.update({k:cached[k] for k in ('sha256','collected_at') if k in cached})
             manifest['documents'].append(entry)
+    # Pair info lives on the not-yet-effective entry only, and only when the
+    # in-force edition really went to documents (not excluded as out of scope).
+    listed = {(e['id'], e['mst']) for e in manifest['documents']}
+    for entry in manifest['excluded']:
+        current = entry['row'].get(CURRENT_EDITION)
+        if entry['reason'] == NOT_YET_EFFECTIVE and (entry['id'], current) in listed:
+            entry.update(current_edition_listed=True, current_edition_mst=current)
     budget = False
     for entry in manifest['documents']:
         if budget:
