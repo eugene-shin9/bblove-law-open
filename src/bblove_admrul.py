@@ -43,12 +43,15 @@ KEYWORDS = ('세', '조세', '국세', '조사', '징수', '체납', '부가', '
             # Tax rules of 재정경제부 whose titles carry none of the words above. Short
             # words are avoided ('인지' would also match '확인지침').
             '정보교환', '성실신고', '수입인지', '손금')
+# '세' inside 시행세칙·세부·세계·세입·세출 is not a tax word; removed before the
+# KEYWORDS check only (세부담 stays). Closed list, longest first.
+NOT_TAX_WORDS = re.compile(r'시행세칙|세칙|세부(?!담)|세계|세입|세출')
 # Every 훈령·예규·고시 of this ministry is tax administration; titles are not filtered.
 ALL_TITLES = '국세청'
 POLICY = 'tax-admrul-v1-no-customs'
 # Scope edition, added to manifest and index. POLICY is unchanged so caches and
 # readers keep working; verify accepts any value or none (older assets).
-SCOPE = 'nts-all+mofe-keywords-2'
+SCOPE = 'nts-all+mofe-keywords-3'
 FILE_LIMIT = 8 * 1024 * 1024
 NOTICE = '법원·납세자를 직접 구속하지 않을 수 있음'
 NOT_YET_EFFECTIVE = 'NOT_YET_EFFECTIVE'
@@ -166,10 +169,12 @@ def exclusion(row):
         return None
     title = row['행정규칙명']
     # Domestic tax administration, not customs/trade remedies; a title naming
-    # 국세 as well (e.g. 국세 및 관세 해석 지침) stays in scope.
-    if '관세' in title and '국세' not in title:
+    # 국세 as well (e.g. 국세 및 관세 해석 지침) stays in scope. '국세청' alone does not.
+    if '관세' in title and '국세' not in title.replace('국세청', ' '):
         return 'CUSTOMS_EXCLUDED'
-    if not any(k in title for k in KEYWORDS):
+    # A space keeps removed words from joining their neighbours into a new keyword.
+    words = NOT_TAX_WORDS.sub(' ', title)
+    if not any(k in words for k in KEYWORDS):
         return 'NO_TAX_KEYWORD'
     return None
 
