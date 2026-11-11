@@ -1,6 +1,7 @@
 """Synthetic admrul contracts. No DRF calls, deployments or real credentials."""
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -1160,7 +1161,7 @@ class Scope(unittest.TestCase):
         raw, dest = self.root / 'raw', self.root / 'assets'
         self.assertTrue(A.collect(Fake(self.rows()), raw, DATE))
         m = json.loads((raw / 'manifest.json').read_text(encoding='utf-8'))
-        self.assertEqual((m['policy'], m['scope']), ('tax-admrul-v1-no-customs', 'nts-all+mofe-keywords-2'))
+        self.assertEqual((m['policy'], m['scope']), ('tax-admrul-v1-no-customs', 'nts-all+mofe-keywords-3'))
         A.build(raw, dest)
         path = dest / 'admrul/index.json'
         index = json.loads(path.read_text(encoding='utf-8'))
@@ -1199,7 +1200,7 @@ class Scope(unittest.TestCase):
         self.assertTrue(A.collect(client, raw, DATE))
         helper = NotYetEffective()
         out, summary = helper.run_script(helper.workflow_script('Progress'), work)
-        expected = ('scope=nts-all+mofe-keywords-2 docs_by_org={"국세청": 5, "기획재정부": 1, "재정경제부": 5} '
+        expected = ('scope=nts-all+mofe-keywords-3 docs_by_org={"국세청": 5, "기획재정부": 1, "재정경제부": 5} '
                     'excluded_by_reason={"CUSTOMS_EXCLUDED": 1, "NO_TAX_KEYWORD": 3, "OUTSIDE_KINDS": 5}')
         self.assertIn(f'::notice title=admrul 범위::{expected}', out)
         self.assertIn(f'`{expected}`', summary)
@@ -1219,5 +1220,84 @@ class Scope(unittest.TestCase):
             for leaked in (self.SECRET, 'http', 'OC=', '홈택스'):
                 self.assertNotIn(leaked, blob)
 
+
+
+def scope2_exclusion(row):
+    """Scope 'nts-all+mofe-keywords-2', before the 재정경제부 titles were narrowed."""
+    org = A.current_org(row['소관부처명'])
+    if org not in A.ORG:
+        return 'OUTSIDE_ORGANIZATIONS'
+    if row['행정규칙종류'] not in A.KINDS:
+        return 'OUTSIDE_KINDS'
+    if org == '국세청':
+        return None
+    title = row['행정규칙명']
+    if '관세' in title and '국세' not in title:
+        return 'CUSTOMS_EXCLUDED'
+    return None if any(k in title for k in A.KEYWORDS) else 'NO_TAX_KEYWORD'
+
+
+class MofeNarrow(unittest.TestCase):
+    """'세' inside 시행세칙·세부 etc. is not a tax word; '국세청' does not lift the customs exclusion."""
+    ORGS = ('재정경제부', '기획재정부')
+    DROPPED = ['세계은행 초급전문가 및 중견전문가 파견 및 관리 규정',
+               '세입·세출외거래 회계처리지침',
+               '수복지역내 국유화 된 토지의 매각 및 대부에 관한 세부처리 기준',
+               '재정경제부 당직 및 비상근무 시행세칙',
+               '재정경제부 보안업무 시행세칙',
+               '재정경제부소관 국가정보자료관리 세부시행규칙',
+               '재정경제부 소관 법령에 따른 행정처분 및 과태료의 가중처분에 관한 세부지침']
+    KEPT = ['공직퇴임세무사의 공익목적 수임범위에 관한 고시',
+            '교육세법 시행령 제4조제2항제13호의 규정에 의한 재정경제부장관이 정하여 고시하는 대출',
+            '국제거래가격과세조정심의위원회의 운영규정',
+            '대한민국 정부와 미합중국 정부 간의 국제 납세의무 준수 촉진을 위한 협정에 따른 금융정보자동교환 이행규정',
+            '국세 및 관세 관계법규 해석에 관한 업무처리지침',
+            '양도소득 세부담 경감 기준', '세부담 완화 고시']
+    CUSTOMS = ['국세청 관세 협조 규정', '덤핑방지관세부과 징수 규정']
+
+    def test_mofe_titles(self):
+        for org in self.ORGS:
+            for kind in sorted(A.KINDS):
+                ex = lambda t: A.exclusion(row(1, org, t, kind))
+                for title in self.DROPPED:
+                    self.assertEqual(ex(title), 'NO_TAX_KEYWORD', (org, title))
+                for title in self.KEPT:
+                    self.assertIsNone(ex(title), (org, title))
+                for title in self.CUSTOMS:
+                    self.assertEqual(ex(title), 'CUSTOMS_EXCLUDED', (org, title))
+
+    def test_nts_titles_still_unfiltered(self):
+        for title in ['국세청 세무조사 시행세칙', '국세청 관세 협조 규정'] + self.DROPPED + self.CUSTOMS:
+            self.assertIsNone(A.exclusion(row(1, '국세청', title)), title)
+
+    def test_dropped_rule_is_listed_as_excluded_and_never_published(self):
+        rows = [row(i, '재정경제부', t) for i, t in enumerate(self.DROPPED + self.KEPT[:4], 1)]
+        rows.append(row(50, '국세청', '국세청 세무조사 시행세칙'))
+        with tempfile.TemporaryDirectory() as temp:
+            raw, dest = Path(temp) / 'raw', Path(temp) / 'assets'
+            client = Fake(rows)
+            self.assertTrue(A.collect(client, raw, DATE))
+            m = json.loads((raw / 'manifest.json').read_text(encoding='utf-8'))
+            self.assertEqual(m['scope'], 'nts-all+mofe-keywords-3')
+            reasons = {e['title']: e['reason'] for e in m['excluded']}
+            self.assertTrue(all(reasons.get(t) == 'NO_TAX_KEYWORD' for t in self.DROPPED))
+            self.assertEqual({e['title'] for e in m['documents']}, set(self.KEPT[:4]) | {'국세청 세무조사 시행세칙'})
+            requested = {p['ID'] for e, p, _ in client.requests if e == 'lawService.do'}
+            self.assertFalse(requested & {r['행정규칙일련번호'] for r in rows[:len(self.DROPPED)]})
+            A.build(raw, dest)
+            self.assertEqual(A.verify(dest)['documents'], 5)
+
+    def test_only_narrows_for_every_title_in_this_file(self):
+        import ast
+        titles = {n.value for n in ast.walk(ast.parse(Path(__file__).read_text(encoding='utf-8')))
+                  if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                  and re.search('[가-힣]', n.value) and len(n.value) < 120}
+        self.assertGreater(len(titles), 50)
+        for title in sorted(titles):
+            for org in ('국세청', '재정경제부', '기획재정부', '국세상담센터'):
+                for kind in ('훈령', '예규', '고시', '지침'):
+                    r = row(1, org, title, kind)
+                    if scope2_exclusion(r):
+                        self.assertTrue(A.exclusion(r), (org, kind, title))
 
 if __name__=='__main__':unittest.main()
