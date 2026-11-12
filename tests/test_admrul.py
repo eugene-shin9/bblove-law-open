@@ -3,6 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1299,5 +1300,217 @@ class MofeNarrow(unittest.TestCase):
                     r = row(1, org, title, kind)
                     if scope2_exclusion(r):
                         self.assertTrue(A.exclusion(r), (org, kind, title))
+
+
+LINK = 'http://law.go.kr/flDownload.do?flSeq='
+
+
+def attached(body, links, names, supplement=None, r=None):
+    d = detail(r or row(), body)
+    d['AdmRulService']['첨부파일'] = {'첨부파일링크': links, '첨부파일명': names}
+    if supplement is not None:
+        d['AdmRulService']['부칙'] = supplement
+    return d
+
+
+class RecoveredBodies(unittest.TestCase):
+    """Repeated article numbers and bodies posted only as images/attachments."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.raw, self.dest = self.root / 'raw', self.root / 'assets'
+
+    def rows(self, body):
+        stats = {}
+        return A.article_rows(body, stats), stats
+
+    def test_same_article_printed_twice_around_a_heading_is_kept_once(self):
+        arts, stats = self.rows('제1조(목적) 합성 목적.\n제2조(기한) 합성 기한.\n제3장 보칙\n제2조(기한) 합성 기한.')
+        self.assertEqual(arts, [['제1조', '목적', '제1조(목적) 합성 목적.'],
+                                ['제2조', '기한', '제2조(기한) 합성 기한.\n제3장 보칙']])
+        self.assertEqual(stats['articles_merged'], 1)
+        # The heading may sit in the later copy; its text is kept, at the first copy's place.
+        arts, stats = self.rows('제1조(목적) 합성.\n제1조(목적) 합성.\n제2절 합성 절\n제2조(기한) 합성 기한.')
+        self.assertEqual(arts[0], ['제1조', '목적', '제1조(목적) 합성.\n제2절 합성 절'])
+        self.assertEqual(len(arts), 2)
+        arts, stats = self.rows('제1조(목적) 합성.\n제1조(목적) 합성.\n제1조(목적) 합성.')
+        self.assertEqual((arts, stats['articles_merged']), ([['제1조', '목적', '제1조(목적) 합성.']], 2))
+        arts, stats = self.rows('제1조(목적) 합성.\n제2조(기한) 합성.')
+        self.assertEqual((len(arts), stats['articles_merged']), (2, 0))
+
+    def test_deleted_and_live_article_with_one_number_become_one_row(self):
+        arts, stats = self.rows('제1조(목적) 합성.\n제2조(확인) <삭제>\n제2조(주관) 합성 주관.\n제3조(벌칙) 합성 벌칙.')
+        self.assertEqual(arts, [['제1조', '목적', '제1조(목적) 합성.'],
+                                ['제2조', '주관', '제2조(확인) <삭제>\n제2조(주관) 합성 주관.'],
+                                ['제3조', '벌칙', '제3조(벌칙) 합성 벌칙.']])
+        self.assertEqual(stats['articles_merged'], 1)
+        for mark in ('삭제', '삭제 <2010. 4. 30.>', '삭제<2020.8.26>', '<삭제>\n제2장 합성 장'):
+            with self.subTest(mark=mark):
+                arts, _ = self.rows(f'제1조(주관) 합성 주관.\n제1조(확인) {mark}')
+                self.assertEqual(arts, [['제1조', '주관', f'제1조(주관) 합성 주관.\n제1조(확인) {mark}']])
+        arts, _ = self.rows('제1조 삭제\n제1조(주관) 합성 주관.')
+        self.assertEqual(arts, [['제1조', '주관', '제1조 삭제\n제1조(주관) 합성 주관.']])
+
+    def test_other_repeats_still_fail(self):
+        for body in (
+                '제1조(목적) 하나\n제1조(목적) 둘',                        # different text
+                '제1조(가) 합성 하나.\n제1조(나) 합성 둘.',                # two live articles
+                '제1조(가) 합성.\n제2조(나) 합성.\n제1조(가) 합성.',      # same text, apart
+                '제1조(가) <삭제>\n제2조(나) 합성.\n제1조(다) 합성.',     # deleted + live, apart
+                '제1조(가) 삭제 합성 문장\n제1조(나) 합성.',              # not only a deletion mark
+                '제1조(가) 삭제 <합성>\n제1조(나) 합성.',                 # not a date
+                '제1조(가) <삭제>\n제1조(나) 삭제',                       # no live article
+                '제1조(가) <삭제>\n제1조(나) 합성.\n제1조(다) 합성 셋.',  # two live articles
+                '제1조 합성.\n제2장 갑\n제1조 합성.\n제3장 을'):        # two different headings
+            with self.subTest(body=body):
+                stats = {}
+                with self.assertRaisesRegex(ValueError, 'ADMRUL_DUPLICATE_ARTICLE'):
+                    A.article_rows(body, stats)
+                self.assertNotIn('articles_merged', stats)
+
+    def test_attachment_only_rows(self):
+        notice = ('이 행정규칙의 본문은 법제처 국가법령정보센터에 글자로 게시되어 있지 않고 이미지 또는 첨부파일로만 '
+                  '제공됩니다. 아래 첨부파일 또는 공식 링크에서 원문을 확인해야 합니다.')
+        d = attached('', LINK + '11', '합성 고시.pdf')
+        stats = {}
+        _, arts = A.validate_raw(A.encode(d), row(), DATE, removals=stats)
+        self.assertEqual(arts, [['안내', '', notice + '\n첨부: 합성 고시.pdf ' + LINK + '11']])
+        self.assertTrue(stats['attachment_only'])
+        d = attached('<img id="1"></img><img id="2"></img>', [LINK + '22', LINK + '21'],
+                     ['합성 고시.hwp', '합성 고시.hwp'], {'부칙공포일자': '20250101', '부칙내용': '부칙 합성 적용례.'})
+        stats = {}
+        _, arts = A.validate_raw(A.encode(d), row(), DATE, removals=stats)
+        self.assertEqual(arts, [['안내', '', notice + f'\n첨부: 합성 고시.hwp {LINK}22\n첨부: 합성 고시.hwp {LINK}21'],
+                                ['부칙', '', '부칙 합성 적용례.']])
+        self.assertEqual((stats['attachment_only'], stats['images_removed']), (True, 2))
+        self.assertFalse(any(re.match(r'제\d+조', a[0]) for a in arts))
+        # A text body never takes this path, even with attachments.
+        d = attached('제1조(목적) 합성.', LINK + '1', '합성.pdf')
+        stats = {}
+        _, arts = A.validate_raw(A.encode(d), row(), DATE, removals=stats)
+        self.assertEqual(([a[0] for a in arts], stats['attachment_only']), (['제1조'], False))
+
+    def test_empty_body_without_attachment_link_still_fails(self):
+        for value in (None, '', {}, {'첨부파일링크': '', '첨부파일명': ''},
+                      {'첨부파일링크': [], '첨부파일명': []}, {'첨부파일명': '합성.pdf'}):
+            with self.subTest(value=value):
+                d = detail(row(), '')
+                if value is not None:
+                    d['AdmRulService']['첨부파일'] = value
+                with self.assertRaisesRegex(ValueError, 'ADMRUL_BODY_MISSING'):
+                    A.validate_raw(A.encode(d), row(), DATE)
+        # An image-only supplement still fails as before.
+        d = attached('', LINK + '1', '합성.pdf', {'부칙내용': '<img id="9"></img>'})
+        with self.assertRaisesRegex(ValueError, 'ADMRUL_BODY_MISSING'):
+            A.validate_raw(A.encode(d), row(), DATE)
+        # Other body shapes keep their own failure.
+        d = attached(None, LINK + '1', '합성.pdf')
+        with self.assertRaisesRegex(ValueError, 'ADMRUL_BODY_SHAPE'):
+            A.validate_raw(A.encode(d), row(), DATE)
+
+    def test_attachment_shape_failures(self):
+        for links, names in (
+                ([LINK + '1', LINK + '2'], '합성.pdf'),
+                (LINK + '1', ['합성.pdf', '합성.hwp']),
+                ('https://law.go.kr/flDownload.do?flSeq=1', '합성.pdf'),
+                ('http://example.invalid/flDownload.do?flSeq=1', '합성.pdf'),
+                (LINK + '1&x=2', '합성.pdf'),
+                (LINK + 'abc', '합성.pdf'),
+                (LINK, '합성.pdf'),
+                (LINK + '1', '합성\n.pdf'),
+                (LINK + '1', '합성\x07.pdf'),
+                (LINK + '1', '합성\u202e.pdf'),
+                (LINK + '1', ' '),
+                (LINK + '1', 7),
+                ([LINK + '1', 2], ['가', '나'])):
+            with self.subTest(links=links, names=names):
+                with self.assertRaisesRegex(ValueError, 'ADMRUL_ATTACHMENT_SHAPE'):
+                    A.validate_raw(A.encode(attached('', links, names)), row(), DATE)
+        d = attached('', LINK + '1', '합성.pdf')
+        d['AdmRulService']['첨부파일']['기타'] = '합성'
+        with self.assertRaisesRegex(ValueError, 'ADMRUL_ATTACHMENT_SHAPE'):
+            A.validate_raw(A.encode(d), row(), DATE)
+        d['AdmRulService']['첨부파일'] = [LINK + '1']
+        with self.assertRaisesRegex(ValueError, 'ADMRUL_ATTACHMENT_SHAPE'):
+            A.validate_raw(A.encode(d), row(), DATE)
+
+    def fixtures(self):
+        first, second = row(), row(2, '재정경제부', '소득세 납세절차', '예규')
+        details = {
+            first['행정규칙일련번호']: attached('<img id="1"></img>', [LINK + '5', LINK + '6'],
+                                         ['합성 고시.hwp', '합성 고시.pdf'], {'부칙내용': '부칙 합성.'}, first),
+            second['행정규칙일련번호']: detail(second, '제1조(목적) 합성.\n제2조(확인) <삭제>\n제2조(주관) 합성 주관.'),
+        }
+        return first, second, details
+
+    def test_collect_build_verify_and_reuse(self):
+        first, second, details = self.fixtures()
+        client = Fake(details=details)
+        self.assertTrue(A.collect(client, self.raw, DATE))
+        manifest = json.loads((self.raw / 'manifest.json').read_bytes())
+        entries = {e['id']: e for e in manifest['documents']}
+        a, b = entries[first['행정규칙ID']], entries[second['행정규칙ID']]
+        self.assertEqual((a['status'], a['articles'], a['attachment_only'], a['articles_merged']),
+                         ('SUCCESS', 2, True, 0))
+        self.assertEqual((b['status'], b['articles'], b['attachment_only'], b['articles_merged']),
+                         ('SUCCESS', 2, False, 1))
+        stats = A.build(self.raw, self.dest)
+        self.assertEqual((stats['documents'], stats['failed']), (2, 0))
+        docs = {mst: json.loads((self.dest / f'admrul/docs/{mst}.json').read_bytes())[0]
+                for mst in (a['mst'], b['mst'])}
+        self.assertEqual(docs[a['mst']]['st'], '본문 미게시(이미지·첨부파일로만 제공) · 공식 링크에서 원문 확인')
+        self.assertEqual([x[0] for x in docs[a['mst']]['a']], ['안내', '부칙'])
+        self.assertEqual(docs[b['mst']]['st'], '현행(수집 기준) · 별표·첨부파일은 공식 링크에서 별도 확인')
+        self.assertEqual(set(docs[a['mst']]), set(docs[b['mst']]))
+        index = json.loads((self.dest / 'admrul/index.json').read_bytes())
+        self.assertEqual(index['failures'], [])
+        meta(self.dest)
+        self.assertEqual(A.verify(self.dest, merge_meta=True)['documents'], 2)
+        before = {p.name: p.read_bytes() for p in (self.dest / 'admrul/docs').iterdir()}
+        # Stored originals replay with no calls and give the same rows and marks.
+        replay = Fake(details=details, stop_after=0)
+        self.assertTrue(A.collect(replay, self.raw, DATE))
+        self.assertEqual(replay.calls, 0)
+        again = json.loads((self.raw / 'manifest.json').read_bytes())
+        for e in again['documents']:
+            old = {**entries[e['id']]}
+            self.assertTrue(e['reused'])
+            self.assertEqual({k: e[k] for k in ('status', 'articles', 'attachment_only', 'articles_merged')},
+                             {k: old[k] for k in ('status', 'articles', 'attachment_only', 'articles_merged')})
+        shutil.rmtree(self.dest)
+        A.build(self.raw, self.dest)
+        self.assertEqual({p.name: p.read_bytes() for p in (self.dest / 'admrul/docs').iterdir()}, before)
+
+    def test_build_rejects_marks_that_differ_from_the_original(self):
+        first, second, details = self.fixtures()
+        self.assertTrue(A.collect(Fake(details=details), self.raw, DATE))
+        manifest = json.loads((self.raw / 'manifest.json').read_bytes())
+        for key, value in (('attachment_only', False), ('articles_merged', 0), ('articles_merged', 2)):
+            ident = first['행정규칙ID'] if key == 'attachment_only' else second['행정규칙ID']
+            with self.subTest(key=key, value=value):
+                changed = json.loads(json.dumps(manifest))
+                next(e for e in changed['documents'] if e['id'] == ident)[key] = value
+                A.save(self.raw / 'manifest.json', changed)
+                with self.assertRaisesRegex(ValueError, 'ADMRUL_MANIFEST_MISMATCH'):
+                    A.build(self.raw, self.dest / key)
+        # A manifest written before these keys existed reads them as False and 0.
+        changed = json.loads(json.dumps(manifest))
+        for e in changed['documents']:
+            e.pop('attachment_only')
+            e.pop('articles_merged')
+        A.save(self.raw / 'manifest.json', changed)
+        with self.assertRaisesRegex(ValueError, 'ADMRUL_MANIFEST_MISMATCH'):
+            A.build(self.raw, self.dest / 'legacy')
+
+    def test_legacy_manifest_without_marks_builds_plain_documents(self):
+        self.assertTrue(A.collect(Fake(), self.raw, DATE))
+        manifest = json.loads((self.raw / 'manifest.json').read_bytes())
+        for e in manifest['documents']:
+            e.pop('attachment_only')
+            e.pop('articles_merged')
+        A.save(self.raw / 'manifest.json', manifest)
+        self.assertEqual(A.build(self.raw, self.dest)['documents'], 2)
 
 if __name__=='__main__':unittest.main()
