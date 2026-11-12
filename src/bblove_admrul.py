@@ -15,6 +15,7 @@ import shutil
 import sys
 import tempfile
 import traceback
+import unicodedata
 
 from bblove_law_all import Client, save, today, stamp, write_step_output, collection_complete
 from bblove_quality import credential_markers
@@ -337,6 +338,50 @@ def body_text(value, removals=None):
     return value.strip()
 
 
+# A whole line that is only a part/chapter/section heading (제9장 보칙). Splitting at 제N조
+# leaves such a line at the end of the preceding article's piece.
+HEADING_LINE = re.compile(r'제\d+(?:의\d+)?[편장절관](?:\s+[^\n]{1,60})?')
+# What may follow 제N조(제목) in a deleted article: <삭제>, 삭제, 삭제 <2010. 4. 30.>.
+DELETED_REST = re.compile(r'<삭제>|삭제(?:\s*<\s*\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?\s*>)?')
+
+
+def heading_lines(piece):
+    return [line for line in piece.split('\n') if HEADING_LINE.fullmatch(line.strip())]
+
+
+def without_headings(piece):
+    return '\n'.join(line for line in piece.split('\n')
+                     if not HEADING_LINE.fullmatch(line.strip())).strip()
+
+
+def deleted_only(match, piece):
+    """True if the piece is 제N조(제목) followed by a deletion mark only (and heading lines)."""
+    rest = without_headings(piece[len(match[0].strip()):])
+    return bool(DELETED_REST.fullmatch(rest))
+
+
+def merge_repeat(run):
+    """One row for consecutive pieces with the same label, or None (left to fail).
+
+    run: [(match, piece), ...]. Only two shapes are recovered; nothing is guessed.
+    """
+    pieces = [p for _, p in run]
+    # (가) The same article printed twice: identical once heading lines are set aside.
+    # The piece carrying a heading line is kept so no original text is dropped.
+    if len({without_headings(p) for p in pieces}) == 1:
+        headed = {p for p in pieces if heading_lines(p)}
+        if len(headed) > 1:
+            return None
+        m, piece = next(((m, p) for m, p in run if p in headed), run[0])
+        return [run[0][0][1], m[2] or '', piece]
+    # (나) A deleted article and a live article sharing one number: every line is kept in
+    # original order and the row takes the live article's title.
+    live = [(m, p) for m, p in run if not deleted_only(m, p)]
+    if len(live) == 1:
+        return [run[0][0][1], live[0][0][2] or '', '\n'.join(pieces)]
+    return None
+
+
 def article_rows(value, removals=None):
     body = body_text(value, removals)
     matches = list(re.finditer(r'(?m)^\s*(제\d+조(?:의\d+)?)(?:\s*\(([^)\n]*)\))?', body))
@@ -345,12 +390,71 @@ def article_rows(value, removals=None):
     out = []
     if body[:matches[0].start()].strip():
         out.append(['전문', '', body[:matches[0].start()].strip()])
+    runs = []
     for i, m in enumerate(matches):
         end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
-        out.append([m[1], m[2] or '', body[m.start():end].strip()])
+        piece = body[m.start():end].strip()
+        if runs and runs[-1][0][0][1] == m[1]:
+            runs[-1].append((m, piece))
+        else:
+            runs.append([(m, piece)])
+    merged = 0
+    for run in runs:
+        if len(run) == 1:
+            m, piece = run[0]
+            out.append([m[1], m[2] or '', piece])
+            continue
+        row = merge_repeat(run)
+        if row is None:
+            raise ValueError('ADMRUL_DUPLICATE_ARTICLE')
+        out.append(row)
+        merged += len(run) - 1
+    # A label repeated at separate places is never joined (that would reorder the text).
     if len({a[0] for a in out}) != len(out):
         raise ValueError('ADMRUL_DUPLICATE_ARTICLE')
+    if removals is not None:
+        removals['articles_merged'] = removals.get('articles_merged', 0) + merged
     return out
+
+
+ATTACHMENT_ONLY_NOTICE = ('이 행정규칙의 본문은 법제처 국가법령정보센터에 글자로 게시되어 있지 않고 '
+                          '이미지 또는 첨부파일로만 제공됩니다. 아래 첨부파일 또는 공식 링크에서 원문을 확인해야 합니다.')
+ATTACHMENT_ONLY_STATUS = '본문 미게시(이미지·첨부파일로만 제공) · 공식 링크에서 원문 확인'
+ATTACHMENT_LINK = re.compile(r'http://law\.go\.kr/flDownload\.do\?flSeq=[0-9]{1,20}')
+
+
+def attachment_values(value):
+    if value is None or value == '':
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return value
+    raise ValueError('ADMRUL_ATTACHMENT_SHAPE')
+
+
+def attachment_row(value):
+    """The 안내 row for a rule whose body is posted only as images/attachments.
+
+    Raises ADMRUL_BODY_MISSING when there is no attachment link (nothing to point to).
+    Names and links are copied unchanged; the files are never fetched or read.
+    """
+    if not value:
+        raise ValueError('ADMRUL_BODY_MISSING')
+    if not isinstance(value, dict) or set(value) - {'첨부파일링크', '첨부파일명'}:
+        raise ValueError('ADMRUL_ATTACHMENT_SHAPE')
+    links = attachment_values(value.get('첨부파일링크'))
+    names = attachment_values(value.get('첨부파일명'))
+    if not links:
+        raise ValueError('ADMRUL_BODY_MISSING')
+    if len(names) != len(links) or any(not ATTACHMENT_LINK.fullmatch(link) for link in links):
+        raise ValueError('ADMRUL_ATTACHMENT_SHAPE')
+    for name in names:
+        if not name.strip() or any(unicodedata.category(c)[0] == 'C' or unicodedata.category(c) in {'Zl', 'Zp'}
+                                   for c in name):
+            raise ValueError('ADMRUL_ATTACHMENT_SHAPE')
+    lines = [f'첨부: {name} {link}' for name, link in zip(names, links)]
+    return ['안내', '', '\n'.join([ATTACHMENT_ONLY_NOTICE, *lines])]
 
 
 def validate_raw(raw, row, date, credential='', removals=None):
@@ -369,12 +473,23 @@ def validate_raw(raw, row, date, credential='', removals=None):
         raise ValueError('ADMRUL_ORG_CODE_MISMATCH')
     # Guide declares 조문내용, not the normal law's 조문/조문단위 envelope.
     # No guessed dictionary flattening: a different JSON nesting must be reviewed.
-    articles = article_rows(service.get('조문내용'), removals)
+    attachment_only = False
+    try:
+        articles = article_rows(service.get('조문내용'), removals)
+    except ValueError as exc:
+        # No body text at all (empty, image tags only): point to the posted attachments
+        # instead of failing, but never invent body text. No attachment link still fails.
+        if str(exc) != 'ADMRUL_BODY_MISSING':
+            raise
+        articles = [attachment_row(service.get('첨부파일'))]
+        attachment_only = True
     if service.get('부칙'):
         value = service['부칙']
         if isinstance(value, dict):
             value = value.get('부칙내용')
         articles.append(['부칙', '', body_text(value, removals)])
+    if removals is not None:
+        removals['attachment_only'] = attachment_only
     return actual, articles
 
 
@@ -443,6 +558,7 @@ def collect(client, out, date):
         entry = {'id': row['행정규칙ID'], 'mst': row['행정규칙일련번호'],
                  'title': row['행정규칙명'], 'row': row, 'status': 'PENDING',
                  'images_removed': 0, 'scripts_removed': 0,
+                 'articles_merged': 0, 'attachment_only': False,
                  'path': f"raw/{row['행정규칙ID']}/{row['행정규칙일련번호']}.json"}
         # Scope exclusions first, so the not-yet-effective list holds only rules
         # this collection would otherwise publish.
@@ -538,13 +654,19 @@ def build(source, dest):
             raw = (source / e['path']).read_bytes()
             if hashlib.sha256(raw).hexdigest() != e['sha256']:
                 raise ValueError('ADMRUL_RAW_HASH_MISMATCH')
-            _, arts = validate_raw(raw, row, manifest['date'])
+            marks = {}
+            _, arts = validate_raw(raw, row, manifest['date'], removals=marks)
             if len(arts) != e['articles']:
                 raise ValueError('ADMRUL_ARTICLE_COUNT_MISMATCH')
+            # Recalculated from the exact original; a manifest without these keys predates them.
+            if (marks['attachment_only'], marks.get('articles_merged', 0)) != (
+                    e.get('attachment_only', False), e.get('articles_merged', 0)):
+                raise ValueError('ADMRUL_MANIFEST_MISMATCH')
             doc = {'id': e['id'], 'mst': e['mst'], 'k': '행정규칙', 'kc': row['행정규칙종류'],
                    'org': row['소관부처명'], 't': e['title'], 'eff': iso(row['시행일자']),
                    'pub': iso(row['발령일자']), 'collected': iso(manifest['date']),
-                   'st': '현행(수집 기준) · 별표·첨부파일은 공식 링크에서 별도 확인',
+                   'st': ATTACHMENT_ONLY_STATUS if marks['attachment_only'] else
+                         '현행(수집 기준) · 별표·첨부파일은 공식 링크에서 별도 확인',
                    'url': f"https://www.law.go.kr/LSW/admRulLsInfoP.do?admRulSeq={e['mst']}", 'a': arts}
             data = encode([doc])
             if len(data) > FILE_LIMIT:
