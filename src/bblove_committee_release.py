@@ -21,7 +21,14 @@ PATTERNS = {
     'EMAIL': r'(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?!\w)',
     # At least three groups; excludes YYYY-MM-DD, case numbers, amounts and article numbers.
     'ACCOUNT': r'(?<![\d-])(?:\d{2,6}-\d{2,6}-\d{3,8}(?:-\d{1,6})?)(?![\d-])',
-    'ACCOUNT_CONTEXT': r'(?:계좌|account)\s*(?:번호)?\s*[:：]?\s*\d{10,16}(?!\d)',
+    # Same strings and spans as the former \s*(?:번호)?\s*[:：]?\s* form, whose three adjacent \s* runs
+    # backtracked in cubic time on a long blank after the context word.
+    'ACCOUNT_CONTEXT': r'(?:계좌|account)\s*(?:번호\s*)?(?:[:：]\s*)?\d{10,16}(?!\d)',
+    # ACCOUNT glued to a preceding word by a hyphen (bank-110-123-456789), which ACCOUNT's lookbehind skips.
+    'ACCOUNT_PREFIXED': r'(?<=[^\d\s-]-)(?:\d{2,6}-\d{2,6}-\d{3,8}(?:-\d{1,6})?)(?![\d-])',
+    # Context word, then 2-6 digit groups split by one repeated blank, dot or hyphen. gate() keeps a match
+    # only when it holds 10-16 digits and its first three groups are not a date.
+    'ACCOUNT_CONTEXT_SPLIT': r'(?:계좌|account)\s*(?:번호\s*)?(?:[:：]\s*)?\d+([ .-])\d+(?:\1\d+){0,4}(?!\d)',
 }
 
 
@@ -37,16 +44,42 @@ def pii_text(value):
     return re.sub(r'[\u00a0\u2000-\u200a\u202f\u3000]', ' ', text)
 
 
+# A second normalized copy; gate() reports the union of both. Here the soft hyphen and rarer dash look-alikes
+# become '-' instead of vanishing or staying, so 110\u00ad123\u00ad456789 and 110ㅡ123ㅡ456789 keep the ACCOUNT
+# shape. NFKC has already turned ㅡ (U+3161) and halfwidth ㅡ (U+FFDA) into U+1173, so the table lists U+1173.
+# The first copy stays unchanged: an extra '-' changes what lookarounds such as ACCOUNT's (?<![\d-]) see.
+_DASHES_WIDE = {**_DASHES, **dict.fromkeys(map(ord, '\u00ad\u2043\u02d7\u2e3a\u2e3b\u1173'), '-')}
+_INVISIBLE_KEPT = {k: v for k, v in _INVISIBLE.items() if k not in _DASHES_WIDE}
+
+
+def pii_text_dash(value):
+    text = unicodedata.normalize('NFKC', value).translate(_INVISIBLE_KEPT).translate(_DASHES_WIDE)
+    return re.sub(r'[\u00a0\u2000-\u200a\u202f\u3000]', ' ', text)
+
+
+def account_split(text):
+    """ACCOUNT_CONTEXT_SPLIT counts: 10-16 digits in all, first three groups not YYYY, 1-12, 1-31."""
+    groups = re.findall(r'\d+', text)
+    date = (len(groups) >= 3 and len(groups[0]) == 4 and len(groups[1]) <= 2 and len(groups[2]) <= 2
+            and 1 <= int(groups[1]) <= 12 and 1 <= int(groups[2]) <= 31)
+    return 10 <= sum(map(len, groups)) <= 16 and not date
+
+
 def gate(row):
     codes = set()
     for key, value in row.items():
         if not isinstance(value, str) or key in ('id', 'source', 'decided', 'disposed', 'official_url'):
             continue
-        for code, pattern in PATTERNS.items():
-            for match in re.finditer(pattern, pii_text(value), re.I):
-                if code == 'ACCOUNT' and re.fullmatch(r'\d{4}-\d{2}-\d{2}', match[0]):
-                    continue
-                codes.add(code)
+        plain, dashed = pii_text(value), pii_text_dash(value)
+        for text in (plain,) if dashed == plain else (plain, dashed):
+            for code, pattern in PATTERNS.items():
+                for match in re.finditer(pattern, text, re.I):
+                    if code in ('ACCOUNT', 'ACCOUNT_PREFIXED') and re.fullmatch(r'\d{4}-\d{2}-\d{2}', match[0]):
+                        continue
+                    if code == 'ACCOUNT_CONTEXT_SPLIT' and not account_split(match[0]):
+                        continue
+                    codes.add(code)
+                    break
     return sorted(codes)
 
 

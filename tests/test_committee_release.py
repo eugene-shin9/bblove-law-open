@@ -6,15 +6,40 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
+import unicodedata
 import unittest
 from unittest.mock import patch
 sys.path[:0]=[str(Path(__file__).parents[1]/'src'),str(Path(__file__).parents[1]/'scripts')]
 from test_committee_collect import Client, ROW, DETAIL
 from bblove_precedent_collect import collect, validated
-from bblove_committee_release import gate, export, verify, FIELDS
+import bblove_committee_release as committee
+from bblove_committee_release import gate, export, verify, FIELDS, pii_text_dash, _DASHES_WIDE
 from committee_release import needs_publication
 import collect_precedents as wrapper
 from workflow_contract import load_workflow
+
+# Digit groups of a synthetic account; every account-shaped string is joined at runtime for the repository guard.
+ACCT=('110','123','456789')
+
+
+class Hundred(Client):
+    """100 synthetic decc records; 재결요지 of record i is texts.get(i), otherwise a neutral summary."""
+    def __init__(self, texts): super().__init__(); self.texts=texts
+    def get(self, endpoint, params, **kwargs):
+        self.calls+=1
+        if endpoint=='lawSearch.do':
+            rows=[]
+            for i in range(100):
+                sid=str(900001+i)
+                rows.append(dict(ROW, **{'행정심판재결례일련번호':sid,'사건번호':f'2099행심{i+1}',
+                    '행정심판례상세링크':f'https://www.law.go.kr/DRF/lawService.do?target=decc&ID={sid}'}))
+            return {'Decc':{'totalCnt':'100','decc':rows}},None
+        i=int(params['ID'])-900001
+        d=dict(DETAIL, **{'행정심판례일련번호':params['ID'],'사건번호':f'2099행심{i+1}',
+            '재결요지':self.texts.get(i,'합성 요지')})
+        doc={'PrecService':d}; return doc,json.dumps(doc).encode()
+
 
 class CommitteeReleaseTests(unittest.TestCase):
     def test_target_only_incremental_and_summary_untouched(self):
@@ -74,30 +99,62 @@ class CommitteeReleaseTests(unittest.TestCase):
             self.assertFalse(gate({'holding':text}),text)
 
     def test_halt_percent_boundary(self):
-        class Hundred(Client):
-            def __init__(self, bad): super().__init__(); self.bad=bad
-            def get(self, endpoint, params, **kwargs):
-                self.calls+=1
-                if endpoint=='lawSearch.do':
-                    rows=[]
-                    for i in range(100):
-                        sid=str(900001+i)
-                        rows.append(dict(ROW, **{'행정심판재결례일련번호':sid,'사건번호':f'2099행심{i+1}',
-                            '행정심판례상세링크':f'https://www.law.go.kr/DRF/lawService.do?target=decc&ID={sid}'}))
-                    return {'Decc':{'totalCnt':'100','decc':rows}},None
-                i=int(params['ID'])-900001
-                d=dict(DETAIL, **{'행정심판례일련번호':params['ID'],'사건번호':f'2099행심{i+1}',
-                    '재결요지':'person@example.invalid' if i < self.bad else '합성 요지'})
-                doc={'PrecService':d}; return doc,json.dumps(doc).encode()
         for bad in (5,6):
             with tempfile.TemporaryDirectory() as t:
-                root=Path(t); collect(Hundred(bad),root/'s','20261103',targets=('decc',))
+                root=Path(t); collect(Hundred({i:'person@example.invalid' for i in range(bad)}),root/'s','20261103',targets=('decc',))
                 if bad==5:
                     m=export(root/'s',root/'out')
                     self.assertEqual((m['accepted'],m['excluded']),(95,5))
                     self.assertEqual(len(verify(root/'out')),95)
                 else:
                     with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError,'EXCLUSION_RATE'): export(root/'s',root/'out')
+
+    def test_gate_dash_copy_prefixed_and_split_accounts(self):
+        a=ACCT; dashed='-'.join(a)
+        newly={'\u00ad'.join(a):'ACCOUNT', '\u3161'.join(a):'ACCOUNT', '국민은행-'+dashed+'.':'ACCOUNT_PREFIXED',
+               '신한-'+dashed:'ACCOUNT_PREFIXED', '계좌번호 '+' '.join(a):'ACCOUNT_CONTEXT_SPLIT',
+               '계좌 '+'.'.join(a):'ACCOUNT_CONTEXT_SPLIT', 'account: '+' '.join(a):'ACCOUNT_CONTEXT_SPLIT'}
+        for text,code in newly.items():
+            self.assertEqual(gate({'holding':text}),[code],text.encode('unicode_escape'))
+        for text in ('입금 계좌 '+dashed+'.', '\u2010'.join(a), '계좌 '+'3333'+'012345678'+'.'):
+            self.assertTrue(gate({'holding':text}),text.encode('unicode_escape'))
+        # Decided: a word, a hyphen and three groups cannot be told apart from an account, so it is excluded.
+        for text in ('처분청-'+'-'.join(('2019','123','4567')), '산-'+'-'.join(('106','19','123')), '\u00ad'.join(('106','19','123'))):
+            self.assertTrue(gate({'holding':text}),text.encode('unicode_escape'))
+        for text in ('서울특별시 ○○구 ○○동 106-19','1997-02540','2026.01.01','계좌 2019.03.05 100만원',
+                     '계좌번호 1997 5 3 12345','제12조-제3항','국민은행-2026-01-01'):
+            self.assertFalse(gate({'holding':text}),text)
+
+    def test_dash_copy_table_lists_each_nfkc_form(self):
+        for ch in '\u00ad\u2043\u02d7\u2e3a\u2e3b\u3161\uffda':
+            normalized=unicodedata.normalize('NFKC',ch)
+            self.assertEqual(len(normalized),1,hex(ord(ch)))
+            self.assertEqual(_DASHES_WIDE.get(ord(normalized)),'-',hex(ord(ch)))
+            self.assertEqual(pii_text_dash(ch),'-',hex(ord(ch)))
+
+    def test_normalized_copies_once_per_value(self):
+        with patch.object(committee,'pii_text',wraps=committee.pii_text) as plain, \
+                patch.object(committee,'pii_text_dash',wraps=committee.pii_text_dash) as dashed:
+            committee.gate({'id':'1','title':'합성 제목','holding':'합성 요지','order':'합성 주문'})
+        self.assertEqual((plain.call_count,dashed.call_count),(3,3))
+
+    def test_gate_time_is_linear(self):
+        # The former ACCOUNT_CONTEXT needed over 20 s on the first input (cubic in the blank run);
+        # the order makes a regression fail on it before the 60,000-blank input.
+        for text in ('계좌'+' '*2000+'x', '계좌'+' '*60000+'x', ('계좌'+' '*200)*300, '계좌 '+'1 '*30000,
+                     '계좌 '+'1'*60000, '계좌 '+'12.'*30000, '가-12-34-'*10000, ('\u3161'+'1')*30000,
+                     '\u00ad1'*30000, '가'*200000):
+            start=time.perf_counter(); gate({'holding':text})
+            self.assertLess(time.perf_counter()-start,1.0,text[:12])
+
+    def test_new_codes_pass_verify(self):
+        a=ACCT
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t)
+            collect(Hundred({0:'신한-'+'-'.join(a), 1:'계좌번호 '+' '.join(a), 2:'\u00ad'.join(a)}),root/'s','20261103',targets=('decc',))
+            m=export(root/'s',root/'out')
+            self.assertEqual(m['exclusion_reasons'],{'ACCOUNT':1,'ACCOUNT_CONTEXT_SPLIT':1,'ACCOUNT_PREFIXED':1})
+            self.assertEqual(len(verify(root/'out')),97)
 
     def test_total_change_reset_uses_explicit_targets(self):
         with tempfile.TemporaryDirectory() as t:
