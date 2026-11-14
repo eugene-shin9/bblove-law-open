@@ -26,8 +26,9 @@ PATTERNS = {
     'ACCOUNT_CONTEXT': r'(?:계좌|account)\s*(?:번호\s*)?(?:[:：]\s*)?\d{10,16}(?!\d)',
     # ACCOUNT glued to a preceding word by a hyphen (bank-110-123-456789), which ACCOUNT's lookbehind skips.
     'ACCOUNT_PREFIXED': r'(?<=[^\d\s-]-)(?:\d{2,6}-\d{2,6}-\d{3,8}(?:-\d{1,6})?)(?![\d-])',
-    # Context word, then 2-6 digit groups split by one repeated blank, dot or hyphen. gate() keeps a match
-    # only when it holds 10-16 digits and its first three groups are not a date.
+    # Context word, then two to six runs of digits (any length) split by one repeated blank, dot or hyphen.
+    # gate() keeps a match only when it holds 10-16 digits and its first three runs are not a date; other
+    # users of PATTERNS see the bare pattern without that filter.
     'ACCOUNT_CONTEXT_SPLIT': r'(?:계좌|account)\s*(?:번호\s*)?(?:[:：]\s*)?\d+([ .-])\d+(?:\1\d+){0,4}(?!\d)',
 }
 
