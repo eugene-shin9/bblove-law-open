@@ -36,6 +36,7 @@ SEARCH = {'committee_decisions': ('title', 'holding', 'order'), 'precedents': ('
           'interpretations': ('title', 'question', 'answer', 'laws'),
           'tribunal_decisions': ('title', 'summary', 'laws', 'decision_type', 'tax_type')}
 TABLES = {'decc': 'committee_decisions', 'prec': 'precedents', 'ntsCgmExpc': 'interpretations', 'ttSpecialDecc': 'tribunal_decisions'}
+TARGETS_BY_TABLE = {table: target for target, table in TABLES.items()}
 
 
 def schema(tokenizer='trigram'):
@@ -263,11 +264,16 @@ def build(source, out, loaded=None, tokenizer='trigram', daily_limit=DAILY_LIMIT
             skipped += 1
             continue
         is_committee = table == 'committee_decisions'
+        cost = reservation_cost(table, row, committee_model if is_committee else model)
+        if cost > DAILY_LIMIT or len(insert_sql(table, row).encode('utf-8')) > 90_000:
+            # Never fits one day's window or one statement: skip it (not truncated) and list it in the
+            # report; progress() counts it. Re-checked on every build, so a later model can admit it.
+            failures.append({'target': TARGETS_BY_TABLE[table], 'id': row['id'], 'reason': 'ROW_TOO_LARGE'})
+            continue
+        if cost > daily_limit:
+            break  # Fits a full day but not what is left of today: keep today's batches, resume tomorrow.
         if batch and (batch[-1][0] == 'committee_decisions') != is_committee:
             flush()
-        cost = reservation_cost(table, row, committee_model if is_committee else model)
-        if cost > daily_limit or len(insert_sql(table, row).encode('utf-8')) > 90_000:
-            raise ValueError('SINGLE_DOCUMENT_EXCEEDS_SAFE_BUDGET')
         # Sum rounded chunk reservations within each day, so fractional rows
         # cannot accumulate past the daily cap at chunk boundaries.
         extra = math.ceil(units + cost) - math.ceil(units)
@@ -531,7 +537,10 @@ def progress(source, out, state_file):
     summary = (f"- 이번 실행 {state.get('last_run', {}).get('elapsed_minutes', 0):.2f}분 · "
                f"누적 적재 {loaded_total:,}행 / 추정 전체 {estimated_total if estimated_total is not None else '미측정'}행 · "
                f"남은 예상 실행 일수 {remaining_days}일")
-    skipped = state.get('last_run', {}).get('permanent_failures_skipped', {})
+    skipped = dict(state.get('last_run', {}).get('permanent_failures_skipped', {}))
+    too_large = sum(f.get('reason') == 'ROW_TOO_LARGE' for f in report.get('pending_or_failed', []))
+    if too_large:
+        skipped['ROW_TOO_LARGE'] = too_large
     skipped_line = f"- Permanent source failures skipped: {sum(skipped.values())}"
     if skipped:
         skipped_line += ' (' + ', '.join(f'{reason}={count}' for reason, count in sorted(skipped.items())) + ')'
