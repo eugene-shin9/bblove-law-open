@@ -248,7 +248,7 @@ def build(source, out, loaded=None, tokenizer='trigram', daily_limit=DAILY_LIMIT
         old.unlink()
     (out / 'schema.sql').write_text(schema(tokenizer), encoding='utf-8')
     batch, units, batches, selected, skipped = [], Fraction(0), [], [], 0
-    day, day_units = 1, 0
+    day, day_units, stopped = 1, 0, None
     def flush():
         nonlocal batch, units
         if not batch:
@@ -267,11 +267,14 @@ def build(source, out, loaded=None, tokenizer='trigram', daily_limit=DAILY_LIMIT
         cost = reservation_cost(table, row, committee_model if is_committee else model)
         if cost > DAILY_LIMIT or len(insert_sql(table, row).encode('utf-8')) > 90_000:
             # Never fits one day's window or one statement: skip it (not truncated) and list it in the
-            # report; progress() counts it. Re-checked on every build, so a later model can admit it.
+            # report; progress() counts it. Re-checked on every build under the budget model in use.
             failures.append({'target': TARGETS_BY_TABLE[table], 'id': row['id'], 'reason': 'ROW_TOO_LARGE'})
             continue
-        if cost > daily_limit:
-            break  # Fits a full day but not what is left of today: keep today's batches, resume tomorrow.
+        if stopped or cost > daily_limit:
+            # Fits a full day but not what is left of today: keep today's batches and plan nothing more;
+            # later rows still get the size check above. The next day resumes from this document.
+            stopped = stopped or {'target': TARGETS_BY_TABLE[table], 'id': row['id'], 'reason': 'REMAINING_BUDGET'}
+            continue
         if batch and (batch[-1][0] == 'committee_decisions') != is_committee:
             flush()
         # Sum rounded chunk reservations within each day, so fractional rows
@@ -301,7 +304,7 @@ def build(source, out, loaded=None, tokenizer='trigram', daily_limit=DAILY_LIMIT
     if size > DB_LIMIT:
         raise ValueError('DATABASE_EXCEEDS_FREE_LIMIT')
     report = dict(tokenizer=tokenizer, total_documents=len(rows), pending_or_failed=failures,
-                  skipped_ids=skipped, selected_documents=len(selected), batches=batches,
+                  skipped_ids=skipped, selected_documents=len(selected), batches=batches, stopped_for_budget=stopped,
                   estimated_days=batches[-1]['day'] if batches else 0, local_database_bytes=size,
                   scope_selection=manifest['scope_selection'], budget_model=model or {'mode': 'conservative'},
                   daily_limit=daily_limit, local_total_changes=changes, schema_write_reserve=SCHEMA_RESERVE,
@@ -510,7 +513,7 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
     # The durable GitHub state stays small: SQL ID inventories belong to the
     # build artifact, not duplicated into the quota/measurement ledger.
     state.update(last_build={k: report[k] for k in ('selected_documents', 'skipped_ids', 'estimated_days',
-                 'scope_selection', 'budget_model', 'status')}, updated_utc=day)
+                 'scope_selection', 'budget_model', 'status', 'stopped_for_budget')}, updated_utc=day)
     save(state_file, state)
     return state
 
@@ -541,6 +544,7 @@ def progress(source, out, state_file):
     too_large = sum(f.get('reason') == 'ROW_TOO_LARGE' for f in report.get('pending_or_failed', []))
     if too_large:
         skipped['ROW_TOO_LARGE'] = too_large
+    stop = report.get('stopped_for_budget')
     skipped_line = f"- Permanent source failures skipped: {sum(skipped.values())}"
     if skipped:
         skipped_line += ' (' + ', '.join(f'{reason}={count}' for reason, count in sorted(skipped.items())) + ')'
@@ -549,7 +553,8 @@ def progress(source, out, state_file):
              + (f"; partial public export, catalogs={','.join(manifest['partial_targets'])}" if manifest.get('partial_targets') else ''),
              f"- D1 database ID: {state.get('database_id', 'NOT_PREPARED')}; name={state.get('database_name', 'NOT_PREPARED')}",
              f"- Catalog totals: {json.dumps(report.get('catalog_totals', manifest.get('catalogs', {})), ensure_ascii=False)}",
-             f"- Build: {report.get('status', 'NOT_BUILT')}; skipped IDs={report.get('skipped_ids', 0)}; current-window policy plan days={report.get('estimated_days', '?')}",
+             f"- Build: {report.get('status', 'NOT_BUILT')}; skipped IDs={report.get('skipped_ids', 0)}; current-window policy plan days={report.get('estimated_days', '?')}"
+             + (f"; day ended at {stop['target']}/{stop['id']} ({stop['reason']})" if stop else ''),
              f"- Tokenizer={report.get('tokenizer', 'trigram')}; local estimated DB bytes={report.get('local_database_bytes', '?')}",
              f"- UTC write ledger: {json.dumps(state.get('days', {}), sort_keys=True)}",
              f"- Next UTC day budget ({next_day}): {json.dumps(next_policy, ensure_ascii=False, sort_keys=True)}; estimated documents/day={capacity}",
