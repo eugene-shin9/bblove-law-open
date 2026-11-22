@@ -13,6 +13,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from bblove_law_all import save
@@ -116,8 +117,9 @@ COUNTS_SQL = 'CREATE TABLE IF NOT EXISTS table_counts (tbl TEXT PRIMARY KEY, n I
 COUNTS_RESERVE = 64
 
 
-def record_counts(state, state_file, out, loaded, day, write):
-    counts = {t: len(loaded.get(t, [])) for t in COLUMNS}
+def record_counts(state, state_file, out, loaded, day, write, tables=None):
+    # tables (TASK-CC-056): a database holding only some tables records only those rows.
+    counts = {t: len(loaded.get(t, [])) for t in (tables or COLUMNS)}
     if state.get('table_counts', {}).get('n') == counts:
         return  # unchanged: no write (the stored day is the last change)
     path = out / 'counts.sql'
@@ -203,9 +205,20 @@ def reservation_cost(table, row, model=None):
     return Fraction(model['rows_written'] * 3, model['documents'] * 2)
 
 
-def load_rows(source, scope='all', committee_source=None):
+def selected_tables(tables):
+    """None keeps every table (the single-database layout); otherwise a non-empty subset of COLUMNS."""
+    if tables is None:
+        return None
+    tables = tuple(tables)
+    if not tables or any(t not in COLUMNS for t in tables) or len(set(tables)) != len(tables):
+        raise ValueError('TABLES_INVALID')
+    return tables
+
+
+def load_rows(source, scope='all', committee_source=None, tables=None):
     if scope not in ('tax', 'all', 'committee'):
         raise ValueError('SCOPE_INVALID')
+    tables = selected_tables(tables)
     manifest = strict_json((source / 'manifest.json').read_bytes())
     if manifest.get('schema') != SCHEMA:
         raise ValueError('MANIFEST_SCHEMA_INVALID')
@@ -228,20 +241,27 @@ def load_rows(source, scope='all', committee_source=None):
             excluded += 1
             continue
         rows.append((TABLES[entry['target']], row))
-    if committee_source is not None:
+    if committee_source is not None and (tables is None or 'committee_decisions' in tables):
         from bblove_committee_release import verify
         rows.extend(('committee_decisions', r) for r in verify(committee_source))
+    if tables is not None:
+        # Tables another database holds are neither planned, estimated nor reported as failures here.
+        rows = [(t, r) for t, r in rows if t in tables]
+        failures = [f for f in failures if TABLES[f['target']] in tables]
     manifest['scope_selection'] = dict(scope=scope, excluded_documents=excluded, skipped_sources=skipped, rule='tax-v2')
     return manifest, rows, failures
 
 
 def build(source, out, loaded=None, tokenizer='trigram', daily_limit=DAILY_LIMIT,
-          model=None, scope='all', max_batch_documents=None, committee_source=None, committee_model=None):
-    if not 1 <= daily_limit <= DAILY_LIMIT:
+          model=None, scope='all', max_batch_documents=None, committee_source=None, committee_model=None,
+          tables=None, day_cap=DAILY_LIMIT):
+    # day_cap (TASK-CC-056): the bulk-load switch passes a larger per-database day; DAILY_LIMIT stays the default.
+    if not 1 <= daily_limit <= day_cap:
         raise ValueError('DAILY_LIMIT_INVALID')
     if max_batch_documents is not None and max_batch_documents < 1:
         raise ValueError('BATCH_DOCUMENT_LIMIT_INVALID')
-    manifest, rows, failures = load_rows(source, scope, committee_source)
+    tables = selected_tables(tables)
+    manifest, rows, failures = load_rows(source, scope, committee_source, tables)
     loaded = {table: set(ids) for table, ids in (loaded or {}).items()}
     out.mkdir(parents=True, exist_ok=True)
     for old in out.glob('batch-*.sql'):
@@ -257,7 +277,7 @@ def build(source, out, loaded=None, tokenizer='trigram', daily_limit=DAILY_LIMIT
         raw = ''.join(insert_sql(t, r) for t, r in batch).encode('utf-8')
         (out / name).write_bytes(raw)
         batches.append(dict(path=name, sha256=digest(raw), documents=len(batch), write_units=math.ceil(units), day=day,
-                            ids={t: [r['id'] for table, r in batch if table == t] for t in COLUMNS}))
+                            ids={t: [r['id'] for table, r in batch if table == t] for t in (tables or COLUMNS)}))
         batch, units = [], Fraction(0)
     for table, row in rows:
         if row['id'] in loaded.get(table, []):
@@ -312,6 +332,12 @@ def build(source, out, loaded=None, tokenizer='trigram', daily_limit=DAILY_LIMIT
                   # catalogs are unknown, never reported as a measured zero.
                   catalog_totals={t: manifest['catalogs'].get(t, {}).get('total') for t in (TARGETS if scope == 'committee' else DEFAULT_TARGETS)},
                   status='READY' if not failures else 'PARTIAL_WITH_FAILURES')
+    if tables is not None:
+        report['tables'] = list(tables)
+        report['catalog_totals'] = {t: n for t, n in report['catalog_totals'].items() if TABLES[t] in tables}
+        if committee_source is not None and 'committee_decisions' in tables:
+            # The committee projection is verified whole: its row count is the exact total.
+            report['catalog_totals']['decc'] = sum(t == 'committee_decisions' for t, _ in rows)
     save(out / 'build-report.json', report)
     return report
 
@@ -349,17 +375,30 @@ def utc_day():
 
 
 def remote_load(source, out, state_file, config, database, wrangler, execute=wrangler_json,
-                day=None, clock=None, scope='all', committee_source=None):
+                day=None, clock=None, scope='all', committee_source=None, tables=None,
+                daily_limit=DAILY_LIMIT, used_elsewhere=0, deadline=None, monotonic=time.monotonic,
+                receipt_name='d1-loaded.json'):
     """One serialized loader, one UTC ledger shared across workflow runs.
 
     Reserve admission units BEFORE each remote write. A crash or unknown result
     consumes the reservation. Rebuild from remote IDs on every run, so a previous
     partial import is safe and cache eviction cannot duplicate document writes.
+
+    TASK-CC-056 (all optional; the defaults keep the single-database behaviour): `tables` limits
+    planning, remote ID reads, key indexes and table_counts to the tables this database holds;
+    `daily_limit` is this database's day (bulk-load switch) and `used_elsewhere` the rows another
+    ledger sharing the same day already used; `deadline` (a `monotonic()` value) ends the run
+    normally between batches; `receipt_name` keeps each database's receipt in its own file.
     """
     clock = clock or utc_day
     day = day or clock()
+    tables = selected_tables(tables)
+    if (type(daily_limit) is not int or daily_limit < 1 or type(used_elsewhere) is not int or used_elsewhere < 0
+            or not re.fullmatch(r'[a-z0-9-]+\.json', receipt_name)):
+        raise ValueError('LOAD_LIMIT_INVALID')
+    cap = daily_limit - used_elsewhere
     # Verify all local input before any remote mutation.
-    load_rows(source, scope, committee_source)
+    load_rows(source, scope, committee_source, tables)
     state = strict_json(state_file.read_bytes()) if state_file.exists() else {'days': {}}
     ledger = state['days'].setdefault(day, {'reserved': 0, 'rows_written': 0})
     model = ledger.setdefault('budget_model', budget_model(state, day))
@@ -371,13 +410,21 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
     if committee_model and committee_model.get('schema_sha256', fingerprint) != fingerprint:
         committee_model = ledger['committee_budget_model'] = {'mode': 'conservative'}
     ledger.setdefault('documents_written', 0)
-    if ledger.get('halted') or max(ledger['reserved'], ledger['rows_written']) >= DAILY_LIMIT:
+    if ledger.get('halted') or max(ledger['reserved'], ledger['rows_written']) >= cap:
+        return state
+    def past_deadline():
+        # Only with a deadline (bulk switch): the end of the run or of the UTC day stops normally.
+        return deadline is not None and (monotonic() >= deadline or clock() != day)
+    if past_deadline():
+        state.setdefault('last_build', {})['stopped_for_deadline'] = 'DEADLINE'
+        save(state_file, state)
         return state
     base = [wrangler, 'd1', 'execute', database, '--remote', '--config', str(config)]
+    observed_size = [None]
     def reserve(cost):
         if day != clock():
             raise ValueError('UTC_WRITE_WINDOW_CHANGED')
-        if max(ledger['reserved'], ledger['rows_written']) + cost > DAILY_LIMIT:
+        if max(ledger['reserved'], ledger['rows_written']) + cost > cap:
             return False
         ledger['reserved'] = max(ledger['reserved'], ledger['rows_written']) + cost
         save(state_file, state)
@@ -390,6 +437,8 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
             raise ValueError('REMOTE_WRITE_RECEIPT_MISSING')
         observed = sum(x['meta']['rows_written'] for x in result)
         ledger['rows_written'] += observed
+        # The receipt's own database size, when D1 reports it, replaces the 16x running estimate.
+        observed_size[0] = result[-1].get('meta', {}).get('size_after') if result else None
         if batch:
             is_committee = bool(batch['ids'].get('committee_decisions'))
             counter = 'committee_documents_written' if is_committee else 'documents_written'
@@ -417,7 +466,7 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
         state['schema_sha256'] = fingerprint
         save(state_file, state)
     loaded = {}
-    for table in COLUMNS:
+    for table in (tables or COLUMNS):
         ids, cursor = [], ''
         while True:
             query = f'SELECT id FROM {table} WHERE id > {literal(cursor)} ORDER BY id LIMIT 1000;'
@@ -432,7 +481,7 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
             cursor = page[-1]
         loaded[table] = ids
     # Cache hint only; every import still reads authoritative remote IDs.
-    receipt_file = source / 'd1-loaded.json'
+    receipt_file = source / receipt_name
     save(receipt_file, dict(database_id=state.get('database_id'), ids=loaded))
     if committee_source is not None:
         save(Path(committee_source) / 'd1-loaded.json', dict(database_id=state.get('database_id'), ids={'committee_decisions': loaded.get('committee_decisions', [])}))
@@ -441,12 +490,14 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
     existing = {str(r.get('name')) for block in execute(base + ['--command', "SELECT name FROM sqlite_master WHERE type='index';"])
                 for r in block.get('results', [])}
     for table in KEY_COLUMNS:
+        if tables is not None and table not in tables:
+            continue  # another database's table: its index is neither built nor dropped here
         name = index_name(table)
         stale = sorted(n for n in existing if n.startswith(table + '_key') and n != name)
         if name in existing and not stale:
             continue
         cost = SCHEMA_RESERVE if name in existing else index_cost(len(loaded.get(table, [])))
-        if cost > DAILY_LIMIT:
+        if cost > daily_limit:
             raise ValueError('INDEX_BUDGET_IMPOSSIBLE')
         path = out / f'index-{table}.sql'
         # A new index is built first and the old one is dropped on a later run, so a Worker still sending
@@ -474,8 +525,14 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
     size = sizes[-1].get('meta', {}).get('size_after')
     if type(size) is not int or size < 0:
         raise ValueError('REMOTE_DATABASE_SIZE_MISSING')
-    remaining = DAILY_LIMIT - max(ledger['reserved'], ledger['rows_written'])
+    remaining = cap - max(ledger['reserved'], ledger['rows_written'])
     if remaining <= 0:
+        return state
+    if past_deadline():
+        state.setdefault('last_build', {})['stopped_for_deadline'] = 'DEADLINE'
+        if clock() == day:
+            record_counts(state, state_file, out, loaded, day, write, tables)
+        save(state_file, state)
         return state
     chunk_documents = WRITE_CHUNK_DOCUMENTS
     if model['mode'] == 'conservative':
@@ -485,9 +542,14 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
                 return state
             chunk_documents = WRITE_CHUNK_DOCUMENTS
     report = build(source, out, loaded, daily_limit=remaining, model=model, scope=scope,
-                   max_batch_documents=chunk_documents, committee_source=committee_source, committee_model=committee_model)
+                   max_batch_documents=chunk_documents, committee_source=committee_source, committee_model=committee_model,
+                   tables=tables, day_cap=daily_limit)
+    stopped = {}
     for batch in report['batches']:
         if batch['day'] != 1:
+            break
+        if past_deadline():
+            stopped['stopped_for_deadline'] = 'DEADLINE'  # between batches, never inside one
             break
         is_committee = bool(batch['ids'].get('committee_decisions'))
         active_model = committee_model if is_committee and committee_model else model
@@ -500,7 +562,15 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
         if digest(file.read_bytes()) != batch['sha256']:
             raise ValueError('SQL_BATCH_SHA_MISMATCH')
         if size + file.stat().st_size * 16 + 1_000_000 > DB_LIMIT:
-            raise ValueError('REMOTE_DATABASE_CAPACITY_RESERVE_EXCEEDED')
+            # No room for the next batch: end today's loading normally (counts and receipts below still
+            # run) and keep the stop on the state, with the first day of an unbroken run, for the monitor.
+            previous = state.get('capacity_stop') or {}
+            state['capacity_stop'] = dict(reason='CAPACITY_RESERVE', day=day, size=size,
+                                          first_day=previous.get('first_day', day),
+                                          batch_bytes=file.stat().st_size)
+            stopped['stopped_for_capacity'] = 'CAPACITY_RESERVE'
+            save(state_file, state)
+            break
         if not write(file, batch['write_units'], batch):
             break
         for table, ids in batch['ids'].items():
@@ -508,17 +578,23 @@ def remote_load(source, out, state_file, config, database, wrangler, execute=wra
         save(receipt_file, dict(database_id=state.get('database_id'), ids=loaded))
         if committee_source is not None:
             save(Path(committee_source) / 'd1-loaded.json', dict(database_id=state.get('database_id'), ids={'committee_decisions': loaded.get('committee_decisions', [])}))
-        size += file.stat().st_size * 16
-    record_counts(state, state_file, out, loaded, day, write)
+        size = observed_size[0] if type(observed_size[0]) is int and observed_size[0] >= 0 else size + file.stat().st_size * 16
+    if 'stopped_for_capacity' not in stopped:
+        state.pop('capacity_stop', None)
+    if deadline is None or clock() == day:
+        # A run stopped by the new UTC day leaves the counts to the next run (no write in a closed window).
+        record_counts(state, state_file, out, loaded, day, write, tables)
     # The durable GitHub state stays small: SQL ID inventories belong to the
     # build artifact, not duplicated into the quota/measurement ledger.
     state.update(last_build={k: report[k] for k in ('selected_documents', 'skipped_ids', 'estimated_days',
                  'scope_selection', 'budget_model', 'status', 'stopped_for_budget')}, updated_utc=day)
+    state['last_build'].update(stopped)
     save(state_file, state)
     return state
 
 
-def progress(source, out, state_file):
+def progress(source, out, state_file, tables=None, receipt_name='d1-loaded.json'):
+    tables = selected_tables(tables)
     manifest = strict_json((source / 'manifest.json').read_bytes()) if (source / 'manifest.json').exists() else {}
     report = strict_json((out / 'build-report.json').read_bytes()) if (out / 'build-report.json').exists() else {}
     state = strict_json(state_file.read_bytes()) if state_file.exists() else {}
@@ -529,9 +605,18 @@ def progress(source, out, state_file):
     docs = manifest.get('documents', [])
     loaded_total = sum(d.get('documents_written', 0) for d in state.get('days', {}).values())
     totals = [manifest.get('catalogs', {}).get(t, {}).get('total') for t in (TARGETS if report.get('scope_selection', {}).get('scope') == 'committee' else DEFAULT_TARGETS)]
-    estimated_total = sum(totals) if all(type(n) is int for n in totals) else None
-    successful_days = [d.get('documents_written', 0) for d in state.get('days', {}).values()
-                       if d.get('documents_written', 0) > 0]
+    written = lambda d: d.get('documents_written', 0)  # noqa: E731
+    if tables is not None:
+        # One database of several: its own catalogs, and what its remote ID inventory (this database's
+        # receipt) holds — never documents another database (or an earlier layout) loaded.
+        totals = list(report.get('catalog_totals', {}).values()) if report.get('tables') == list(tables) else [None]
+        receipt_file = source / receipt_name
+        receipt = strict_json(receipt_file.read_bytes()) if receipt_file.exists() else {}
+        ids = receipt.get('ids', {}) if receipt.get('database_id') == state.get('database_id') else {}
+        loaded_total = sum(len(ids.get(t, [])) for t in tables)
+        written = lambda d: d.get('documents_written', 0) + d.get('committee_documents_written', 0)  # noqa: E731
+    estimated_total = sum(totals) if totals and all(type(n) is int for n in totals) else None
+    successful_days = [written(d) for d in state.get('days', {}).values() if written(d) > 0]
     # Observed daily throughput includes the time cap; row-only capacity is not an ETA.
     rate = sum(successful_days) / len(successful_days) if successful_days else 0
     if isinstance(capacity, int):
@@ -548,7 +633,16 @@ def progress(source, out, state_file):
     skipped_line = f"- Permanent source failures skipped: {sum(skipped.values())}"
     if skipped:
         skipped_line += ' (' + ', '.join(f'{reason}={count}' for reason, count in sorted(skipped.items())) + ')'
-    lines = ['# Precedent D1 progress', summary, skipped_line,
+    lines = ['# Precedent D1 progress', summary, skipped_line]
+    if tables is not None:
+        lines.append(f"- Tables: {', '.join(tables)}")
+    capacity_stop = state.get('capacity_stop')
+    if isinstance(capacity_stop, dict):
+        lines.append(f"- CAPACITY_RESERVE: 다음 배치가 들어갈 자리 없음({capacity_stop.get('first_day')}부터 {capacity_stop.get('day')}까지, "
+                     f"size={capacity_stop.get('size')}) — 이어지면 DB 크기를 확인")
+    if state.get('last_build', {}).get('stopped_for_deadline'):
+        lines.append('- DEADLINE: 마감 시각에 배치 사이에서 멈춤(남은 문서는 다음 실행이 이어 감)')
+    lines += [
              '- 적재 행은 문서 행(FTS 쓰기 제외); 전체 카탈로그 수는 tax 범위의 상한. 일수는 관측 일별 처리량 기준 추정이며 초기에는 미측정.', f"- Collection: {manifest.get('status', 'NOT_STARTED')}; documents={len(docs)}, success={sum(e['status']=='SUCCESS' for e in docs)}"
              + (f"; partial public export, catalogs={','.join(manifest['partial_targets'])}" if manifest.get('partial_targets') else ''),
              f"- D1 database ID: {state.get('database_id', 'NOT_PREPARED')}; name={state.get('database_name', 'NOT_PREPARED')}",
