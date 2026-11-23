@@ -3,7 +3,7 @@ import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 import os
@@ -20,12 +20,26 @@ from bblove_law_transport import measured_transport
 from bblove_v107_pilot import category, check_date, records, sanitized, text, validate_detail
 
 
+# How the current edition's body is fetched (recorded per manifest document as `fetch`).
+# target=law&MST answered the edition as first promulgated, without amendments promulgated later
+# but already in force (probes 2026-11-23); target=eflaw with the catalog 시행일자 answers the text
+# in force on that date. Amendments not yet in force (and their 부칙) are not part of that text.
+FETCH = 'eflaw-mst-efyd-v1'
+# law.go.kr re-merges later amendments under the same MST/시행일자, so a weekly run always
+# refetches; only a run resumed within a few days reuses what it already holds.
+REUSE_WINDOW = timedelta(days=6)
+
+
+def now():
+    return datetime.now(ZoneInfo('Asia/Seoul'))
+
+
 def today():
     return datetime.now(ZoneInfo('Asia/Seoul')).strftime('%Y%m%d')
 
 
 def stamp():
-    return datetime.now(ZoneInfo('Asia/Seoul')).isoformat()
+    return now().isoformat()
 
 
 def save(path, value):
@@ -210,7 +224,7 @@ def safe_detail(exc, credential=''):
     return message[:1000]
 
 
-def validate_detail_all(doc, row, date):
+def validate_detail_all(doc, row, date, fetch=None):
     """Validate a projection using V1.07; never mutate the official document.
 
     Only whitespace-equivalent names, duplicate article numbers and explicitly
@@ -250,7 +264,7 @@ def validate_detail_all(doc, row, date):
             basic['시행일자'] = exp_date
             warnings.append({'code': 'detail_date_after_today' if act_date > date
                              else 'effective_date_differs_from_catalog',
-                             'catalog': exp_date, 'detail': act_date})
+                             'catalog': exp_date, 'detail': act_date, **({'fetch': fetch} if fetch else {})})
     section = law.get('조문')
     units = section.get('조문단위') if isinstance(section, dict) else None
     parsed = records(units)
@@ -286,11 +300,11 @@ def validate_detail_all(doc, row, date):
     return validate_detail(projected, row, date), warnings
 
 
-def validate_raw(raw, row, date, *, with_warnings=False):
+def validate_raw(raw, row, date, *, with_warnings=False, fetch=None):
     if credential_markers(raw):
         raise ValueError('CREDENTIAL_MARKER')
     doc = strict_json(raw)
-    count, warnings = validate_detail_all(doc, row, date)
+    count, warnings = validate_detail_all(doc, row, date, fetch)
     basic = doc['법령']['기본정보']
     if text(basic, '공포일자') != text(row, '공포일자'):
         raise ValueError('PUBLICATION_MISMATCH')
@@ -350,48 +364,132 @@ def validate_fallback(raw, original, entry, date):
     return count, warnings
 
 
+class EditionMismatch(ValueError):
+    """The fetched body is not the catalog's current edition."""
+
+
+def fetch_params(entry):
+    return {'target': 'eflaw', 'MST': entry['mst'], 'efYd': entry['effective']}
+
+
+def recent(collected_at, current=None):
+    try:
+        then = datetime.fromisoformat(collected_at)
+    except (TypeError, ValueError):
+        return False
+    if then.tzinfo is None:
+        return False
+    return timedelta(0) <= (current or now()) - then <= REUSE_WINDOW
+
+
+def reusable(old, row):
+    """A receipt may stand in for a fetch only if it used this method, this edition and is recent."""
+    return (old.get('fetch') == FETCH and old.get('mst') == text(row, '법령일련번호')
+            and old.get('effective') == text(row, '시행일자') and recent(old.get('collected_at')))
+
+
+def _promulgation_number(value):
+    value = str(value or '').strip()
+    return str(int(value)) if value.isdigit() else value
+
+
+def bind_current(raw, entry):
+    """Tie the response to the catalog row; never rewrite it to the catalog's values.
+
+    Shapes that cannot be read are left to validate_raw (DETAIL_VALIDATION_FAILED).
+    """
+    try:
+        law = strict_json(raw).get('법령')
+        basic = law.get('기본정보')
+    except Exception:
+        return
+    if not isinstance(basic, dict):
+        return
+    row = entry['row']
+    def mismatch(field, catalog, detail):
+        raise EditionMismatch(f'{field}: catalog={str(catalog)[:40]} detail={str(detail)[:40]}')
+    if text(basic, '법령ID') != text(row, '법령ID'):
+        mismatch('id', text(row, '법령ID'), text(basic, '법령ID'))
+    mst = text(law, '법령일련번호') or text(basic, '법령일련번호')
+    if mst:
+        if mst != text(row, '법령일련번호'):
+            mismatch('mst', text(row, '법령일련번호'), mst)
+    else:
+        # DRF omits 법령일련번호 in bodies (probes): bind by promulgation date and number instead.
+        if text(basic, '공포일자') != text(row, '공포일자'):
+            mismatch('published', text(row, '공포일자'), text(basic, '공포일자'))
+        number, expected = _promulgation_number(text(basic, '공포번호')), _promulgation_number(text(row, '공포번호'))
+        if not number or number != expected:
+            mismatch('number', expected, number)
+    if text(basic, '시행일자') != text(row, '시행일자'):
+        mismatch('effective', text(row, '시행일자'), text(basic, '시행일자'))
+
+
+def addenda_keys(raw):
+    law = strict_json(raw).get('법령')
+    section = law.get('부칙') if isinstance(law, dict) else None
+    units = records(section.get('부칙단위')) if isinstance(section, dict) else []
+    return Counter((text(u, '부칙공포일자'), text(u, '부칙공포번호')) for u in units)
+
+
+def dropped_addenda(old_raw, new_raw, lid):
+    """공포일자/공포번호 of addenda in the previous RAW of the same 법령ID but not in the new one."""
+    try:
+        old = strict_json(old_raw).get('법령')
+        if text(old.get('기본정보'), '법령ID') != lid:
+            return None
+        gone = addenda_keys(old_raw) - addenda_keys(new_raw)
+    except Exception:
+        return None
+    return [f'{date}/{number}' for date, number in sorted(gone.elements())]
+
+
 def collect_entry(client, out, entry, old, date):
     entry = dict(entry)
     phase = 'RAW_CACHE_READ_FAILED'
     try:
         file = out / entry['path']
         raw = file.read_bytes() if file.exists() else b''
-        reuse = (old.get('mst') == entry['mst'] and
+        reuse = (reusable(old, entry['row']) and
                  (old.get('status') == 'SUCCESS' or old.get('reason') == 'DETAIL_VALIDATION_FAILED'
                   or old.get('raw_status') in {'SUCCESS', 'DETAIL_VALIDATION_FAILED'}) and
                  old.get('sha256') == hashlib.sha256(raw).hexdigest())
         if not reuse:
-            entry.pop('detail_source', None)
-            entry.pop('fallback_reason', None)
+            for key in ('detail_source', 'fallback_reason', 'dropped_addenda'):
+                entry.pop(key, None)
             phase = 'DETAIL_FETCH_FAILED'
-            _, raw = client.get('lawService.do', {'target': 'law', 'MST': entry['mst']}, original=True)
-            # Persist safe RAW before semantic validation, including failing originals.
-            if credential_markers(raw):
+            # One request per document. The eflaw answer is already the fallback the old
+            # target=law path used for repeal-only bodies, so no second request is made.
+            _, fresh = client.get('lawService.do', fetch_params(entry), original=True)
+            if credential_markers(fresh):
                 raise ValueError('CREDENTIAL_BEARING_ORIGINAL_NOT_PERSISTED')
+            bind_current(fresh, entry)  # a mismatched body is never written
+            if raw:
+                dropped = dropped_addenda(raw, fresh, entry['id'])
+                if dropped is not None:
+                    entry['dropped_addenda'] = dropped
+            raw = fresh
+            # Persist safe RAW before semantic validation, including failing originals.
             phase = 'RAW_WRITE_FAILED'
             file.parent.mkdir(parents=True, exist_ok=True)
             tmp = file.with_suffix('.tmp')
             tmp.write_bytes(raw)
             tmp.replace(file)
-        entry.update(sha256=hashlib.sha256(raw).hexdigest(),
+        else:
+            bind_current(raw, entry)
+            entry.update({k: old[k] for k in ('dropped_addenda',) if k in old})
+        entry.update(sha256=hashlib.sha256(raw).hexdigest(), fetch=FETCH,
                      collected_at=old.get('collected_at', stamp()) if reuse else stamp(), reused=reuse)
         phase = 'DETAIL_VALIDATION_FAILED'
-        if reuse:
-            entry.update({k: old[k] for k in ('detail_source', 'fallback_reason') if k in old})
-        if repeal_only(raw):
-            _, candidate = client.get('lawService.do',
-                {'target': 'eflaw', 'MST': entry['mst'], 'efYd': entry['effective']},
-                original=True, attempts=1)
-            validate_fallback(candidate, raw, entry, date)
-            tmp = file.with_suffix('.tmp')
-            tmp.write_bytes(candidate)
-            tmp.replace(file)
-            raw = candidate
-            entry.update(sha256=hashlib.sha256(raw).hexdigest(), collected_at=stamp(),
-                         reused=False, detail_source='eflaw-fallback',
-                         fallback_reason='LAW_TARGET_REPEAL_ONLY')
-        _, count, warnings = validate_raw(raw, entry['row'], date, with_warnings=True)
+        _, count, warnings = validate_raw(raw, entry['row'], date, with_warnings=True, fetch=FETCH)
         entry.update(status='SUCCESS', raw_status='SUCCESS', articles=count, warnings=warnings)
+    except EditionMismatch as exc:
+        # Not the current edition: keep no body (nor a stale one) for this document.
+        file.unlink(missing_ok=True)
+        for key in ('sha256', 'collected_at', 'raw_status', 'fetch', 'dropped_addenda'):
+            entry.pop(key, None)
+        entry.update(reused=reuse, status='FAILED', reason='CURRENT_EDITION_MISMATCH',
+                     detail=safe_detail(exc, getattr(client, 'credential', '')))
     except Exception as exc:
         if phase == 'DETAIL_VALIDATION_FAILED':
             entry['raw_status'] = 'DETAIL_VALIDATION_FAILED'
@@ -423,9 +521,9 @@ def collect(client, out, date, *, outcome=None):
                 'published': text(row, '공포일자'), 'row': row, 'status': 'PENDING'})
             old = cached.get(lid, {})
             state = old.get('raw_status') or (old.get('reason') if old.get('status') == 'FAILED' else old.get('status'))
-            if old.get('mst') == text(row, '법령일련번호') and state in {'SUCCESS', 'DETAIL_VALIDATION_FAILED'}:
+            if reusable(old, row) and state in {'SUCCESS', 'DETAIL_VALIDATION_FAILED'}:
                 # Preserve known RAW receipts even if this run stops before replaying this entry.
-                manifest['documents'][-1].update({k: old[k] for k in ('sha256', 'collected_at', 'detail_source', 'fallback_reason') if k in old})
+                manifest['documents'][-1].update({k: old[k] for k in ('sha256', 'collected_at', 'fetch', 'dropped_addenda') if k in old})
                 manifest['documents'][-1]['raw_status'] = state
     except Exception as exc:
         outcome['budget_only'] = isinstance(exc, PilotBlocked) and str(exc) == 'COLLECTION_BUDGET_EXHAUSTED'

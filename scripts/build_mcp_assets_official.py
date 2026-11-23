@@ -112,7 +112,7 @@ def load_groups(source, date, annexes=None, annex_skips=None, addenda=None, adde
                 text(row, '법령ID'), text(row, '법령일련번호'), text(row, '시행일자'),
                 text(row, '공포일자'), text(row, '법령명한글', '법령명_한글')):
             raise ValueError('MANIFEST_METADATA_MISMATCH')
-        doc, count, warnings = validate_raw(raw, row, date, with_warnings=True)
+        doc, count, warnings = validate_raw(raw, row, date, with_warnings=True, fetch=entry.get('fetch'))
         if entry.get('warnings', []) != warnings:
             raise ValueError('VALIDATION_WARNINGS_MISMATCH')
         if annexes is not None:
