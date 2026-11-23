@@ -57,6 +57,29 @@ class WorkflowStructureTests(unittest.TestCase):
             self.assertEqual(restore['restore-keys'].strip(), restore['key'].split('${{ github.run_id }}')[0])
         self.assertEqual(step_by_id(j, 'collect')['env']['LAW_OC'], '${{ secrets.LAW_OC }}')
 
+    def test_law_collector_resume_schedule_and_permissions(self):
+        from workflow_contract import job, steps, step_by_id
+        wf = load_workflow(ROOT / '.github/workflows/collect-law-all.yml')
+        self.assertEqual(set(wf['on']), {'workflow_dispatch', 'schedule'})
+        self.assertEqual(wf['on']['schedule'],
+                         [{'cron': f'20 16 * * {day}'} for day in range(3)])
+        self.assertEqual(wf['permissions'], {})
+        j = job(wf, 'collect')
+        self.assertEqual(j['permissions'], {'contents': 'write', 'id-token': 'write', 'attestations': 'write'})
+        ordered = steps(j)
+        restore = next(s for s in ordered if s.get('uses', '').startswith('actions/cache/restore@'))
+        decision = step_by_id(j, 'resume')
+        self.assertLess(ordered.index(restore), ordered.index(decision))
+        for id in ('credential', 'egress', 'collect', 'scan_raw', 'progress'):
+            guarded = step_by_id(j, id)
+            self.assertLess(ordered.index(decision), ordered.index(guarded))
+            self.assertIn("steps.resume.outputs.skip != 'true'", guarded['if'])
+        self.assertIn('github.event.schedule', str(decision))
+        for step in ordered:
+            action = step.get('uses', './')
+            if not action.startswith('./'):
+                self.assertRegex(action, r'@[0-9a-f]{40}$')
+
     def test_helpers_preserve_values_and_reference_locations(self):
         from workflow_contract import job, steps, step_by_name, step_by_uses, step_by_id, expressions, env_refs, inputs_refs
         wf = load_workflow(ROOT / 'tests/fixtures/workflow_schedule_inputs.yml')
