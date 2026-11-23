@@ -2,13 +2,16 @@
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from contextlib import contextmanager
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import date as calendar_date, datetime, timedelta
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import time
 import threading
 from zoneinfo import ZoneInfo
@@ -28,14 +31,19 @@ FETCH = 'eflaw-mst-efyd-v1'
 # law.go.kr re-merges later amendments under the same MST/시행일자, so a weekly run always
 # refetches; only a run resumed within a few days reuses what it already holds.
 REUSE_WINDOW = timedelta(days=6)
+DAILY_CALL_LIMIT = 3500
+DAILY_CALL_CAP = 'DAILY_CALL_CAP'
+BUDGET_REASONS = {'COLLECTION_BUDGET_EXHAUSTED', DAILY_CALL_CAP}
+DAILY_LEDGER = 'daily-calls.json'
+KST = ZoneInfo('Asia/Seoul')
 
 
 def now():
-    return datetime.now(ZoneInfo('Asia/Seoul'))
+    return datetime.now(KST)
 
 
 def today():
-    return datetime.now(ZoneInfo('Asia/Seoul')).strftime('%Y%m%d')
+    return datetime.now(KST).strftime('%Y%m%d')
 
 
 def stamp():
@@ -47,6 +55,195 @@ def save(path, value):
     tmp = path.with_suffix(path.suffix + '.tmp')
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     tmp.replace(path)
+
+
+def daily_limit(value):
+    if value is None:
+        return DAILY_CALL_LIMIT
+    if not re.fullmatch(r'[0-9]{1,4}', value) or not 1 <= int(value) <= DAILY_CALL_LIMIT:
+        raise ValueError('LAW_ALL_DAILY_CALLS_INVALID')
+    return int(value)
+
+
+def ledger_usage(record, day):
+    date = calendar_date.fromisoformat(record['date'])
+    calls = record['calls']
+    if (set(record) != {'date', 'calls'} or record['date'] != date.isoformat() or date > day
+            or type(calls) is not int or not 0 <= calls <= DAILY_CALL_LIMIT):
+        raise ValueError('DAILY_CALL_LEDGER_INVALID')
+    return calls if date == day else 0
+
+
+class DailyLedgerError(RuntimeError):
+    """A local or durable reservation could not be confirmed."""
+
+
+class DailyCalls:
+    def __init__(self, out, limit, remote=None):
+        self.path = out / DAILY_LEDGER
+        self.limit = limit
+        self.remote = remote
+        self.stopped = False
+
+    @contextmanager
+    def locked(self):
+        # Lock the directory so atomic replacement of the ledger cannot split the lock.
+        fd = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield fd
+        except OSError:
+            raise DailyLedgerError('DAILY_CALL_LEDGER_IO_FAILED') from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def used(self, day, fd):
+        try:
+            raw = self.path.read_bytes()
+        except FileNotFoundError:
+            return 0
+        try:
+            return ledger_usage(strict_json(raw), day)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            # Fail closed all day, including if the cap is raised on a subsequent run.
+            self.write(day, DAILY_CALL_LIMIT, fd)
+            return DAILY_CALL_LIMIT
+
+    def write(self, day, calls, fd):
+        tmp = self.path.with_suffix('.json.tmp')
+        with tmp.open('w', encoding='utf-8') as f:
+            json.dump({'date': day.isoformat(), 'calls': calls}, f)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(self.path)
+        os.fsync(fd)
+
+    def reserve(self, needed=1, *, consume=False):
+        with self.locked() as fd:
+            while True:
+                day = now().date()
+                used = self.used(day, fd)
+                if self.remote and self.limit - used >= needed:
+                    persisted = self.remote.reserve(day, used, self.limit, needed)
+                    if persisted > used:
+                        self.write(day, persisted, fd)
+                        used = persisted
+                if self.limit - used < needed:
+                    self.stopped = True
+                    raise PilotBlocked(DAILY_CALL_CAP)
+                if not consume:
+                    return
+                self.write(day, used + 1, fd)
+                # If the write straddles midnight, charge both days before the request.
+                if self.remote:
+                    self.remote.record(day, used + 1)
+                if now().date() == day:
+                    return
+
+    def report(self):
+        with self.locked() as fd:
+            return self.used(now().date(), fd)
+
+
+class GitHubDailyCalls:
+    """Keep the reservation across hosted runners even if a checkpoint cannot be saved."""
+    TAG = 'collector-daily-calls'
+
+    def __init__(self, repository, commit, token):
+        self.repository = repository
+        self.commit = commit
+        self.token = token
+        self.day = None
+        self.calls = 0
+        self.claimed = False
+
+    def api(self, method, path, payload=None):
+        cmd = ['gh', 'api', '--method', method, f'repos/{self.repository}/git/{path}']
+        body = None
+        if payload is not None:
+            cmd += ['--input', '-']
+            body = json.dumps(payload)
+        # Keep the law credential and its egress proxy confined to the collector.
+        env = {key: os.environ[key] for key in ('PATH', 'HOME') if key in os.environ}
+        env['GH_TOKEN'] = self.token
+        try:
+            result = subprocess.run(cmd, input=body, text=True, capture_output=True, check=True,
+                                    timeout=20, env=env)
+            return json.loads(result.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raise DailyLedgerError('DAILY_CALL_REMOTE_LEDGER_FAILED') from None
+
+    def lookup(self, day):
+        refs = self.api('GET', f'matching-refs/tags/{self.TAG}')
+        try:
+            if not isinstance(refs, list):
+                raise ValueError('DAILY_CALL_REMOTE_REFS_INVALID')
+            ref = next((r for r in refs if r['ref'] == f'refs/tags/{self.TAG}'), None)
+            if ref is None:
+                return None, 0
+            sha = ref['object']['sha']
+            obj = self.api('GET', f'tags/{sha}')
+            return sha, ledger_usage(strict_json(obj['message'].encode()), day)
+        except (AttributeError, ValueError, TypeError, KeyError, OverflowError):
+            raise DailyLedgerError('DAILY_CALL_REMOTE_LEDGER_INVALID') from None
+
+    def publish(self, day, calls, previous):
+        # The workflow concurrency group serializes writers across runner lifetimes.
+        tag = self.api('POST', 'tags', {
+            'tag': self.TAG, 'message': json.dumps({'date': day.isoformat(), 'calls': calls}),
+            'object': self.commit, 'type': 'commit',
+            'tagger': {'name': 'github-actions[bot]',
+                       'email': 'github-actions[bot]@users.noreply.github.com'},
+        })
+        if previous:
+            self.api('PATCH', f'refs/tags/{self.TAG}', {'sha': tag['sha'], 'force': True})
+        else:
+            self.api('POST', 'refs', {'ref': f'refs/tags/{self.TAG}', 'sha': tag['sha']})
+        return tag['sha']
+
+    def reserve(self, day, used, limit, needed):
+        if day != self.day:
+            self.settle()
+            self.previous, persisted = self.lookup(day)
+            self.day, self.calls = day, max(persisted, used)
+        start = max(self.calls, used)
+        if not self.claimed and limit - start >= needed:
+            # Reserve the whole available balance before the first possible transport.
+            # An interrupted run keeps this pessimistic balance on GitHub.
+            self.previous = self.publish(day, limit, self.previous)
+            self.claimed = True
+        return start
+
+    def record(self, day, calls):
+        if self.day == day and self.claimed:
+            self.calls = calls
+
+    def settle(self):
+        if self.claimed:
+            self.publish(self.day, self.calls, self.previous)
+            self.claimed = False
+
+
+def budget_reason(exc):
+    if isinstance(exc, PilotBlocked) and str(exc) in BUDGET_REASONS:
+        return str(exc)
+
+
+def resume_not_needed(manifest, current):
+    if manifest.get('status') != 'COMPLETE':
+        return False
+    try:
+        completed = datetime.fromisoformat(manifest.get('completed_at'))
+    except (TypeError, ValueError):
+        return False
+    if completed.tzinfo is None:
+        return False
+    monday = (current - timedelta(days=current.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    return monday <= completed <= current
 
 
 # 대법원규칙(민사소송규칙·가사소송규칙·부동산등기규칙 등): 소장·신청서의 기재사항·첨부서류가 여기 있다.
@@ -65,13 +262,14 @@ def collection_category(row):
 
 class Client:
     """Three bounded in-flight requests, per-thread spacing and shared cooldown."""
-    def __init__(self, credential, seconds=3500, transport=None, interval=.3):
+    def __init__(self, credential, seconds=3500, transport=None, interval=.3, daily=None):
         self.credential = credential
         # Minimum spacing between request starts per thread (law.go.kr may stop answering heavy callers).
         self.interval = max(.3, float(interval))
         self.deadline = time.monotonic() + min(seconds, 3500)
         self.transport = transport or measured_transport
         self.calls = 0
+        self.daily = daily
         self.lock = threading.Lock()
         self.slots = threading.BoundedSemaphore(3)
         self.local = threading.local()
@@ -116,6 +314,11 @@ class Client:
                 if now + delay + 32 >= self.deadline or self.calls >= 30000:
                     raise PilotBlocked('COLLECTION_BUDGET_EXHAUSTED')
                 if delay <= 0:
+                    if self.daily:
+                        self.daily.reserve(consume=True)
+                        now = time.monotonic()
+                        if now + 32 >= self.deadline:
+                            raise PilotBlocked('COLLECTION_BUDGET_EXHAUSTED')
                     self.calls += 1
                     self.local.last = now
                     return
@@ -314,7 +517,7 @@ def validate_raw(raw, row, date, *, with_warnings=False, fetch=None):
 
 def collection_complete(documents):
     return bool(documents) and all(e.get('status') in {'SUCCESS', 'FAILED'} and
-        e.get('reason') != 'COLLECTION_BUDGET_EXHAUSTED' for e in documents)
+        e.get('reason') not in BUDGET_REASONS for e in documents)
 
 
 def failure_report(documents):
@@ -496,16 +699,18 @@ def collect_entry(client, out, entry, old, date):
         discard(file, entry)
         entry.update(reused=reuse, status='FAILED', reason='CURRENT_EDITION_MISMATCH',
                      detail=safe_detail(exc, getattr(client, 'credential', '')))
+    except DailyLedgerError:
+        raise
     except Exception as exc:
-        if replaced and phase == 'DETAIL_FETCH_FAILED':
+        reason = budget_reason(exc)
+        if replaced and phase == 'DETAIL_FETCH_FAILED' and reason != DAILY_CALL_CAP:
             # The old RAW came from another fetch or is too old to stand in; the release zips
             # this folder, so it must not stay next to a FAILED entry as if it were current.
             discard(file, entry)
         if phase == 'DETAIL_VALIDATION_FAILED':
             entry['raw_status'] = 'DETAIL_VALIDATION_FAILED'
-        entry.update(status='FAILED', reason='COLLECTION_BUDGET_EXHAUSTED'
-                     if isinstance(exc, PilotBlocked) and str(exc) == 'COLLECTION_BUDGET_EXHAUSTED'
-                     else phase, detail=safe_detail(exc, getattr(client, 'credential', '')))
+        entry.update(status='FAILED', reason=reason or phase,
+                     detail=safe_detail(exc, getattr(client, 'credential', '')))
     return entry
 
 
@@ -519,6 +724,11 @@ def collect(client, out, date, *, outcome=None):
     manifest = {'schema': 2, 'date': date, 'started_at': stamp(), 'status': 'INCOMPLETE',
                 'list_count': 0, 'api_calls': 0, 'documents': []}
     try:
+        daily = getattr(client, 'daily', None)
+        if daily:
+            count = previous.get('list_count')
+            pages = (count + 99) // 100 if type(count) is int and count > 0 else 60
+            daily.reserve(pages)
         rows, total = catalog(client, date)
         groups = grouping(rows)
         manifest['list_count'] = total
@@ -535,8 +745,10 @@ def collect(client, out, date, *, outcome=None):
                 # Preserve known RAW receipts even if this run stops before replaying this entry.
                 manifest['documents'][-1].update({k: old[k] for k in ('sha256', 'collected_at', 'fetch', 'dropped_addenda') if k in old})
                 manifest['documents'][-1]['raw_status'] = state
+    except DailyLedgerError:
+        raise
     except Exception as exc:
-        outcome['budget_only'] = isinstance(exc, PilotBlocked) and str(exc) == 'COLLECTION_BUDGET_EXHAUSTED'
+        outcome['budget_only'] = budget_reason(exc) is not None
         save(out / 'attempt.json', {'status': 'FAILED', 'reason': 'CATALOG_FAILED',
              'detail': safe_detail(exc, getattr(client, 'credential', '')), 'api_calls': client.calls})
         return False
@@ -564,7 +776,7 @@ def collect(client, out, date, *, outcome=None):
                 result = future.result()
                 manifest['documents'][index] = result
                 processed += 1
-                budget_exhausted |= result.get('reason') == 'COLLECTION_BUDGET_EXHAUSTED'
+                budget_exhausted |= result.get('reason') in BUDGET_REASONS
             manifest.update(api_calls=client.calls, elapsed_seconds=round(time.monotonic()-start, 2))
             if processed - checkpoint_count >= 25 or time.monotonic() - last_checkpoint >= 5 or budget_exhausted:
                 checkpoint_start = time.monotonic()
@@ -573,7 +785,7 @@ def collect(client, out, date, *, outcome=None):
                 last_checkpoint, checkpoint_count = time.monotonic(), processed
     documents = manifest['documents']
     outcome['budget_only'] = bool(documents) and all(
-        e['status'] in {'SUCCESS', 'PENDING'} or e.get('reason') == 'COLLECTION_BUDGET_EXHAUSTED'
+        e['status'] in {'SUCCESS', 'PENDING'} or e.get('reason') in BUDGET_REASONS
         for e in documents)
     manifest['status'] = 'COMPLETE' if collection_complete(documents) else 'INCOMPLETE'
     manifest.update(completed_at=stamp(), api_calls=client.calls,
@@ -599,14 +811,44 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', type=Path, default=Path('auto/official-all'))
     ap.add_argument('--partial-ok', action='store_true',
-                    help='exit 0 when the run stopped only at the time budget; next run resumes')
+                    help='exit 0 when the run stopped only at a collection budget; next run resumes')
+    ap.add_argument('--check-resume', action='store_true',
+                    help='check the cached manifest without accessing the API or its credential')
     args = ap.parse_args()
+    if args.check_resume:
+        manifest_path = args.out / 'manifest.json'
+        manifest = strict_json(manifest_path.read_bytes()) if manifest_path.exists() else {}
+        if resume_not_needed(manifest, now()):
+            write_outputs(skip='true')
+            summary = os.environ.get('GITHUB_STEP_SUMMARY')
+            if summary:
+                with open(summary, 'a', encoding='utf-8') as fh:
+                    fh.write('이어받을 것 없음\n')
+        return 0
+    try:
+        limit = daily_limit(os.environ.get('LAW_ALL_DAILY_CALLS'))
+    except ValueError as exc:
+        print(str(exc))
+        write_step_output(False)
+        return 1
+    token = os.environ.pop('LAW_ALL_GITHUB_LEDGER_TOKEN', '')
+    remote = GitHubDailyCalls(os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_SHA'], token) if token else None
+    daily = DailyCalls(args.out, limit, remote)
     credential = os.environ.get('LAW_OC', '')
     if not credential:
         print('LAW_OC_NOT_AVAILABLE')
         return 1
     outcome = {}
-    ok = collect(Client(credential), args.out, today(), outcome=outcome)
+    try:
+        ok = collect(Client(credential, daily=daily), args.out, today(), outcome=outcome)
+        if remote:
+            remote.settle()
+        used = daily.report()
+    except DailyLedgerError as exc:
+        print(str(exc))
+        write_step_output(False)
+        return 1
+    write_outputs(daily_calls=used, daily_limit=limit, daily_cap_stop=int(daily.stopped))
     print('COLLECTION_COMPLETE' if ok else 'COLLECTION_INCOMPLETE')
     write_step_output(ok)
     # Only this invocation's budget outcome qualifies; old manifests cannot hide list failures.
@@ -615,10 +857,15 @@ def main():
 
 def write_step_output(complete):
     """Expose completion to later workflow steps; build/publish/deploy run only when complete."""
+    write_outputs(complete='true' if complete else 'false')
+
+
+def write_outputs(**values):
     target = os.environ.get('GITHUB_OUTPUT')
     if target:
         with open(target, 'a', encoding='utf-8') as fh:
-            fh.write(f"complete={'true' if complete else 'false'}\n")
+            for key, value in values.items():
+                fh.write(f'{key}={value}\n')
 
 
 if __name__ == '__main__':
