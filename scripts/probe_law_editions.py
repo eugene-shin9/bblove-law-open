@@ -51,28 +51,54 @@ def _number(value):
     return int(value) if re.fullmatch(r'\d+', value) else 0
 
 
-def _strings(value):
+def _strings(value, issues):
     if isinstance(value, str):
         yield value
     elif isinstance(value, list):
         for item in value:
-            yield from _strings(item)
+            yield from _strings(item, issues)
+    elif value is not None:
+        issues.append('content')  # dict/number where text was expected: cannot compare it
 
 
-def wording(node):
-    """조문·항·호·목 text only, whitespace collapsed; field names, order and metadata excluded."""
+def _children(value, issues):
+    """항·호·목 children; any non-dict item (e.g. a list wrapped once more) is a shape issue."""
+    if value is None or value == '':
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list) and all(isinstance(v, dict) for v in value):
+        return value
+    issues.append('children')
+    found = []
+    def dig(v):  # still read what is there, but the law is flagged as not comparable
+        if isinstance(v, dict):
+            found.append(v)
+        elif isinstance(v, list):
+            for item in v:
+                dig(item)
+    dig(value)
+    return found
+
+
+def wording(node, issues=None):
+    """조문·항·호·목 text only, whitespace collapsed; field names, order and metadata excluded.
+
+    Shapes the walk cannot read losslessly are appended to `issues` (never ignored silently).
+    """
+    issues = [] if issues is None else issues
     parts = []
     def walk(n):
         for key in CONTENT:
-            parts.extend(' '.join(s.split()) for s in _strings(n.get(key)) if s.strip())
+            parts.extend(' '.join(s.split()) for s in _strings(n.get(key), issues) if s.strip())
         for key in CHILDREN:
-            for child in records(n.get(key)):
+            for child in _children(n.get(key), issues):
                 walk(child)
     walk(node)
     return '\n'.join(parts)
 
 
-def labelled(units):
+def labelled(units, issues):
     """[(label, wording)] in source order; label is the article number (or heading position)."""
     result, seen = [], Counter()
     for unit in units:
@@ -83,7 +109,11 @@ def labelled(units):
         seen[label] += 1
         if seen[label] > 1:
             label += f'#{seen[label]}'
-        result.append((label, wording(unit)))
+        words = wording(unit, issues)
+        if not words and text(unit, '조문여부') != '전문' and not (
+                text(unit, '조문제목') == '삭제' or text(unit, '조문삭제여부') in {'Y', '삭제'}):
+            issues.append('empty_article')
+        result.append((label, words))
     return result
 
 
@@ -106,8 +136,11 @@ def summarize(doc, lid, row, today, spec):
         return {'status': 'NO_LAW_IN_RESPONSE'}, None
     basic = law['기본정보']
     section = law.get('조문') if isinstance(law.get('조문'), dict) else {}
-    units = records(section.get('조문단위'))
-    pairs = labelled(units)
+    issues = []
+    units = _children(section.get('조문단위'), issues)
+    pairs = labelled(units, issues)
+    annex = law.get('별표') if isinstance(law.get('별표'), dict) else {}
+    annexes = [(text(u, '별표번호'), text(u, '별표가지번호'), text(u, '별표구분')) for u in records(annex.get('별표단위'))]
     effective = text(basic, '시행일자')
     addenda = addenda_keys(law)
     mst = text(law, '법령일련번호') or text(basic, '법령일련번호')
@@ -116,11 +149,11 @@ def summarize(doc, lid, row, today, spec):
         'effective_le_today': bool(re.fullmatch(r'\d{8}', effective)) and effective <= today,
         'mst_in_response': ('MATCH' if mst == text(row, '법령일련번호') else 'DIFFERENT') if mst else 'ABSENT',
         'articles': sum(text(u, '조문여부') not in ('N', '전문') for u in units),
-        'addenda': len(addenda),
+        'addenda': len(addenda), 'annexes': len(annexes), 'shape_issues': len(issues),
         'wording_sha256': hashlib.sha256('\n'.join(w for _, w in pairs).encode('utf-8')).hexdigest()}
     if spec[4] is not None:
         result['marker'] = marker_present(units, spec[2], spec[3], spec[4])
-    return result, {'pairs': pairs, 'addenda': addenda}
+    return result, {'pairs': pairs, 'addenda': addenda, 'annexes': annexes}
 
 
 def difference(a, b):
@@ -131,7 +164,10 @@ def difference(a, b):
     ca, cb = Counter(a['addenda']), Counter(b['addenda'])
     def listed(counter):
         return [f'{d}/{n}' for (d, n), k in sorted(counter.items()) for _ in range(k)]
+    xa, xb = Counter(a['annexes']), Counter(b['annexes'])
     return {'wording_equal': not changed, 'changed_articles_count': len(changed),
+            'annexes_only_in_law_mst': ['-'.join(k) for k in sorted((xa - xb).elements())],
+            'annexes_only_in_eflaw': ['-'.join(k) for k in sorted((xb - xa).elements())],
             'changed_articles': changed[:DIFF_LIST_LIMIT],
             'addenda_only_in_law_mst': listed(ca - cb), 'addenda_only_in_eflaw': listed(cb - ca)}
 
@@ -193,9 +229,15 @@ def verdict(results, comparisons):
     markers = all(b.get(s[0], {}).get('marker') == '있음' for s in LAWS if s[4] is not None)
     bound = all(r.get('status') == 'SUCCESS' and r.get('id_matches') and r.get('effective_le_today')
                 for r in b.values()) and len(b) == len(LAWS)
+    # "Read nothing" or "read the same broken shape on both sides" must never pass as "equal".
+    bodies = [r for r in results if r['request'] in METHODS]
+    readable = (len(bodies) == 2 * len(LAWS) and all(
+        r.get('status') == 'SUCCESS' and r.get('articles', 0) > 0 and r.get('shape_issues') == 0 for r in bodies)
+        and all(r.get('addenda', 0) > 0 for r in bodies if r['law'] in
+                {s[0] for s in LAWS if s[4] is None}))
     controls = all(c.get('wording_equal') is True for c in comparisons if c['control'])
     addenda = all('status' not in c and not c['addenda_only_in_law_mst'] for c in comparisons)
-    checks = {'markers_present_in_eflaw': markers, 'eflaw_id_and_date_ok': bound,
+    checks = {'bodies_readable': readable, 'markers_present_in_eflaw': markers, 'eflaw_id_and_date_ok': bound,
               'controls_wording_equal': controls, 'no_addenda_missing_in_eflaw': addenda}
     return {**checks, 'stage2_method_b': all(checks.values())}
 
@@ -204,28 +246,30 @@ def table(results, comparisons, gate, attempts):
     yes = {True: '예', False: '아니오', None: ''}
     lines = [f'### 현행 본문 조회 ⓐ law+MST / ⓑ eflaw+MST+efYd 비교 (전송 시도 {attempts}/{CALL_LIMIT}회)', '',
              '| 법령ID | 조회 | 상태 | ID 일치 | 시행일자 | 시행일≤오늘 | 공포일자 | 공포번호 | 응답 MST | 조문 수 | 부칙 수 '
-             '| 문안 sha256(앞 12자) | 표지 |', '|' + '---|' * 13]
+             '| 별표 수 | 형태 이상 | 문안 sha256(앞 12자) | 표지 |', '|' + '---|' * 15]
     for r in results:
         if r['request'] == 'catalog':
             lines.append(f"| {r['law']} | 목록 | {r['status']} | | {r.get('effective', '')} | | "
-                         f"{r.get('published', '')} | | {r.get('mst', '')} | | | | |")
+                         f"{r.get('published', '')} | | {r.get('mst', '')} | | | | | | |")
             continue
         name = 'ⓐ law-mst' if r['request'] == 'law-mst' else 'ⓑ eflaw-mst-efyd'
         lines.append(f"| {r['law']} | {name} | {r['status']} | {yes[r.get('id_matches')]} | "
                      f"{r.get('effective', '')} | {yes[r.get('effective_le_today')]} | {r.get('published', '')} | "
                      f"{r.get('number', '')} | {r.get('mst_in_response', '')} | {r.get('articles', '')} | "
-                     f"{r.get('addenda', '')} | {(r.get('wording_sha256') or '')[:12]} | {r.get('marker', '')} |")
-    lines += ['', '| 법령ID | 대조군 | 문안 ⓐ=ⓑ | 문안이 다른 조문 | ⓐ에만 있는 부칙(공포일자/번호) | ⓑ에만 있는 부칙 |',
-              '|---|---|---|---|---|---|']
+                     f"{r.get('addenda', '')} | {r.get('annexes', '')} | {r.get('shape_issues', '')} | "
+                     f"{(r.get('wording_sha256') or '')[:12]} | {r.get('marker', '')} |")
+    lines += ['', '| 법령ID | 대조군 | 문안 ⓐ=ⓑ | 문안이 다른 조문 | ⓐ에만 있는 부칙(공포일자/번호) | ⓑ에만 있는 부칙 '
+              '| ⓐ에만 있는 별표 | ⓑ에만 있는 별표 |', '|---|---|---|---|---|---|---|---|']
     for c in comparisons:
         if 'status' in c:
-            lines.append(f"| {c['law']} | {yes[c['control']]} | {c['status']} | | | |")
+            lines.append(f"| {c['law']} | {yes[c['control']]} | {c['status']} | | | | | |")
             continue
         changed = ', '.join(c['changed_articles'])
         if c['changed_articles_count'] > len(c['changed_articles']):
             changed += f" 외 {c['changed_articles_count'] - len(c['changed_articles'])}개"
         lines.append(f"| {c['law']} | {yes[c['control']]} | {yes[c['wording_equal']]} | {changed} | "
-                     f"{', '.join(c['addenda_only_in_law_mst'])} | {', '.join(c['addenda_only_in_eflaw'])} |")
+                     f"{', '.join(c['addenda_only_in_law_mst'])} | {', '.join(c['addenda_only_in_eflaw'])} | "
+                     f"{', '.join(c['annexes_only_in_law_mst'])} | {', '.join(c['annexes_only_in_eflaw'])} |")
     lines += ['', '2단계(ⓑ) 기준: ' + ', '.join(f'{k}={yes[v]}' for k, v in gate.items())]
     return '\n'.join(lines) + '\n'
 

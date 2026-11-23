@@ -88,6 +88,55 @@ class ProbeTests(unittest.TestCase):
         changed['항']['호'][0]['호내용'] = '1. 호 <개정 2026.4.21>'
         self.assertNotEqual(wording(unit), wording(changed))
 
+    def test_unreadable_bodies_never_pass_as_equal(self):
+        def empty(lid, target, doc):
+            if lid == '001583':
+                doc['법령']['조문']['조문단위'] = []
+        results, comparisons, gate = compare(Fake(tweak=empty), TODAY)
+        self.assertTrue({c['law']: c for c in comparisons}['001583']['wording_equal'])
+        self.assertFalse(gate['bodies_readable'])
+        self.assertFalse(gate['stage2_method_b'])
+        def no_addenda(lid, target, doc):
+            if lid == '011311':
+                doc['법령']['부칙'] = {}
+        self.assertFalse(compare(Fake(tweak=no_addenda), TODAY)[2]['stage2_method_b'])
+
+    def test_unexpected_shapes_are_counted_not_dropped(self):
+        issues = []
+        a = wording({'조문내용': '제1조', '항': [[{'항내용': '① A'}]]}, issues)
+        self.assertEqual(issues, ['children'])
+        self.assertIn('① A', a)  # still read, and flagged
+        issues = []
+        wording({'조문내용': {'내용': '제1조'}}, issues)
+        self.assertEqual(issues, ['content'])
+        def wrapped(lid, target, doc):
+            if lid == '009873':
+                unit = doc['법령']['조문']['조문단위'][1]
+                unit['항'] = [unit['항']]
+        results, _, gate = compare(Fake(tweak=wrapped), TODAY)
+        self.assertEqual({(r['law'], r['request']): r for r in results}[('009873', 'law-mst')]['shape_issues'], 1)
+        self.assertFalse(gate['bodies_readable'])
+        self.assertFalse(gate['stage2_method_b'])
+        def blank(lid, target, doc):
+            if lid == '001649' and target == 'eflaw':
+                doc['법령']['조문']['조문단위'][1] = {'조문번호': '1', '조문여부': '조문', '조문내용': ' '}
+        self.assertFalse(compare(Fake(tweak=blank), TODAY)[2]['bodies_readable'])
+
+    def test_annexes_on_one_side_are_reported(self):
+        def annex(lid, target, doc):
+            if lid == '001561':
+                units = [{'별표번호': '0001', '별표가지번호': '00', '별표구분': '별표', '별표내용': '합성 별표'}]
+                if target == 'law':
+                    units.append({'별표번호': '0002', '별표가지번호': '00', '별표구분': '별표', '별표내용': '합성 별표'})
+                doc['법령']['별표'] = {'별표단위': units}
+        results, comparisons, gate = compare(Fake(tweak=annex), TODAY)
+        diff = {c['law']: c for c in comparisons}['001561']
+        self.assertEqual(diff['annexes_only_in_law_mst'], ['0002-00-별표'])
+        self.assertEqual(diff['annexes_only_in_eflaw'], [])
+        rendered = table(results, comparisons, gate, 24)
+        self.assertIn('0002-00-별표', rendered)
+        self.assertNotIn('합성', rendered)
+
     def test_gate_stops_on_control_difference(self):
         def tweak(lid, target, doc):
             if lid == '001649' and target == 'eflaw':
