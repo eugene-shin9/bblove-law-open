@@ -1,74 +1,122 @@
+from copy import deepcopy
 from pathlib import Path
 import sys
 import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 sys.path.insert(0, str(ROOT / 'src'))
-from probe_law_editions import CALL_LIMIT, LAWS, METHODS, capped, compare, table
+from probe_law_editions import CALL_LIMIT, LAWS, capped, compare, table, wording
 
-ROWS = {'001561': ('276123', '20260102', '20251001'), '001571': ('276117', '20260102', '20251001'),
-        '001565': ('280405', '20260701', '20251223'), '001585': ('280377', '20261001', '20260602'),
-        '001583': ('270000', '20250101', '20241231')}
-ARTICLE = {'001561': ('44', ''), '001571': ('21', ''), '001565': ('118', '10'), '001585': ('41', '')}
+TODAY = '20261123'
+ROWS = {s[0]: (str(270000 + i), '20260102', '20251001') for i, s in enumerate(LAWS)}
+ARTICLE = {s[0]: (str(s[2]), str(s[3]) if s[3] else '', s[4]) for s in LAWS if s[4]}
+
+
+def body(lid, target):
+    """law target: stale edition (no marker, one addendum fewer). Field order differs by target."""
+    no, branch, marker = ARTICLE.get(lid, ('1', '', None))
+    fresh = target == 'eflaw'
+    unit = {'조문번호': no, '조문가지번호': branch, '조문여부': '조문', '조문내용': f'제{no}조(합성) 합성 본문',
+            '항': [{'항내용': '① 합성 항 ' + (marker if fresh and marker else ''),
+                    '호': [{'호내용': '1. 합성 호', '목': {'목내용': ['가. 합성 목']}}]}]}
+    if fresh:  # eflaw: extra metadata and another key order; same wording
+        unit = {'조문시행일자': '20260102', **dict(reversed(list(unit.items())))}
+        unit['항'][0]['항내용'] = '  ' + unit['항'][0]['항내용'].replace(' ', '   ') + ' '
+    heading = {'조문번호': no, '조문여부': '전문', '조문내용': '제1장 합성 ' + (marker or '')}
+    addenda = [{'부칙공포일자': '20201229', '부칙공포번호': '17761', '부칙내용': '합성 부칙'}]
+    if fresh and marker:
+        addenda.append({'부칙공포일자': '20251223', '부칙공포번호': '21221', '부칙내용': '합성 부칙'})
+    return {'법령': {'기본정보': {'법령ID': lid, '시행일자': ROWS[lid][1], '공포일자': ROWS[lid][2], '공포번호': '1'},
+                     '조문': {'조문단위': [heading, unit]}, '부칙': {'부칙단위': addenda}}}
 
 
 class Fake:
-    """Synthetic DRF: target=law by MST is stale (no marker); eflaw and ID lookups carry it."""
-    def __init__(self, fail=False):
-        self.calls, self.fail = [], fail
+    def __init__(self, fail=False, tweak=None):
+        self.calls, self.fail, self.tweak = [], fail, tweak
 
     def get(self, endpoint, params, **kw):
         self.calls.append((endpoint, dict(params), kw))
         if self.fail:
             raise ValueError('PRIVATE_RAW_ERROR https://example.invalid/?OC=secret')
         if endpoint == 'lawSearch.do':
-            rows = [{'법령ID': lid, '법령일련번호': m, '시행일자': e, '공포일자': p}
-                    for lid, (m, e, p) in ROWS.items()]
+            rows = [{'법령ID': lid, '법령일련번호': m, '시행일자': e, '공포일자': p} for lid, (m, e, p) in ROWS.items()]
             rows.append({'법령ID': '009999', '법령일련번호': '1', '시행일자': '20200101', '공포일자': '20200101'})
             return {'LawSearch': {'law': rows}}, None
-        lid = params.get('ID') or next(k for k, v in ROWS.items() if v[0] == params['MST'])
-        stale = params['target'] == 'law' and 'MST' in params and lid != '001583'
-        no, branch = ARTICLE.get(lid, ('1', ''))
-        marker = next((s[4] for s in LAWS if s[0] == lid), None) or ''
-        unit = {'조문번호': no, '조문가지번호': branch, '조문여부': '조문',
-                '조문내용': '합성 본문', '항': [{'항내용': '합성 항 ' + ('' if stale else marker)}]}
-        decoy = {'조문번호': no, '조문여부': '전문', '조문내용': marker}
-        # A by-ID eflaw lookup may answer with a not-yet-effective (시행 예정) edition.
-        effective = '20270101' if (lid, params['target'], 'ID' in params) == ('001585', 'eflaw', True) else ROWS[lid][1]
-        return {'법령': {'기본정보': {'법령ID': lid, '시행일자': effective, '공포일자': ROWS[lid][2],
-                                      '공포번호': '1'},
-                         '조문': {'조문단위': [decoy, unit]}, '부칙': {'부칙단위': [{'부칙내용': '합성'}]}}}, None
+        lid = next(k for k, v in ROWS.items() if v[0] == params['MST'])
+        doc = body(lid, params['target'])
+        if self.tweak:
+            self.tweak(lid, params['target'], doc)
+        return doc, None
 
 
 class ProbeTests(unittest.TestCase):
-    def test_five_laws_four_methods_within_limit(self):
+    def test_eight_laws_two_methods_within_limit(self):
         c = Fake()
-        report = compare(c, '20261123')
-        self.assertEqual(len(c.calls), 25)
-        # Up to 2 attempts per request; the transport cap (capped) bounds the total at 30.
+        results, comparisons, gate = compare(c, TODAY)
+        self.assertEqual(len(c.calls), 24)
+        self.assertLessEqual(len(c.calls), CALL_LIMIT)
         self.assertTrue(all(kw.get('attempts') == 2 for _, _, kw in c.calls))
-        self.assertEqual(len(report), 25)
-        searches = [p for e, p, _ in c.calls if e == 'lawSearch.do']
-        self.assertTrue(all(p['target'] == 'law' and p['nw'] == '3' for p in searches))
-        bodies = [(p.get('target'), tuple(sorted(k for k in p if k != 'target')))
-                  for e, p, _ in c.calls if e == 'lawService.do']
-        self.assertEqual(bodies[:4], [('law', ('MST',)), ('eflaw', ('MST', 'efYd')), ('law', ('ID',)), ('eflaw', ('ID',))])
-        efyd = next(p for e, p, _ in c.calls if p.get('target') == 'eflaw' and 'MST' in p)
-        self.assertEqual((efyd['MST'], efyd['efYd']), ('276123', '20260102'))
-        by = {(r['law'], r['request']): r for r in report}
+        self.assertTrue(all(p['target'] == 'law' and p['nw'] == '3' for e, p, _ in c.calls if e == 'lawSearch.do'))
+        bodies = [p for e, p, _ in c.calls if e == 'lawService.do']
+        self.assertEqual(bodies[:2], [{'target': 'law', 'MST': '270000'},
+                                      {'target': 'eflaw', 'MST': '270000', 'efYd': '20260102'}])
+        by = {(r['law'], r['request']): r for r in results}
         for lid in ARTICLE:
             self.assertEqual(by[(lid, 'law-mst')]['marker'], '없음')
-            for m in METHODS[1:]:
-                self.assertEqual(by[(lid, m)]['marker'], '있음', (lid, m))
-                self.assertTrue(by[(lid, m)]['id_matches'])
-        self.assertFalse(by[('001585', 'eflaw-id')]['effective_le_today'])
-        self.assertTrue(by[('001561', 'eflaw-id')]['effective_le_today'])
-        self.assertTrue(all(by[('001583', m)]['same_as_law_mst'] for m in METHODS))
-        self.assertNotIn('marker', by[('001583', 'law-mst')])
-        self.assertEqual(by[('001561', 'law-mst')]['mst_in_response'], 'ABSENT')
-        rendered = str(report) + table(report, 25)
+            self.assertEqual(by[(lid, 'eflaw-mst-efyd')]['marker'], '있음')
+        self.assertEqual(ARTICLE['001565'], ('59', '2', '2026.4.21'))
+        diff = {c['law']: c for c in comparisons}
+        for lid in ('001583', '009873', '001649', '011311'):
+            self.assertTrue(diff[lid]['control'])
+            # Field order, extra metadata and whitespace do not change the wording hash.
+            self.assertTrue(diff[lid]['wording_equal'], lid)
+            self.assertEqual(by[(lid, 'law-mst')]['wording_sha256'], by[(lid, 'eflaw-mst-efyd')]['wording_sha256'])
+        self.assertEqual(diff['001561']['changed_articles'], ['제44조'])
+        self.assertEqual(diff['001565']['changed_articles'], ['제59조의2'])
+        self.assertEqual(diff['001561']['addenda_only_in_eflaw'], ['20251223/21221'])
+        self.assertEqual(diff['001561']['addenda_only_in_law_mst'], [])
+        self.assertTrue(gate['stage2_method_b'])
+        rendered = str(results) + str(comparisons) + table(results, comparisons, gate, 24)
         self.assertNotIn('합성', rendered)
-        self.assertIn('25/30', table(report, 25))
+        self.assertIn('24/30', rendered)
+
+    def test_wording_ignores_fields_and_order_but_not_text(self):
+        unit = {'조문내용': '제1조 본문', '항': {'항내용': '① 항', '호': [{'호내용': '1. 호'}]}, '조문시행일자': '1'}
+        moved = {'항': {'호': [{'호내용': '1.  호'}], '항내용': '① 항'}, '조문내용': ' 제1조 본문', '조문이동': 'x'}
+        self.assertEqual(wording(unit), wording(moved))
+        changed = deepcopy(unit)
+        changed['항']['호'][0]['호내용'] = '1. 호 <개정 2026.4.21>'
+        self.assertNotEqual(wording(unit), wording(changed))
+
+    def test_gate_stops_on_control_difference(self):
+        def tweak(lid, target, doc):
+            if lid == '001649' and target == 'eflaw':
+                doc['법령']['조문']['조문단위'][1]['조문내용'] += ' 다름'
+        results, comparisons, gate = compare(Fake(tweak=tweak), TODAY)
+        diff = {c['law']: c for c in comparisons}
+        self.assertFalse(diff['001649']['wording_equal'])
+        self.assertEqual(diff['001649']['changed_articles'], ['제1조'])
+        self.assertFalse(gate['controls_wording_equal'])
+        self.assertFalse(gate['stage2_method_b'])
+
+    def test_gate_stops_when_eflaw_drops_an_addendum(self):
+        def tweak(lid, target, doc):
+            if lid == '009873' and target == 'eflaw':
+                doc['법령']['부칙']['부칙단위'] = []
+        results, comparisons, gate = compare(Fake(tweak=tweak), TODAY)
+        diff = {c['law']: c for c in comparisons}
+        self.assertEqual(diff['009873']['addenda_only_in_law_mst'], ['20201229/17761'])
+        self.assertFalse(gate['no_addenda_missing_in_eflaw'])
+        self.assertFalse(gate['stage2_method_b'])
+        self.assertIn('20201229/17761', table(results, comparisons, gate, 24))
+
+    def test_gate_stops_when_a_marker_is_missing(self):
+        def tweak(lid, target, doc):
+            if lid == '001565' and target == 'eflaw':
+                doc['법령']['조문']['조문단위'][1]['항'][0]['항내용'] = '① 합성 항'
+        _, _, gate = compare(Fake(tweak=tweak), TODAY)
+        self.assertFalse(gate['markers_present_in_eflaw'])
+        self.assertFalse(gate['stage2_method_b'])
 
     def test_transport_cap_is_thirty(self):
         sent = []
@@ -104,35 +152,33 @@ class ProbeTests(unittest.TestCase):
         # One attempt already spent (it succeeds), so request 15 straddles the cap.
         flaky['n'] = 1
         transport('spent', 1)
-        c = Flaky()
-        report = compare(c, '20261123', lambda: CALL_LIMIT - count())
+        results, comparisons, gate = compare(Flaky(), TODAY, lambda: CALL_LIMIT - count())
         self.assertEqual(count(), CALL_LIMIT)
-        by = {(r['law'], r['request']): r['status'] for r in report}
-        self.assertEqual(by[('001565', 'eflaw-id')], 'STOPPED_AT_CALL_LIMIT')
-        self.assertEqual(by[('001565', 'law-id')], 'SUCCESS')
-        self.assertTrue(all(by[(lid, m)] == 'NOT_RUN_CALL_LIMIT' for lid in ('001585', '001583')
-                            for m in ('catalog', 'law-id', 'eflaw-id')))
+        by = {(r['law'], r['request']): r['status'] for r in results}
+        self.assertEqual(by[('001583', 'eflaw-mst-efyd')], 'STOPPED_AT_CALL_LIMIT')  # 15th request
+        self.assertEqual(by[('001583', 'law-mst')], 'SUCCESS')
+        self.assertEqual(by[('009873', 'catalog')], 'NOT_RUN_CALL_LIMIT')
         self.assertNotIn('REQUEST_OR_RESPONSE_FAILED', by.values())
-        control = [r for r in report if r['law'] == '001583' and r['request'] in METHODS]
-        self.assertTrue(all(r['same_as_law_mst'] is None for r in control))
-        self.assertIn('알 수 없음', table(report, count()))
+        self.assertIn({'law': '001583', 'control': True, 'status': 'NOT_COMPARABLE'}, comparisons)
+        self.assertFalse(gate['stage2_method_b'])
 
     def test_time_limit_is_its_own_code(self):
         from bblove_tax_p2_collect import PilotBlocked
         class Late(Fake):
             def get(self, *a, **k):
                 raise PilotBlocked('COLLECTION_BUDGET_EXHAUSTED')
-        self.assertEqual({r['status'] for r in compare(Late(), '20261123')},
-                         {'STOPPED_AT_TIME_LIMIT', 'NOT_RUN_NO_CATALOG_ROW'})
+        results, _, gate = compare(Late(), TODAY)
+        self.assertEqual({r['status'] for r in results}, {'STOPPED_AT_TIME_LIMIT', 'NOT_RUN_NO_CATALOG_ROW'})
+        self.assertFalse(gate['stage2_method_b'])
 
     def test_errors_are_fixed_codes(self):
         c = Fake(fail=True)
-        report = compare(c, '20261123')
-        rendered = str(report) + table(report, 5)
+        results, comparisons, gate = compare(c, TODAY)
+        rendered = str(results) + str(comparisons) + table(results, comparisons, gate, 8)
         self.assertNotIn('PRIVATE_RAW_ERROR', rendered)
         self.assertNotIn('secret', rendered)
-        self.assertEqual(len(c.calls), 15)  # body by MST needs the catalog row
-        self.assertEqual({r['status'] for r in report}, {'REQUEST_OR_RESPONSE_FAILED', 'NOT_RUN_NO_CATALOG_ROW'})
+        self.assertEqual(len(c.calls), 8)  # body by MST needs the catalog row
+        self.assertEqual({r['status'] for r in results}, {'REQUEST_OR_RESPONSE_FAILED', 'NOT_RUN_NO_CATALOG_ROW'})
 
 
 if __name__ == '__main__':
