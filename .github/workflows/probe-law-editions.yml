@@ -1,4 +1,4 @@
-name: Compare traffic-energy tax law editions (manual, at most 10 calls)
+name: Compare current-law body fetch methods for five tax laws (manual, at most 30 calls)
 on:
   workflow_dispatch:
 permissions: {}
@@ -30,7 +30,7 @@ jobs:
           client-id: ${{ secrets.TS_CLIENT_ID }}
           audience: ${{ secrets.TS_AUDIENCE }}
           exit-node: ${{ secrets.TS_EXIT_NODE }}
-      - name: Compare edition article counts; no RAW or Release publication
+      - name: Compare four body fetch methods (markers and hashes only); no RAW or Release publication
         env:
           LAW_OC: ${{ secrets.LAW_OC }}
           HTTPS_PROXY: ${{ steps.egress.outputs.https-proxy }}
