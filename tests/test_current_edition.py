@@ -195,6 +195,39 @@ class CurrentEditionTests(unittest.TestCase):
             self.assertTrue(collect(Recording(addenda=[]), path, DATE))
             self.assertNotIn('dropped_addenda', manifest(path)['documents'][0])
 
+    def test_old_raw_from_another_fetch_is_removed_when_refetch_fails(self):
+        class Down(Recording):
+            def get(self, endpoint, params, **kw):
+                if endpoint == 'lawService.do':
+                    raise PilotBlocked('REQUEST_FAILED_AFTER_RETRIES')
+                return super().get(endpoint, params, **kw)
+        for changes, kept in (({'fetch': 'target-law-mst'}, False), ({}, True)):
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as t:
+                path = Path(t)
+                self.assertTrue(collect(Recording(), path, DATE))
+                age_receipts(path, 0, **changes)
+                entry = manifest(path)['documents'][0]
+                if kept:  # a reusable receipt whose file no longer matches: earlier behaviour, kept
+                    (path / entry['path']).write_bytes(b'{}')
+                self.assertTrue(collect(Down(), path, DATE))
+                entry = manifest(path)['documents'][0]
+                self.assertEqual(entry['reason'], 'DETAIL_FETCH_FAILED')
+                self.assertEqual((path / entry['path']).exists(), kept)
+                self.assertEqual('sha256' in entry, kept)
+
+    def test_build_refuses_many_edition_mismatches(self):
+        from build_mcp_assets_official import MAX_EDITION_MISMATCH, edition_mismatches, build
+        docs = [{'reason': 'CURRENT_EDITION_MISMATCH'}] * (MAX_EDITION_MISMATCH + 1) + [{'status': 'SUCCESS'}]
+        self.assertEqual(edition_mismatches(docs), 21)
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / 'raw'
+            self.assertTrue(collect(Recording(rows=[deepcopy(ROW), deepcopy(SECOND)]), path, DATE))
+            m = manifest(path)
+            m['documents'][1].update(status='FAILED', reason='CURRENT_EDITION_MISMATCH')
+            (path / 'manifest.json').write_bytes(encode(m))
+            with self.assertRaisesRegex(ValueError, '"current_edition_mismatch": 1'):
+                build(path, ROOT, Path(t) / 'assets', DATE)
+
     def test_diagnose_counts_mismatch_and_fetch(self):
         def ident(doc): doc['법령']['기본정보']['법령ID'] = '000009'
         with tempfile.TemporaryDirectory() as t:

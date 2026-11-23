@@ -176,6 +176,13 @@ def group_id(name):
     return hashlib.sha1(name.encode('utf-8')).hexdigest()[:12]
 
 
+MAX_EDITION_MISMATCH = 20
+
+
+def edition_mismatches(documents):
+    return sum(e.get('reason') == 'CURRENT_EDITION_MISMATCH' for e in documents)
+
+
 def build(source, repo, out, date=None, enforce_thresholds=True):
     date = date or today()
     annexes, annex_skips, addenda, addenda_skips, abbreviations = {}, [], {}, [], {}
@@ -187,10 +194,14 @@ def build(source, repo, out, date=None, enforce_thresholds=True):
     stats = {'n_groups': len(groups), 'n_docs': len(docs),
              'n_articles': sum(len(d['a']) for d in docs),
              'n_laws': sum(d['k'] == '법률' for d in docs)}
+    mismatched = edition_mismatches(manifest['documents'])
+    # A body that is not the catalog's current edition is left out (FAILED); more than a few
+    # such documents means the fetch is wrong, not the law, so nothing is built or published.
     if enforce_thresholds and (not all(checks.values()) or stats['n_laws'] < 1650 or
-                               stats['n_docs'] < 4500 or stats['n_articles'] < 170000):
+                               stats['n_docs'] < 4500 or stats['n_articles'] < 170000 or
+                               mismatched > MAX_EDITION_MISMATCH):
         raise ValueError('ACCEPTANCE_COUNTS_OR_REQUIRED_ARTICLES_FAILED ' + json.dumps(
-            {'required': checks, **stats}, ensure_ascii=False))
+            {'required': checks, **stats, 'current_edition_mismatch': mismatched}, ensure_ascii=False))
     light, sizes, seen_ids = {}, [], set()
     # Build privately, then replace the output only after every gate succeeds.
     out.parent.mkdir(parents=True, exist_ok=True)

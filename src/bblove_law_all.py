@@ -444,9 +444,16 @@ def dropped_addenda(old_raw, new_raw, lid):
     return [f'{date}/{number}' for date, number in sorted(gone.elements())]
 
 
+def discard(file, entry):
+    file.unlink(missing_ok=True)
+    for key in ('sha256', 'collected_at', 'raw_status', 'fetch', 'dropped_addenda'):
+        entry.pop(key, None)
+
+
 def collect_entry(client, out, entry, old, date):
     entry = dict(entry)
     phase = 'RAW_CACHE_READ_FAILED'
+    replaced = False  # True once a fetch has started for a body whose old RAW is not reusable
     try:
         file = out / entry['path']
         raw = file.read_bytes() if file.exists() else b''
@@ -458,6 +465,7 @@ def collect_entry(client, out, entry, old, date):
             for key in ('detail_source', 'fallback_reason', 'dropped_addenda'):
                 entry.pop(key, None)
             phase = 'DETAIL_FETCH_FAILED'
+            replaced = not reusable(old, entry['row'])
             # One request per document. The eflaw answer is already the fallback the old
             # target=law path used for repeal-only bodies, so no second request is made.
             _, fresh = client.get('lawService.do', fetch_params(entry), original=True)
@@ -485,12 +493,14 @@ def collect_entry(client, out, entry, old, date):
         entry.update(status='SUCCESS', raw_status='SUCCESS', articles=count, warnings=warnings)
     except EditionMismatch as exc:
         # Not the current edition: keep no body (nor a stale one) for this document.
-        file.unlink(missing_ok=True)
-        for key in ('sha256', 'collected_at', 'raw_status', 'fetch', 'dropped_addenda'):
-            entry.pop(key, None)
+        discard(file, entry)
         entry.update(reused=reuse, status='FAILED', reason='CURRENT_EDITION_MISMATCH',
                      detail=safe_detail(exc, getattr(client, 'credential', '')))
     except Exception as exc:
+        if replaced and phase == 'DETAIL_FETCH_FAILED':
+            # The old RAW came from another fetch or is too old to stand in; the release zips
+            # this folder, so it must not stay next to a FAILED entry as if it were current.
+            discard(file, entry)
         if phase == 'DETAIL_VALIDATION_FAILED':
             entry['raw_status'] = 'DETAIL_VALIDATION_FAILED'
         entry.update(status='FAILED', reason='COLLECTION_BUDGET_EXHAUSTED'
