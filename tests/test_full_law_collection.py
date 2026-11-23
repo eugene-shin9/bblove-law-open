@@ -20,9 +20,9 @@ from verify_mcp_assets_official import verify
 
 DATE = '20261014'
 ROW = {'법령ID': '000001', '법령일련번호': '123456', '법령명한글': '테스트법',
-       '시행일자': '20260101', '공포일자': '20250101', '법령구분명': '법률', '현행연혁코드': '현행'}
+       '시행일자': '20260101', '공포일자': '20250101', '공포번호': '20001', '법령구분명': '법률', '현행연혁코드': '현행'}
 DOC = {'법령': {'기본정보': {'법령ID': '000001', '법령명_한글': '테스트법',
-                           '시행일자': '20260101', '공포일자': '20250101'},
+                           '시행일자': '20260101', '공포일자': '20250101', '공포번호': '20001'},
                '조문': {'조문단위': [
                    {'조문여부': 'N', '조문번호': '1', '조문내용': '제1장'},
                    {'조문여부': 'Y', '조문번호': '1', '조문가지번호': '2', '조문제목': '목적',
@@ -74,10 +74,12 @@ class FullLawTests(unittest.TestCase):
             self.assertEqual(manifest['documents'][0]['status'], 'FAILED')
             with self.assertRaises(ValueError):
                 load_groups(source, DATE)
-            retry = FakeClient()
+            # No body was kept, so the next run asks again (one request) and fails the same way.
+            retry = FakeClient(doc=bad)
             self.assertTrue(collect(retry, source, DATE))
-            self.assertEqual(retry.details, 0)
-            self.assertEqual(json.loads((source / 'manifest.json').read_bytes())['documents'][0]['status'], 'FAILED')
+            self.assertEqual(retry.details, 1)
+            self.assertEqual(json.loads((source / 'manifest.json').read_bytes())['documents'][0]['reason'],
+                             'CURRENT_EDITION_MISMATCH')
 
     def test_future_catalog_and_duplicate_rejected(self):
         for rows in ([{**ROW, '시행일자': '20270101'}], [ROW, ROW]):
@@ -219,14 +221,14 @@ class FullLawTests(unittest.TestCase):
             self.assertTrue(collect(FakeClient(doc=empty), Path(t), DATE))
             manifest = json.loads((Path(t) / 'manifest.json').read_bytes())
             self.assertEqual(manifest['documents'][0]['status'], 'FAILED')
-        # The catalog (현행) already says this MST is current; a later detail date
-        # means provisions with deferred effect. Keep it, but flag it.
+        # The body is requested as in force on the catalog date (eflaw + efYd); a body carrying
+        # another 시행일자 is not that edition and is refused, not relabelled with the catalog date.
         future = deepcopy(DOC); future['법령']['기본정보']['시행일자'] = '20270101'
         with tempfile.TemporaryDirectory() as t:
             self.assertTrue(collect(FakeClient(doc=future), Path(t), DATE))
             entry = json.loads((Path(t) / 'manifest.json').read_bytes())['documents'][0]
-            self.assertEqual(entry['status'], 'SUCCESS')
-            self.assertEqual(entry['warnings'][0]['code'], 'detail_date_after_today')
+            self.assertEqual((entry['status'], entry['reason']), ('FAILED', 'CURRENT_EDITION_MISMATCH'))
+            self.assertFalse((Path(t) / entry['path']).exists())
 
     def test_retry_spacing_and_secret_response_rejection(self):
         attempts = []

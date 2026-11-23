@@ -49,12 +49,25 @@ def diagnose(source, date=None):
                 except ValueError as exc:
                     result['detail'] = safe_detail(exc)
                 try:
-                    _, _, warnings = validate_raw(raw, entry['row'], date, with_warnings=True)
+                    _, _, warnings = validate_raw(raw, entry['row'], date, with_warnings=True,
+                                                    fetch=entry.get('fetch'))
                     result.update(replay='SUCCESS', warnings=warnings)
                 except (ValueError, KeyError, TypeError) as exc:
                     result.update(replay='FAILED', relaxed_detail=safe_detail(exc))
         details.append(result)
+    documents = manifest['documents']
+    dropped = [e for e in documents if e.get('dropped_addenda')]
+    date_warnings = Counter((w.get('code'), w.get('fetch') or 'unrecorded') for e in documents
+                            for w in e.get('warnings') or []
+                            if w.get('code') in {'effective_date_differs_from_catalog', 'detail_date_after_today'})
     return {'date': date, 'candidates': len(details),
+            'fetch_counts': dict(Counter(e.get('fetch') or 'unrecorded' for e in documents)),
+            'current_edition_mismatch': sum(e.get('reason') == 'CURRENT_EDITION_MISMATCH' for e in documents),
+            'effective_date_warnings': {f'{code}@{fetch}': n for (code, fetch), n in sorted(date_warnings.items())},
+            'dropped_addenda': {'documents': len(dropped),
+                                'addenda': sum(len(e['dropped_addenda']) for e in dropped),
+                                'examples': [{'title': e['title'], 'mst': e['mst'], 'addendum': a}
+                                             for e in dropped for a in e['dropped_addenda']][:20]},
             'replay_counts': dict(Counter(r['replay'] for r in details)),
             'strict_failure_distribution': failure_distribution(details), 'documents': details}
 

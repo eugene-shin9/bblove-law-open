@@ -108,7 +108,23 @@ class CollectionFinishTests(unittest.TestCase):
                 doc = deepcopy(DOC)
                 doc['법령']['기본정보']['시행일자'] = detail
                 source, out = Path(tmp) / 'raw', Path(tmp) / 'assets'
+                # The collector now refuses such a body (CURRENT_EDITION_MISMATCH) and writes none ...
                 self.assertTrue(collect(FakeClient(doc=doc), source, DATE))
+                manifest = json.loads((source / 'manifest.json').read_bytes())
+                entry = manifest['documents'][0]
+                self.assertEqual((entry['status'], entry['reason']), ('FAILED', 'CURRENT_EDITION_MISMATCH'))
+                self.assertIn('effective', entry['detail'])
+                self.assertFalse((source / entry['path']).exists())
+                # ... but the retained warning branch still builds and verifies when a receipt carries it.
+                self.assertTrue(collect(FakeClient(), source, DATE))
+                manifest = json.loads((source / 'manifest.json').read_bytes())
+                entry = manifest['documents'][0]
+                raw = encode(doc)
+                (source / entry['path']).write_bytes(raw)
+                _, _, warnings = validate_raw(raw, ROW, DATE, with_warnings=True, fetch=entry['fetch'])
+                self.assertEqual(warnings[0]['fetch'], 'eflaw-mst-efyd-v1')
+                entry.update(sha256=hashlib.sha256(raw).hexdigest(), warnings=warnings)
+                (source / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False))
                 build(source, ROOT, out, DATE, enforce_thresholds=False)
                 meta = json.loads((out / 'meta.json').read_bytes())
                 self.assertEqual(meta['warnings'][0]['warnings'][0]['code'], code)
@@ -207,6 +223,8 @@ class CollectionFinishTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp)
             collect(FakeClient(doc=doc), source, DATE)
+            self.assertFalse((source / '테스트법/법률.json').exists())  # mismatched body is never written
+            (source / '테스트법').mkdir(exist_ok=True)
             (source / '테스트법/법률.json').write_bytes(b'{}')
             retry = FakeClient()
             collect(retry, source, DATE)
@@ -222,7 +240,8 @@ class CollectionFinishTests(unittest.TestCase):
             self.assertEqual(manifest['status_counts'], {'SUCCESS': 1, 'FAILED': 1})
             failures = json.loads((source / 'collection-failures.json').read_bytes())
             self.assertEqual(failures[0]['mst'], '222222')
-            self.assertEqual(failures[0]['detail'], 'detail: title/ID/effective date mismatch')
+            self.assertEqual(failures[0]['reason'], 'CURRENT_EDITION_MISMATCH')
+            self.assertEqual(failures[0]['detail'], 'id: catalog=000002 detail=000001')
             result = build(source, ROOT, out, DATE, enforce_thresholds=False)
             self.assertEqual(result['n_docs'], 1)
             self.assertEqual(result['excluded_documents'], 1)
