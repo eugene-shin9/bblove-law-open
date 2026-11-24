@@ -26,6 +26,8 @@ def unit(number, body, date='20250101'):
 A = unit('00001', ['첫째 부칙', {'문장': '원문을 유지한다.'}])
 B = unit('00002', '둘째 부칙')
 C = unit('00003', '셋째 부칙')
+NUMBERED = unit('23535', '부칙(다른 법령 시행령) <제23535호, 2025.1.1> 첫째 조문')
+MISNUMBERED = unit('23590', '부칙 (다른 법령 시행령) <제23535호,2025.1.1> 첫째 조문')
 
 
 def set_units(doc, units):
@@ -79,6 +81,88 @@ class CarryTests(unittest.TestCase):
         self.assertEqual(self.entry['carried_addenda'], len(value['units']))
         self.assertEqual(self.entry['carried_addenda_sha256'], file_hash(self.sidecar))
         return value['units']
+
+    def seed_carry(self, units, *, collected_at=None):
+        current = manifest(self.source)
+        entry = current['documents'][0]
+        items = [{'key': '/'.join(bblove_law_all.addenda_key(addendum)), 'unit': addendum,
+                  'first_missing': current['date'],
+                  'from_collected_at': collected_at or entry['collected_at']} for addendum in units]
+        self.sidecar.write_bytes(bblove_law_all.encode_carry(entry, items))
+        entry.update(carried_addenda=len(items), carried_addenda_sha256=file_hash(self.sidecar))
+        (self.source / 'manifest.json').write_bytes(encode(current))
+
+    def test_wrong_number_copy_in_old_raw_is_not_carried(self):
+        numbered = unit('00001', '부칙 <제1호, 2025.1.1> 본문')
+        wrong_number = unit('00018', '부칙 <제1호,2025.1.1> 본문')
+        for canonical, alias in ((NUMBERED, MISNUMBERED), (numbered, wrong_number)):
+            with self.subTest(number=alias['부칙공포번호']):
+                self.source = self.root / alias['부칙공포번호']
+                self.refetch([canonical, alias])
+                self.refetch([canonical])
+                self.assertFalse(self.sidecar.exists())
+                self.assertNotIn('carried_addenda', self.entry)
+                self.assertEqual(self.entry['dropped_addenda'], ['/'.join(bblove_law_all.addenda_key(alias))])
+
+    def test_existing_wrong_number_copy_is_pruned_only_after_validation(self):
+        self.refetch([NUMBERED])
+        self.seed_carry([MISNUMBERED, A])
+        items = self.carried()
+        original_hash = file_hash(self.sidecar)
+        self.refetch([NUMBERED], edit=lambda doc: doc['법령'].pop('조문'))
+        self.assertEqual(self.entry['reason'], 'DETAIL_VALIDATION_FAILED')
+        self.assertEqual(self.carried(), items)
+        self.assertEqual(file_hash(self.sidecar), original_hash)
+        self.refetch([NUMBERED])
+        self.assertEqual(self.carried(), items[1:])
+        self.assertNotEqual(self.entry['carried_addenda_sha256'], original_hash)
+
+    def test_equal_bodies_without_a_correct_numbered_header_are_preserved(self):
+        bodies = ('짧은 부칙', '다른 규정을 인용한다. <제9호>', '부칙 <제7호,2025.1.1> 본문')
+        for index, body in enumerate(bodies):
+            with self.subTest(body=body):
+                self.source = self.root / str(index)
+                current = unit('00009', body)
+                missing = unit('00010', body)
+                self.refetch([current, missing])
+                self.refetch([current])
+                self.assertEqual([item['unit'] for item in self.carried()], [missing])
+
+    def test_raw_replace_retry_after_budget_stops_keeps_one_copy(self):
+        class Budget(Recording):
+            def get(self, endpoint, params, **kw):
+                if endpoint == 'lawService.do':
+                    raise PilotBlocked(self.reason)
+                return super().get(endpoint, params, **kw)
+
+        for stops in (('DAILY_CALL_CAP',), ('DAILY_CALL_CAP', 'DAILY_CALL_CAP'),
+                      ('COLLECTION_BUDGET_EXHAUSTED',)):
+            with self.subTest(stops=stops):
+                self.source = self.root / f'{len(stops)}-{stops[0]}'
+                self.refetch([A, B])
+                age_receipts(self.source, 7)
+                raw, original_replace = self.raw, Path.replace
+                before = raw.read_bytes()
+
+                def fail_raw_replace(path, target):
+                    if target == raw:
+                        raise OSError('fixture RAW rename failure')
+                    return original_replace(path, target)
+
+                with patch.object(Path, 'replace', fail_raw_replace):
+                    self.refetch([B], force=False)
+                self.assertEqual(self.entry['reason'], 'RAW_WRITE_FAILED')
+                carried = self.carried()
+                self.assertEqual([item['unit'] for item in carried], [A])
+                for reason in stops:
+                    client = Budget()
+                    client.reason = reason
+                    self.assertFalse(bblove_law_all.collect(client, self.source, DATE))
+                    self.assertEqual(self.entry['reason'], reason)
+                    self.assertEqual(raw.read_bytes(), before)
+                    self.assertEqual(self.carried(), carried)
+                self.assertEqual(self.refetch([B], force=False), 1)
+                self.assertEqual(self.carried(), carried)
 
     def test_two_disappear_then_return_and_remove_sidecar(self):
         self.refetch([A, B, C])
@@ -217,7 +301,7 @@ class CarryTests(unittest.TestCase):
             self.assertEqual(bblove_law_all.main(), 0)
             self.assertEqual(file_hashes(self.source), first)
         rows = self.carried()
-        self.assertEqual([item['unit'] for item in rows], [A, A])
+        self.assertEqual([item['unit'] for item in rows], [A])
         self.assertEqual({item['from_collected_at'] for item in rows}, {old_entry['collected_at']})
         self.assertEqual({item['first_missing'] for item in rows}, {DATE})
         actual = manifest(self.source)
@@ -315,6 +399,41 @@ class CarryTests(unittest.TestCase):
         self.assertEqual(self.backfill_cli(old, summary), 1)
         self.assertEqual(file_hashes(self.source), before)
 
+    def test_backfill_checks_127_unit_receipt_before_restoring_125(self):
+        padded = unit('00001', '부칙 <제1호,2025.1.1> 원문')
+        wrong_padded = unit('00018', padded['부칙내용'])
+        preserved = [unit(str(number), f'유실 부칙 {number}') for number in range(100, 225)]
+        self.refetch([NUMBERED, MISNUMBERED, padded, wrong_padded, *preserved])
+        old = self.source.rename(self.root / 'old')
+        collected_at = manifest(old)['documents'][0]['collected_at']
+        self.refetch([NUMBERED, padded])
+        self.seed_carry([MISNUMBERED, wrong_padded, *preserved], collected_at=collected_at)
+        self.assertEqual(len(self.carried()), 127)
+        self.sidecar.unlink()
+        summary = self.root / 'summary.md'
+        self.assertEqual(self.backfill_cli(old, summary), 0)
+        self.assertEqual([item['unit'] for item in self.carried()], preserved)
+        self.assertFalse(summary.exists())
+        before = file_hashes(self.source)
+        # The replacement receipt must also support recovery if the file goes missing again.
+        self.sidecar.unlink()
+        self.assertEqual(self.backfill_cli(old, summary), 0)
+        self.assertEqual(file_hashes(self.source), before)
+
+    def test_backfill_filters_source_sidecar_after_verifying_original_receipt(self):
+        self.refetch([B])
+        self.seed_carry([MISNUMBERED])
+        old = self.source.rename(self.root / 'old')
+        original_receipt = {key: manifest(old)['documents'][0][key] for key in bblove_law_all.CARRY_FIELDS}
+        self.refetch([NUMBERED])
+        current = manifest(self.source)
+        current['documents'][0].update(original_receipt)
+        (self.source / 'manifest.json').write_bytes(encode(current))
+        self.assertEqual(self.backfill_cli(old, self.root / 'summary.md'), 0)
+        self.assertFalse(self.sidecar.exists())
+        for key in bblove_law_all.CARRY_FIELDS:
+            self.assertNotIn(key, self.entry)
+
     def test_matching_body_cannot_reuse_a_new_unit_already_matched_by_key(self):
         relabeled = {**A, '부칙공포번호': '00009', '부칙공포일자': '20250201'}
         self.refetch([A, relabeled])
@@ -350,13 +469,12 @@ class CarryTests(unittest.TestCase):
                 self.refetch([last])
                 self.assertEqual([u['unit'] for u in self.carried()], [first])
 
-    def test_live_recollection_keeps_identical_units_with_separate_occurrences(self):
+    def test_live_recollection_keeps_first_provenance_for_identical_units(self):
         self.refetch([A, A])
         self.refetch([A])
         original = self.carried()
         self.refetch([])
-        self.assertEqual([u['unit'] for u in self.carried()], [A, A])
-        self.assertEqual(self.carried()[0], original[0])
+        self.assertEqual(self.carried(), original)
 
     def test_rename_budget_stop_preserves_raw_and_carry_for_next_run(self):
         class Budget(Recording):

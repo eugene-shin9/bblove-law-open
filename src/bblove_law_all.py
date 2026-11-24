@@ -731,13 +731,21 @@ def carry_body(unit):
     return re.sub(r'\s+', '', flatten_addenda(unit.get('부칙내용')))
 
 
-def merge_carry(previous, older, newer, date, collected_at, *, prune=True, replay=False):
-    """Match each new unit at most once, across both sources of old units."""
-    def signature(unit):
-        return addenda_key(unit), carry_body(unit)
+def carry_signature(unit):
+    return addenda_key(unit), carry_body(unit)
 
-    old_units = list(map(signature, older + [item['unit'] for item in previous]))
-    new_units = list(map(signature, newer))
+
+def correctly_numbered_bodies(signatures):
+    bodies = set()
+    for (_, number), body in signatures:
+        header = re.match(r'^(?:부칙(?:\([^<]*\))?)?<제([0-9]+)호', body)
+        if header and _promulgation_number(header[1]) == _promulgation_number(number):
+            bodies.add(body)
+    return bodies
+
+
+def unmatched_carry(old_units, new_units, confirmed_bodies=()):
+    """Match each new unit at most once, across both sources of old units."""
     remaining_old = list(range(len(old_units)))
     remaining_new = list(range(len(new_units)))
     # Exact key and body first, then key only, then nonempty body under a changed key.
@@ -752,26 +760,33 @@ def merge_carry(previous, older, newer, date, collected_at, *, prune=True, repla
             key = match_by(old_units[index])
             if available[key]:
                 used.add(available[key].popleft())
-            else:
+            elif old_units[index][1] not in confirmed_bodies:
+                # A confirmed body can reserve its exact match, but needs no fallback match.
                 unmatched.append(index)
         remaining_old = unmatched
         remaining_new = [index for index in remaining_new if index not in used]
+    return set(remaining_old)
 
-    missing = set(remaining_old)
+
+def carry_item(unit, date, collected_at):
+    return {'key': '/'.join(addenda_key(unit)), 'unit': unit,
+            'first_missing': date, 'from_collected_at': collected_at}
+
+
+def unique_carry(items):
+    by_unit = {}
+    for item in items:
+        by_unit.setdefault(json.dumps(item['unit'], ensure_ascii=False), item)
+    return list(by_unit.values())
+
+
+def merge_carry(previous, older, newer, date, collected_at, *, prune=True):
+    old_units = list(map(carry_signature, older + [item['unit'] for item in previous]))
+    new_units = list(map(carry_signature, newer))
+    missing = unmatched_carry(old_units, new_units, correctly_numbered_bodies(new_units))
     kept = [item for index, item in enumerate(previous, len(older)) if not prune or index in missing]
-    # The same source can be replayed in backfill or after a failed RAW replacement.
-    # In those cases reuse the provenance of identical unmatched copies already saved.
-    duplicates = Counter(json.dumps(item['unit'], ensure_ascii=False) for item in kept) if replay else Counter()
-    for index, unit in enumerate(older):
-        if index not in missing:
-            continue
-        identity = json.dumps(unit, ensure_ascii=False)
-        if duplicates[identity]:
-            duplicates[identity] -= 1
-        else:
-            kept.append({'key': '/'.join(addenda_key(unit)), 'unit': unit,
-                         'first_missing': date, 'from_collected_at': collected_at})
-    return kept
+    kept.extend(carry_item(unit, date, collected_at) for index, unit in enumerate(older) if index in missing)
+    return unique_carry(kept)
 
 
 def encode_carry(entry, units):
@@ -821,6 +836,28 @@ def backfill_raw(root, entry):
     return path, raw
 
 
+def restore_carry(entry, old, source_units, source_raw, older, newer, date, collected_at):
+    if source_raw and all(old.get(key) == entry.get(key) for key in CARRY_FIELDS):
+        units, raw = source_units, source_raw
+    else:
+        # Reproduce the original receipt with the matching rules used before filtering.
+        missing = unmatched_carry(list(map(carry_signature, older)), list(map(carry_signature, newer)))
+        units = [carry_item(unit, date, collected_at) for index, unit in enumerate(older) if index in missing]
+        raw = encode_carry(entry, units) if units else b''
+        try:
+            check_carry_receipt(entry, units, raw)
+        except CarryReadError:
+            # A lost sidecar may also have been written after the filtering change.
+            units = merge_carry([], older, newer, date, collected_at)
+            raw = encode_carry(entry, units) if units else b''
+    check_carry_receipt(entry, units, raw)
+    confirmed_bodies = correctly_numbered_bodies(map(carry_signature, newer))
+    filtered = unique_carry(item for item in units if carry_body(item['unit']) not in confirmed_bodies)
+    if filtered != units:
+        raw = encode_carry(entry, filtered) if filtered else b''
+    return filtered, raw
+
+
 def backfill_carry(out, source):
     manifest_path = out / 'manifest.json'
     manifest_raw = manifest_path.read_bytes()
@@ -844,26 +881,26 @@ def backfill_carry(out, source):
             if not eligible:
                 continue
             old_path, old_raw = backfill_raw(source, old)
-            _, source_carry = read_carry(carry_path(old_path, lid), old)
+            source_units, source_carry = read_carry(carry_path(old_path, lid), old)
             restoring = not carried_raw and has_carry_receipt(entry)
-            if restoring and source_carry and all(old.get(key) == entry.get(key) for key in CARRY_FIELDS):
-                changes.append((sidecar, source_carry))
-                continue
             older = addenda_units(old_raw, lid)
             if not older and not carried_raw and not restoring:
                 continue
             _, raw = backfill_raw(out, entry)
             if text(strict_json(raw).get('법령', {}).get('기본정보'), '법령ID') != lid:
                 raise ValueError('ADDENDA_CARRY_RAW_ID_MISMATCH')
-            units = merge_carry(carried, older, addenda_units(raw, lid), manifest['date'],
-                                raw_collected_at(old_path, old_raw, old), replay=True)
-            if units != carried or restoring:
+            newer = addenda_units(raw, lid)
+            collected_at = raw_collected_at(old_path, old_raw, old)
+            if restoring:
+                units, replacement = restore_carry(entry, old, source_units, source_carry,
+                                                   older, newer, manifest['date'], collected_at)
+            else:
+                units = merge_carry(carried, older, newer, manifest['date'], collected_at)
+                if units == carried:
+                    continue
                 replacement = encode_carry(entry, units) if units else b''
-                if restoring:
-                    # Only the original receipt proves that the lost units were recovered.
-                    check_carry_receipt(entry, units, replacement)
-                carry_receipt(entry, units, replacement)
-                changes.append((sidecar, replacement))
+            carry_receipt(entry, units, replacement)
+            changes.append((sidecar, replacement))
         except (OSError, ValueError, RecursionError):
             failed.append(entry['title'])
     if failed:
@@ -873,7 +910,7 @@ def backfill_carry(out, source):
         if raw:
             write_raw(sidecar, raw)
         else:
-            sidecar.unlink()
+            sidecar.unlink(missing_ok=True)
     if manifest != strict_json(manifest_raw):
         save(manifest_path, manifest)
 
@@ -936,9 +973,8 @@ def collect_entry(client, out, entry, old, date):
             collected_at = None
             if older:
                 collected_at = raw_collected_at(file, raw, old)
-            replay = old.get('reason') == 'RAW_WRITE_FAILED'
-            units = merge_carry(carried, older, newer, date, collected_at, prune=False, replay=replay)
-            final_units = (merge_carry(carried, older, newer, date, collected_at, replay=replay)
+            units = merge_carry(carried, older, newer, date, collected_at, prune=False)
+            final_units = (merge_carry(carried, older, newer, date, collected_at)
                            if carried and validation_error is None else units)
             phase = 'RAW_WRITE_FAILED'
             file.parent.mkdir(parents=True, exist_ok=True)
