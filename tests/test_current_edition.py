@@ -101,13 +101,33 @@ class CurrentEditionTests(unittest.TestCase):
                 self.assertEqual(retry.details, 1)
                 self.assertEqual(manifest(path)['documents'][0]['status'], 'SUCCESS')
 
-    def test_mst_or_padded_number_binds(self):
-        def with_mst(doc): doc['법령']['법령일련번호'] = ROW['법령일련번호']; doc['법령']['기본정보']['공포번호'] = '1'
-        def padded(doc): doc['법령']['기본정보']['공포번호'] = '020001'
-        for alter in (with_mst, padded):
-            with self.subTest(alter=alter.__name__), tempfile.TemporaryDirectory() as t:
-                self.assertTrue(collect(Recording(alter=alter), Path(t), DATE))
-                self.assertEqual(manifest(Path(t))['documents'][0]['status'], 'SUCCESS')
+    def test_mst_binds_with_matching_or_absent_number(self):
+        for outer, inner in ((ROW['법령일련번호'], ''), ('', ROW['법령일련번호']),
+                             (ROW['법령일련번호'], ROW['법령일련번호'])):
+            for number in ('020001', None):
+                with self.subTest(outer=outer, inner=inner, number=number):
+                    doc = self.edition_body(outer, inner, number)
+                    bblove_law_all.bind_current(encode(doc), {'row': ROW})
+        bblove_law_all.bind_current(encode(self.edition_body('', '', '020001')), {'row': ROW})
+
+    def test_mst_cannot_override_wrong_promulgation_number(self):
+        doc = self.edition_body(ROW['법령일련번호'], '', '99999')
+        with self.assertRaisesRegex(bblove_law_all.EditionMismatch, '^number:'):
+            bblove_law_all.bind_current(encode(doc), {'row': ROW})
+
+    def test_outer_and_basic_mst_must_agree(self):
+        doc = self.edition_body(ROW['법령일련번호'], '999999', '020001')
+        with self.assertRaisesRegex(bblove_law_all.EditionMismatch, 'outer=123456 basic=999999'):
+            bblove_law_all.bind_current(encode(doc), {'row': ROW})
+
+    @staticmethod
+    def edition_body(outer, inner, number):
+        doc = deepcopy(DOC)
+        law = doc['법령']
+        law['법령일련번호'] = outer
+        law['기본정보']['법령일련번호'] = inner
+        law['기본정보']['공포번호'] = number
+        return doc
 
     def test_receipt_from_another_fetch_is_not_reused(self):
         for changes in ({'fetch': 'target-law-mst'}, {'fetch': None}):

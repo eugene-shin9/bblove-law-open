@@ -7,7 +7,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 WF = ROOT / '.github' / 'workflows'
 ACTION = ROOT / '.github' / 'actions' / 'law-egress' / 'action.yml'
 COLLECTORS = {
-    'collect-law-all.yml': 'python src/bblove_law_all.py',
+    'collect-law-all.yml': 'python src/bblove_law_all.py --partial-ok',
     'collect-admrul.yml': 'python src/bblove_admrul.py collect',
     'collect-precedents.yml': 'python scripts/collect_precedents.py',
     'collect-mofe.yml': 'python src/bblove_mofe_collect.py collect',

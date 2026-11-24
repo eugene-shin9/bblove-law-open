@@ -49,20 +49,44 @@ def extract(doc, today=None):
     units = records(raw_units)  # a single addendum arrives as a dict, several as a list
     if isinstance(raw_units, list) and len(units) != len(raw_units):
         raise ValueError('ADDENDA_SHAPE_INVALID')
-    result = []
-    for unit in units:
-        date = text(unit, '부칙공포일자')
-        number = text(unit, '부칙공포번호')
-        check_date(date, 'addenda', today)
-        if not NUMBER.fullmatch(number):
-            raise ValueError('ADDENDA_NUMBER_INVALID')
-        body = flatten(unit.get('부칙내용')).strip()
-        if not body:
-            raise ValueError('ADDENDA_EMPTY')
-        if credential_markers(body.encode('utf-8')):
-            raise ValueError('ADDENDA_AUTH_MARKER')
-        result.append([iso(date), number, body])
-    return result
+    return [_extract_unit(unit, today) for unit in units]
+
+
+def _extract_unit(unit, today):
+    if not isinstance(unit, dict):
+        raise ValueError('ADDENDA_SHAPE_INVALID')
+    date = text(unit, '부칙공포일자')
+    number = text(unit, '부칙공포번호')
+    check_date(date, 'addenda', today)
+    if not NUMBER.fullmatch(number):
+        raise ValueError('ADDENDA_NUMBER_INVALID')
+    body = flatten(unit.get('부칙내용')).strip()
+    if not body:
+        raise ValueError('ADDENDA_EMPTY')
+    if credential_markers(body.encode('utf-8')):
+        raise ValueError('ADDENDA_AUTH_MARKER')
+    return [iso(date), number, body]
+
+
+def extract_carried(sidecar, today=None):
+    """Return (asset rows, skipped units with zero-based index and reason)."""
+    if (not isinstance(sidecar, dict) or type(sidecar.get('schema')) is not int
+            or sidecar['schema'] != 1 or not isinstance(sidecar.get('units'), list)):
+        raise ValueError('ADDENDA_CARRY_SHAPE_INVALID')
+    rows, skipped = [], []
+    for index, item in enumerate(sidecar['units']):
+        try:
+            unit = item.get('unit') if isinstance(item, dict) else None
+            row = _extract_unit(unit, today)
+            if credential_markers(encode(item)):
+                raise ValueError('ADDENDA_AUTH_MARKER')
+            if item.get('key') != f"{row[0].replace('-', '')}/{row[1]}":
+                raise ValueError('ADDENDA_CARRY_KEY_MISMATCH')
+            rows.append(row)
+        except (ValueError, RecursionError) as exc:
+            reason = 'ADDENDA_SHAPE_INVALID' if isinstance(exc, RecursionError) else str(exc)
+            skipped.append({'index': index, 'reason': reason})
+    return rows, skipped
 
 
 def write_assets(stage, grouped, identifiers, limit=LIMIT):

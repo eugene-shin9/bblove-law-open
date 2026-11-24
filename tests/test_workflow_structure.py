@@ -80,6 +80,29 @@ class WorkflowStructureTests(unittest.TestCase):
             if not action.startswith('./'):
                 self.assertRegex(action, r'@[0-9a-f]{40}$')
 
+    def test_law_carry_backfill_is_manual_offline_and_in_release(self):
+        from workflow_contract import job, steps, step_by_id, step_by_name
+        wf = load_workflow(ROOT / '.github/workflows/collect-law-all.yml')
+        input_spec = wf['on']['workflow_dispatch']['inputs']['carry_from_tag']
+        self.assertEqual((input_spec['type'], input_spec['default']), ('string', ''))
+        j = job(wf, 'collect')
+        ordered = steps(j)
+        backfill = step_by_id(j, 'backfill_carry')
+        restore = step_by_name(j, 'Restore resumable RAW checkpoint')
+        self.assertLess(ordered.index(restore), ordered.index(backfill))
+        for guarded in ('resume', 'credential', 'egress', 'collect'):
+            self.assertLess(ordered.index(backfill), ordered.index(step_by_id(j, guarded)))
+        self.assertEqual(backfill['if'], "github.event_name == 'workflow_dispatch' && inputs.carry_from_tag != ''")
+        self.assertEqual(set(backfill['env']), {'CARRY_FROM_TAG', 'GH_TOKEN'})
+        self.assertNotRegex(backfill['run'], r'LAW_OC|HTTPS?_PROXY|law[.]go[.]kr')
+        run = backfill['run']
+        commands = ('^law-[0-9]{8}-[0-9]+$', '--repo "$GITHUB_REPOSITORY"', 'official-all.zip.sha256',
+                    'sha256sum --strict -c', 'python -m zipfile -e', '--backfill-carry')
+        self.assertEqual(sorted(run.index(c) for c in commands), [run.index(c) for c in commands])
+        package = step_by_name(j, 'Package RAW collection, reports and release-info')['run']
+        self.assertIn("zip -q -r ../release/official-all.zip official-all -x 'official-all/daily-calls.json*'", package)
+        self.assertIn('sha256sum official-all.zip > official-all.zip.sha256', package)
+
     def test_helpers_preserve_values_and_reference_locations(self):
         from workflow_contract import job, steps, step_by_name, step_by_uses, step_by_id, expressions, env_refs, inputs_refs
         wf = load_workflow(ROOT / 'tests/fixtures/workflow_schedule_inputs.yml')

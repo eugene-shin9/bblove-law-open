@@ -2,6 +2,7 @@
 """Build article and annex assets from validated official RAW bytes."""
 import argparse
 import hashlib
+from heapq import merge
 import json
 from pathlib import Path
 import re
@@ -11,11 +12,13 @@ import tempfile
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from bblove_law_all import save, today, validate_raw, collection_complete, failure_report
+from bblove_law_all import (addenda_keys, carry_path, collection_complete, failure_report,
+                            save, today, validate_raw)
 from bblove_storage import strict_json
 from bblove_annex_assets import (extract as extract_annex, write_assets as write_annex_assets,
                                  verify_assets as verify_annex_assets)
-from bblove_addenda_assets import (extract as extract_addenda, write_assets as write_addenda_assets,
+from bblove_addenda_assets import (extract as extract_addenda, extract_carried,
+                                   write_assets as write_addenda_assets,
                                    verify_assets as verify_addenda_assets)
 from bblove_v107_pilot import records, text
 
@@ -89,8 +92,49 @@ def iso(value):
     return f'{value[:4]}-{value[4:6]}-{value[6:]}'
 
 
+def load_carried(raw_path, raw, entry, date, skipped):
+    def report(reason, **details):
+        if skipped is not None:
+            skipped.append({'id': entry['id'], 'title': entry['title'], 'reason': reason, **details})
+
+    if 'carried_addenda' not in entry and 'carried_addenda_sha256' not in entry:
+        return []
+    path = carry_path(raw_path, entry['id'])
+    try:
+        if path.is_symlink():
+            report('ADDENDA_CARRY_UNSAFE_PATH')
+            return []
+        payload = path.read_bytes()
+    except OSError:
+        report('ADDENDA_CARRY_READ_FAILED')
+        return []
+    if hashlib.sha256(payload).hexdigest() != entry.get('carried_addenda_sha256'):
+        report('ADDENDA_CARRY_HASH_MISMATCH')
+        return []
+    try:
+        sidecar = strict_json(payload)
+    except (ValueError, RecursionError):
+        report('ADDENDA_CARRY_SHAPE_INVALID')
+        return []
+    if not isinstance(sidecar, dict) or sidecar.get('id') != entry['id']:
+        report('ADDENDA_CARRY_ID_MISMATCH')
+        return []
+    try:
+        rows, errors = extract_carried(sidecar, date)
+    except ValueError:
+        report('ADDENDA_CARRY_SHAPE_INVALID')
+        return []
+    if type(entry.get('carried_addenda')) is not int or len(sidecar['units']) != entry['carried_addenda']:
+        report('ADDENDA_CARRY_COUNT_MISMATCH')
+        return []
+    for error in errors:
+        report(error['reason'], index=error['index'])
+    raw_keys = addenda_keys(raw)
+    return [row for row in rows if (row[0].replace('-', ''), row[1]) not in raw_keys]
+
+
 def load_groups(source, date, annexes=None, annex_skips=None, addenda=None, addenda_skips=None,
-                abbreviations=None):
+                abbreviations=None, carried_addenda=None):
     manifest = strict_json((source / 'manifest.json').read_bytes())
     if manifest.get('status') != 'COMPLETE' or not collection_complete(manifest.get('documents', [])):
         raise ValueError('INCOMPLETE_COLLECTION')
@@ -134,6 +178,14 @@ def load_groups(source, date, annexes=None, annex_skips=None, addenda=None, adde
                 units = []
                 if addenda_skips is not None:
                     addenda_skips.append({'id': entry['id'], 'title': entry['title'], 'reason': str(exc)[:80]})
+            carried = load_carried(path, raw, entry, date, addenda_skips)
+            if carried:
+                if carried_addenda is not None:
+                    carried_addenda.extend([entry['group'], entry['id'], row[0], row[1]] for row in carried)
+                # Keep current RAW rows in source order, as in carry-free builds.
+                def order(row):
+                    return row[0], int(row[1])
+                units = list(merge(units, sorted(carried, key=order), key=order))
             addenda.setdefault(entry['group'], []).append(
                 {'id': entry['id'], 'k': entry['kind'], 't': entry['title'], 'u': units})
         if abbreviations is not None:
@@ -186,7 +238,9 @@ def edition_mismatches(documents):
 def build(source, repo, out, date=None, enforce_thresholds=True):
     date = date or today()
     annexes, annex_skips, addenda, addenda_skips, abbreviations = {}, [], {}, [], {}
-    manifest, groups = load_groups(source, date, annexes, annex_skips, addenda, addenda_skips, abbreviations)
+    carried_addenda = []
+    manifest, groups = load_groups(source, date, annexes, annex_skips, addenda, addenda_skips,
+                                   abbreviations, carried_addenda)
     docs = [d for values in groups.values() for d in values]
     checks = {title: any(d['t'] == title and d['k'] == '법률' and
                         any(a[0] == no and a[2].strip() for a in d['a']) for d in docs)
@@ -264,6 +318,8 @@ def build(source, repo, out, date=None, enforce_thresholds=True):
                 'titles': {g: rows for g, values in groups.items() if (rows := [
                     [a[0], a[1]] for d in values if d['k'] == '법률' for a in d['a'] if a[1]])},
                 'shards': [], 'source_commit': 'law.go.kr DRF ' + iso(manifest['date'])}
+        if carried_addenda:
+            meta['addenda_carried'] = sorted(carried_addenda)
         meta_raw = encode(meta)
         if len(meta_raw) > META_LIMIT:
             raise ValueError('META_SIZE_LIMIT_EXCEEDED ' + json.dumps(
