@@ -1,5 +1,8 @@
 """All live workflows and historical regression fixtures, offline only."""
 from pathlib import Path
+import os
+import subprocess
+import tempfile
 import unittest
 from workflow_contract import load_workflow, assert_step_envs, assert_inputs_only_job_env
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,6 +105,39 @@ class WorkflowStructureTests(unittest.TestCase):
         package = step_by_name(j, 'Package RAW collection, reports and release-info')['run']
         self.assertIn("zip -q -r ../release/official-all.zip official-all -x 'official-all/daily-calls.json*'", package)
         self.assertIn('sha256sum official-all.zip > official-all.zip.sha256', package)
+
+    def test_law_backfill_tag_whitespace_is_trimmed_before_all_downloads(self):
+        from workflow_contract import job, step_by_id
+        wf = load_workflow(ROOT / '.github/workflows/collect-law-all.yml')
+        run = step_by_id(job(wf, 'collect'), 'backfill_carry')['run']
+        stubs = """\
+gh() {
+  printf '%s\\n' "$3" >> "$CALL_LOG"
+  case "$9" in
+    official-all.zip) printf 'fixture\\n' > "$7/official-all.zip" ;;
+    official-all.zip.sha256) return 1 ;;
+    SHA256SUMS) (cd "$7" && sha256sum official-all.zip > SHA256SUMS) ;;
+    *) return 1 ;;
+  esac
+}
+python() { return 0; }
+"""
+        tag = 'law-20261122-45074151806'
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'calls'
+            env = {**os.environ, 'CALL_LOG': str(log), 'GITHUB_REPOSITORY': 'owner/repo'}
+            for value, valid in ((f' \t\n{tag} \t\n', True), (tag[:-1] + 'x', False), (' \t\n', False)):
+                with self.subTest(value=value):
+                    log.unlink(missing_ok=True)
+                    result = subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', stubs + run],
+                                            env={**env, 'CARRY_FROM_TAG': value}, capture_output=True, text=True)
+                    if valid:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(log.read_text().splitlines(), [tag] * 3)
+                    else:
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn('Invalid carry_from_tag', result.stdout)
+                        self.assertFalse(log.exists())
 
     def test_helpers_preserve_values_and_reference_locations(self):
         from workflow_contract import job, steps, step_by_name, step_by_uses, step_by_id, expressions, env_refs, inputs_refs

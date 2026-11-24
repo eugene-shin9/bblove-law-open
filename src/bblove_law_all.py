@@ -1,6 +1,6 @@
 """Resumable official current-law collection; never logs authenticated URLs."""
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import contextmanager
 from copy import deepcopy
@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+from operator import itemgetter
 from pathlib import Path
 import re
 import subprocess
@@ -35,7 +36,8 @@ REUSE_WINDOW = timedelta(days=6)
 DAILY_CALL_LIMIT = 3500
 DAILY_CALL_CAP = 'DAILY_CALL_CAP'
 BUDGET_REASONS = {'COLLECTION_BUDGET_EXHAUSTED', DAILY_CALL_CAP}
-CARRY_ERRORS = {'ADDENDA_CARRY_READ_FAILED', 'ADDENDA_CARRY_WRITE_FAILED'}
+CARRY_READ_FAILED = 'ADDENDA_CARRY_READ_FAILED'
+CARRY_ERRORS = {CARRY_READ_FAILED, 'ADDENDA_CARRY_WRITE_FAILED'}
 DAILY_LEDGER = 'daily-calls.json'
 KST = ZoneInfo('Asia/Seoul')
 
@@ -57,6 +59,18 @@ def save(path, value):
     tmp = path.with_suffix(path.suffix + '.tmp')
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     tmp.replace(path)
+
+
+def write_raw(path, raw, *, mtime=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    try:
+        tmp.write_bytes(raw)
+        if mtime is not None:
+            os.utime(tmp, ns=(mtime, mtime))
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def daily_limit(value):
@@ -669,18 +683,40 @@ def dropped_addenda(old_raw, new_raw, lid):
     return [f'{date}/{number}' for date, number in sorted(gone.elements())]
 
 
-def read_carry(path, lid):
-    if not path.exists():
+class CarryReadError(ValueError):
+    pass
+
+
+def check_carry_receipt(entry, units, raw):
+    if type(entry.get('carried_addenda')) is not int or entry['carried_addenda'] != len(units) or not units:
+        raise CarryReadError('ADDENDA_CARRY_COUNT_MISMATCH')
+    if entry.get('carried_addenda_sha256') != hashlib.sha256(raw).hexdigest():
+        raise CarryReadError('ADDENDA_CARRY_HASH_MISMATCH')
+
+
+def has_carry_receipt(entry):
+    return any(key in entry for key in CARRY_FIELDS)
+
+
+def read_carry(path, entry, *, restore_missing=False):
+    recorded = has_carry_receipt(entry)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        if recorded and not restore_missing:
+            raise CarryReadError('ADDENDA_CARRY_MISSING') from None
         return [], b''
-    raw = path.read_bytes()
+    if not recorded:
+        raise CarryReadError('ADDENDA_CARRY_RECEIPT_MISSING')
     if credential_markers(raw):
         raise ValueError('ADDENDA_CARRY_AUTH_MARKER')
     sidecar = strict_json(raw)
     if (not isinstance(sidecar, dict) or type(sidecar.get('schema')) is not int or sidecar['schema'] != 1
-            or sidecar.get('id') != lid or not isinstance(sidecar.get('units'), list)
+            or sidecar.get('id') != entry['id'] or not isinstance(sidecar.get('units'), list)
             or any(not isinstance(item, dict) or not isinstance(item.get('unit'), dict)
                    for item in sidecar['units'])):
         raise ValueError('ADDENDA_CARRY_SHAPE_INVALID')
+    check_carry_receipt(entry, sidecar['units'], raw)
     return sidecar['units'], raw
 
 
@@ -695,79 +731,77 @@ def carry_body(unit):
     return re.sub(r'\s+', '', flatten_addenda(unit.get('부칙내용')))
 
 
+def carry_signature(unit):
+    return addenda_key(unit), carry_body(unit)
+
+
+def correctly_numbered_bodies(signatures):
+    bodies = set()
+    for (_, number), body in signatures:
+        header = re.match(r'^(?:부칙(?:\([^<]*\))?)?<제([0-9]+)호', body)
+        if header and _promulgation_number(header[1]) == _promulgation_number(number):
+            bodies.add(body)
+    return bodies
+
+
+def unmatched_carry(old_units, new_units, confirmed_bodies=()):
+    """Match each new unit at most once, across both sources of old units."""
+    remaining_old = list(range(len(old_units)))
+    remaining_new = list(range(len(new_units)))
+    # Exact key and body first, then key only, then nonempty body under a changed key.
+    for match_by in (tuple, itemgetter(0), lambda signature: signature[1] or None):
+        available = defaultdict(deque)
+        for index in remaining_new:
+            key = match_by(new_units[index])
+            if key is not None:
+                available[key].append(index)
+        unmatched, used = [], set()
+        for index in remaining_old:
+            key = match_by(old_units[index])
+            if available[key]:
+                used.add(available[key].popleft())
+            elif old_units[index][1] not in confirmed_bodies:
+                # A confirmed body can reserve its exact match, but needs no fallback match.
+                unmatched.append(index)
+        remaining_old = unmatched
+        remaining_new = [index for index in remaining_new if index not in used]
+    return set(remaining_old)
+
+
+def carry_item(unit, date, collected_at):
+    return {'key': '/'.join(addenda_key(unit)), 'unit': unit,
+            'first_missing': date, 'from_collected_at': collected_at}
+
+
+def unique_carry(items):
+    by_unit = {}
+    for item in items:
+        by_unit.setdefault(json.dumps(item['unit'], ensure_ascii=False), item)
+    return list(by_unit.values())
+
+
 def merge_carry(previous, older, newer, date, collected_at, *, prune=True):
-    """Match key multiplicities first, preferring matching text within each key."""
-    current = Counter(map(addenda_key, newer))
-    exact = Counter((addenda_key(unit), carry_body(unit)) for unit in newer)
-    current_bodies = {}
-    for key, body in exact:
-        if body:
-            current_bodies.setdefault(body, set()).add(key)
+    old_units = list(map(carry_signature, older + [item['unit'] for item in previous]))
+    new_units = list(map(carry_signature, newer))
+    missing = unmatched_carry(old_units, new_units, correctly_numbered_bodies(new_units))
+    kept = [item for index, item in enumerate(previous, len(older)) if not prune or index in missing]
+    kept.extend(carry_item(unit, date, collected_at) for index, unit in enumerate(older) if index in missing)
+    return unique_carry(kept)
 
-    unmatched = []
-    for unit in older:
-        key, body = addenda_key(unit), carry_body(unit)
-        if exact[key, body]:
-            exact[key, body] -= 1
-            current[key] -= 1
-        else:
-            unmatched.append(unit)
 
-    def relabeled(key, body):
-        return bool(current_bodies.get(body, set()) - {key})
-
-    missing = []
-    for unit in unmatched:
-        key = addenda_key(unit)
-        if current[key]:
-            current[key] -= 1
-        elif not relabeled(key, carry_body(unit)):
-            missing.append(unit)
-
-    removed = set()
-    if prune:
-        # A key can have multiple units. If only one returns, match its text first.
-        for index, item in enumerate(previous):
-            unit = item['unit']
-            key, body = addenda_key(unit), carry_body(unit)
-            if current[key] and exact[key, body]:
-                exact[key, body] -= 1
-                current[key] -= 1
-                removed.add(index)
-        for index, item in enumerate(previous):
-            if index in removed:
-                continue
-            unit = item['unit']
-            key = addenda_key(unit)
-            if current[key]:
-                current[key] -= 1
-                removed.add(index)
-            elif relabeled(key, carry_body(unit)):
-                removed.add(index)
-    kept = [item for index, item in enumerate(previous) if index not in removed]
-
-    # Backfill can replay the same old RAW. Keep multiplicity without adding it twice,
-    # including when previously carried entries share a key but have different texts.
-    remaining = Counter(json.dumps(item['unit'], ensure_ascii=False) for item in kept)
-    for unit in missing:
-        identity = json.dumps(unit, ensure_ascii=False)
-        if remaining[identity]:
-            remaining[identity] -= 1
-        else:
-            kept.append({'key': '/'.join(addenda_key(unit)), 'unit': unit,
-                         'first_missing': date, 'from_collected_at': collected_at})
-    return kept
+def encode_carry(entry, units):
+    raw = (json.dumps({'schema': 1, 'id': entry['id'], 'units': units},
+                      ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+    if credential_markers(raw):
+        raise ValueError('ADDENDA_CARRY_AUTH_MARKER')
+    return raw
 
 
 def persist_carry(path, entry, previous_raw, units):
-    raw = b''
-    if units:
-        value = {'schema': 1, 'id': entry['id'], 'units': units}
-        raw = (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
-        if credential_markers(raw):
-            raise ValueError('ADDENDA_CARRY_AUTH_MARKER')
+    raw = encode_carry(entry, units) if units else b''
+    if raw:
         if raw != previous_raw:
-            save(path, value)
+            write_raw(path, raw)
     elif previous_raw:
         path.unlink()
     carry_receipt(entry, units, raw)
@@ -802,6 +836,28 @@ def backfill_raw(root, entry):
     return path, raw
 
 
+def restore_carry(entry, old, source_units, source_raw, older, newer, date, collected_at):
+    if source_raw and all(old.get(key) == entry.get(key) for key in CARRY_FIELDS):
+        units, raw = source_units, source_raw
+    else:
+        # Reproduce the original receipt with the matching rules used before filtering.
+        missing = unmatched_carry(list(map(carry_signature, older)), list(map(carry_signature, newer)))
+        units = [carry_item(unit, date, collected_at) for index, unit in enumerate(older) if index in missing]
+        raw = encode_carry(entry, units) if units else b''
+        try:
+            check_carry_receipt(entry, units, raw)
+        except CarryReadError:
+            # A lost sidecar may also have been written after the filtering change.
+            units = merge_carry([], older, newer, date, collected_at)
+            raw = encode_carry(entry, units) if units else b''
+    check_carry_receipt(entry, units, raw)
+    confirmed_bodies = correctly_numbered_bodies(map(carry_signature, newer))
+    filtered = unique_carry(item for item in units if carry_body(item['unit']) not in confirmed_bodies)
+    if filtered != units:
+        raw = encode_carry(entry, filtered) if filtered else b''
+    return filtered, raw
+
+
 def backfill_carry(out, source):
     manifest_path = out / 'manifest.json'
     manifest_raw = manifest_path.read_bytes()
@@ -811,25 +867,60 @@ def backfill_carry(out, source):
         raise ValueError('ADDENDA_CARRY_SOURCE_NEWER')
     previous_entries = {entry['id']: entry for entry in previous['documents']
                         if entry['status'] == 'SUCCESS' or entry.get('raw_status') == 'SUCCESS'}
+    changes, failed = [], []
     for entry in manifest['documents']:
         lid = entry['id']
         old = previous_entries.get(lid)
-        if old is None or not (entry['status'] == 'SUCCESS' or entry.get('raw_status') == 'SUCCESS'):
-            continue
-        old_path, old_raw = backfill_raw(source, old)
-        older = addenda_units(old_raw, lid)
-        if not older:
-            continue
-        path, raw = backfill_raw(out, entry)
-        if text(strict_json(raw).get('법령', {}).get('기본정보'), '법령ID') != lid:
-            raise ValueError('ADDENDA_CARRY_RAW_ID_MISMATCH')
+        eligible = old is not None and (entry['status'] == 'SUCCESS' or entry.get('raw_status') == 'SUCCESS')
+        path = (out / entry['path']).resolve()
+        if not path.is_relative_to(out.resolve()):
+            raise ValueError('UNSAFE_RAW_PATH')
         sidecar = carry_path(path, lid)
-        carried, carried_raw = read_carry(sidecar, lid)
-        units = merge_carry(carried, older, addenda_units(raw, lid), manifest['date'],
-                            raw_collected_at(old_path, old_raw, old))
-        persist_carry(sidecar, entry, carried_raw, units)
+        try:
+            carried, carried_raw = read_carry(sidecar, entry, restore_missing=eligible)
+            if not eligible:
+                continue
+            old_path, old_raw = backfill_raw(source, old)
+            source_units, source_carry = read_carry(carry_path(old_path, lid), old)
+            restoring = not carried_raw and has_carry_receipt(entry)
+            older = addenda_units(old_raw, lid)
+            if not older and not carried_raw and not restoring:
+                continue
+            _, raw = backfill_raw(out, entry)
+            if text(strict_json(raw).get('법령', {}).get('기본정보'), '법령ID') != lid:
+                raise ValueError('ADDENDA_CARRY_RAW_ID_MISMATCH')
+            newer = addenda_units(raw, lid)
+            collected_at = raw_collected_at(old_path, old_raw, old)
+            if restoring:
+                units, replacement = restore_carry(entry, old, source_units, source_carry,
+                                                   older, newer, manifest['date'], collected_at)
+            else:
+                units = merge_carry(carried, older, newer, manifest['date'], collected_at)
+                if units == carried:
+                    continue
+                replacement = encode_carry(entry, units) if units else b''
+            carry_receipt(entry, units, replacement)
+            changes.append((sidecar, replacement))
+        except (OSError, ValueError, RecursionError):
+            failed.append(entry['title'])
+    if failed:
+        summarize_carry_read_failures(failed)
+        raise CarryReadError(CARRY_READ_FAILED)
+    for sidecar, raw in changes:
+        if raw:
+            write_raw(sidecar, raw)
+        else:
+            sidecar.unlink(missing_ok=True)
     if manifest != strict_json(manifest_raw):
         save(manifest_path, manifest)
+
+
+def summarize_carry_read_failures(titles):
+    summary = os.environ.get('GITHUB_STEP_SUMMARY')
+    if summary and titles:
+        names = ', '.join(' '.join(title.split()) for title in titles[:20])
+        with open(summary, 'a', encoding='utf-8') as fh:
+            fh.write(f'- 보존 읽기 실패 {len(titles)}건 ({names})\n')
 
 
 def discard(file, entry):
@@ -838,18 +929,17 @@ def discard(file, entry):
         entry.pop(key, None)
 
 
-def collect_entry(client, out, entry, old, date, moved_raw=None):
+def collect_entry(client, out, entry, old, date):
     entry = dict(entry)
-    phase = 'RAW_CACHE_READ_FAILED'
+    phase = CARRY_READ_FAILED
     replaced = False  # True once a fetch has started for a body whose old RAW is not reusable
     try:
         file = out / entry['path']
-        raw = file.read_bytes() if file.exists() else b''
-        phase = 'ADDENDA_CARRY_READ_FAILED'
         sidecar = carry_path(file, entry['id'])
-        carried, carried_raw = read_carry(sidecar, entry['id'])
-        carry_receipt(entry, carried, carried_raw)
-        reuse = (reusable(old, entry['row']) and
+        carried, carried_raw = read_carry(sidecar, entry)
+        phase = 'RAW_CACHE_READ_FAILED'
+        raw = file.read_bytes() if file.exists() else b''
+        reuse = (old.get('path') == entry['path'] and reusable(old, entry['row']) and
                  (old.get('status') == 'SUCCESS' or old.get('reason') == 'DETAIL_VALIDATION_FAILED'
                   or old.get('raw_status') in {'SUCCESS', 'DETAIL_VALIDATION_FAILED'}) and
                  old.get('sha256') == hashlib.sha256(raw).hexdigest())
@@ -857,14 +947,14 @@ def collect_entry(client, out, entry, old, date, moved_raw=None):
             for key in ('detail_source', 'fallback_reason', 'dropped_addenda'):
                 entry.pop(key, None)
             phase = 'DETAIL_FETCH_FAILED'
-            replaced = not reusable(old, entry['row'])
+            replaced = old.get('path') != entry['path'] or not reusable(old, entry['row'])
             # One request per document. The eflaw answer is already the fallback the old
             # target=law path used for repeal-only bodies, so no second request is made.
             _, fresh = client.get('lawService.do', fetch_params(entry), original=True)
             if credential_markers(fresh):
                 raise ValueError('CREDENTIAL_BEARING_ORIGINAL_NOT_PERSISTED')
             bind_current(fresh, entry)  # a mismatched body is never written
-            old_raw = moved_raw[0] if moved_raw is not None else raw
+            old_raw = raw
             if old_raw:
                 dropped = dropped_addenda(old_raw, fresh, entry['id'])
                 if dropped is not None:
@@ -882,7 +972,7 @@ def collect_entry(client, out, entry, old, date, moved_raw=None):
             newer = prior_addenda(fresh, entry['id'])
             collected_at = None
             if older:
-                collected_at = moved_raw[1] if moved_raw is not None else raw_collected_at(file, raw, old)
+                collected_at = raw_collected_at(file, raw, old)
             units = merge_carry(carried, older, newer, date, collected_at, prune=False)
             final_units = (merge_carry(carried, older, newer, date, collected_at)
                            if carried and validation_error is None else units)
@@ -921,7 +1011,13 @@ def collect_entry(client, out, entry, old, date, moved_raw=None):
         raise
     except Exception as exc:
         reason = budget_reason(exc)
-        if replaced and phase == 'DETAIL_FETCH_FAILED' and reason != DAILY_CALL_CAP:
+        if phase == CARRY_READ_FAILED and old.get('path') == entry['path']:
+            # Keep the old RAW receipt usable for explicit offline recovery.
+            entry = dict(old)
+            entry.pop('reused', None)
+            if old['status'] == 'SUCCESS':
+                entry['raw_status'] = 'SUCCESS'
+        if replaced and phase == 'DETAIL_FETCH_FAILED' and reason not in BUDGET_REASONS:
             # The old RAW came from another fetch or is too old to stand in; the release zips
             # this folder, so it must not stay next to a FAILED entry as if it were current.
             discard(file, entry)
@@ -932,6 +1028,73 @@ def collect_entry(client, out, entry, old, date, moved_raw=None):
     return entry
 
 
+def copy_prior_raw(source, target, entry):
+    try:
+        raw = source.read_bytes()
+    except FileNotFoundError:
+        return
+    if credential_markers(raw):
+        raise ValueError('CREDENTIAL_BEARING_ORIGINAL_NOT_PERSISTED')
+    collected_at = datetime.fromisoformat(raw_collected_at(source, raw, entry))
+    write_raw(target, raw, mtime=int(collected_at.timestamp() * 1_000_000_000))
+
+
+def relocate_cache(out, manifest_path, previous, documents, cached):
+    """Copy renamed documents before publishing a checkpoint with their new paths."""
+    moves, failed = [], {}
+    for entry in documents:
+        lid = entry['id']
+        old = cached.get(lid, {})
+        if not old.get('path') or old['path'] == entry['path']:
+            continue
+        source, target = out / old['path'], out / entry['path']
+        old_sidecar, new_sidecar = carry_path(source, lid), carry_path(target, lid)
+        try:
+            _, raw = read_carry(old_sidecar, old)
+            # An interrupted relocation may have left an exact copy at the destination.
+            if new_sidecar.exists() and read_carry(new_sidecar, old)[1] != raw:
+                raise CarryReadError('ADDENDA_CARRY_LOCATION_MISMATCH')
+        except (OSError, ValueError, RecursionError) as exc:
+            failed[lid] = exc
+        else:
+            moves.append((old, source, target, old_sidecar, new_sidecar, raw))
+    if failed:
+        return [], failed
+
+    # A rename can take over another law's path. Checkpoint those originals at
+    # distinct paths before any destination write could overwrite them.
+    destinations = {target for _, _, target, _, _, _ in moves}
+    staged = {}
+    for old in cached.values():
+        source = out / old['path']
+        if source not in destinations:
+            continue
+        lid = old['id']
+        backup = source.with_suffix(f'.{lid}.prior.json')
+        copy_prior_raw(source, backup, old)
+        _, raw = read_carry(carry_path(source, lid), old)
+        if raw:
+            write_raw(carry_path(backup, lid), raw)
+        staged[lid] = backup
+    if staged:
+        save(manifest_path, {**previous, 'status': 'INCOMPLETE', 'documents': [
+            dict(old, path=str(staged[old['id']].relative_to(out))) if old['id'] in staged else old
+            for old in previous['documents']]})
+
+    active_paths = {out / entry['path'] for entry in documents}
+    cleanup = []
+    for old, source, target, old_sidecar, new_sidecar, raw in moves:
+        copy_prior_raw(staged.get(old['id'], source), target, old)
+        if raw:
+            write_raw(new_sidecar, raw)
+            cleanup.append(old_sidecar)
+        if source not in active_paths:
+            cleanup.append(source)
+    for lid, backup in staged.items():
+        cleanup.extend((backup, carry_path(backup, lid)))
+    return cleanup, failed
+
+
 def collect(client, out, date, *, outcome=None):
     outcome = outcome if outcome is not None else {}
     outcome['budget_only'] = False
@@ -939,7 +1102,6 @@ def collect(client, out, date, *, outcome=None):
     manifest_path = out / 'manifest.json'
     previous = strict_json(manifest_path.read_bytes()) if manifest_path.exists() else {}
     cached = {r['id']: r for r in previous.get('documents', [])}
-    moved_raw, moved_sidecars = {}, []
     manifest = {'schema': 2, 'date': date, 'started_at': stamp(), 'status': 'INCOMPLETE',
                 'list_count': 0, 'api_calls': 0, 'documents': []}
     try:
@@ -961,28 +1123,23 @@ def collect(client, out, date, *, outcome=None):
             old = cached.get(lid, {})
             entry = manifest['documents'][-1]
             entry.update({k: old[k] for k in CARRY_FIELDS if k in old})
-            if old.get('path') and old['path'] != path:
-                # A renamed or regrouped law keeps its carry. Snapshot the old RAW before
-                # another document can take over that path in this run.
-                old_path = out / old['path']
-                if old_path.is_file():
-                    raw = old_path.read_bytes()
-                    moved_raw[lid] = (raw, raw_collected_at(old_path, raw, old))
-                old_sidecar = carry_path(old_path, lid)
-                carried, carried_raw = read_carry(old_sidecar, lid)
-                new_sidecar = carry_path(out / path, lid)
-                _, new_raw = read_carry(new_sidecar, lid)
-                if new_raw == carried_raw:
-                    carry_receipt(entry, carried, carried_raw)
-                else:
-                    persist_carry(new_sidecar, entry, new_raw, carried)
-                if carried:
-                    moved_sidecars.append(old_sidecar)
             state = old.get('raw_status') or (old.get('reason') if old.get('status') == 'FAILED' else old.get('status'))
-            if reusable(old, row) and state in {'SUCCESS', 'DETAIL_VALIDATION_FAILED'}:
+            if old.get('path') == path and reusable(old, row) and state in {'SUCCESS', 'DETAIL_VALIDATION_FAILED'}:
                 # Preserve known RAW receipts even if this run stops before replaying this entry.
                 manifest['documents'][-1].update({k: old[k] for k in ('sha256', 'collected_at', 'fetch', 'dropped_addenda') if k in old})
                 manifest['documents'][-1]['raw_status'] = state
+        cleanup, move_failures = relocate_cache(out, manifest_path, previous, manifest['documents'], cached)
+        if move_failures:
+            for index, entry in enumerate(manifest['documents']):
+                lid = entry['id']
+                if lid in cached:
+                    entry = dict(cached[lid])
+                    if entry['status'] == 'SUCCESS':
+                        entry['raw_status'] = 'SUCCESS'
+                if lid in move_failures:
+                    entry.update(status='FAILED', reason=CARRY_READ_FAILED,
+                                 detail=safe_detail(move_failures[lid], getattr(client, 'credential', '')))
+                manifest['documents'][index] = entry
     except DailyLedgerError:
         raise
     except Exception as exc:
@@ -991,14 +1148,14 @@ def collect(client, out, date, *, outcome=None):
              'detail': safe_detail(exc, getattr(client, 'credential', '')), 'api_calls': client.calls})
         return False
     save(manifest_path, manifest)
-    for path in moved_sidecars:
+    for path in cleanup:
         path.unlink(missing_ok=True)
     checkpoint_seconds = 0
     processed = 0
     last_checkpoint = time.monotonic()
     checkpoint_count = 0
     with ThreadPoolExecutor(max_workers=3) as pool:
-        remaining = iter(enumerate(manifest['documents']))
+        remaining = iter(enumerate(manifest['documents'] if not move_failures else []))
         active = {}
         budget_exhausted = False
         while True:
@@ -1007,8 +1164,7 @@ def collect(client, out, date, *, outcome=None):
                 if pair is None:
                     break
                 index, entry = pair
-                active[pool.submit(collect_entry, client, out, entry, cached.get(entry['id'], {}), date,
-                                   moved_raw.get(entry['id']))] = index
+                active[pool.submit(collect_entry, client, out, entry, cached.get(entry['id'], {}), date)] = index
             if not active:
                 break
             done, _ = wait(active, return_when=FIRST_COMPLETED)
@@ -1039,6 +1195,8 @@ def collect(client, out, date, *, outcome=None):
                     performance=client.metrics() if hasattr(client, 'metrics') else {})
     save(manifest_path, manifest)
     save(out / 'collection-failures.json', failure_report(documents))
+    summarize_carry_read_failures([entry['title'] for entry in documents
+                                   if entry.get('reason') == CARRY_READ_FAILED])
     # Numeric aggregate only; no URLs, credentials or transport exception strings.
     print(json.dumps({'collection_performance': manifest['performance'],
                       'processed_documents': processed, 'status_counts': manifest['status_counts'],
@@ -1061,6 +1219,9 @@ def main():
     if args.backfill_carry is not None:
         try:
             backfill_carry(args.out, args.backfill_carry)
+        except CarryReadError:
+            print(CARRY_READ_FAILED)
+            return 1
         except (OSError, ValueError, KeyError, TypeError):
             print('ADDENDA_CARRY_BACKFILL_FAILED')
             return 1

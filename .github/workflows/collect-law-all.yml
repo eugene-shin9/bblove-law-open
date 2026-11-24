@@ -56,6 +56,8 @@ jobs:
           CARRY_FROM_TAG: ${{ inputs.carry_from_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          CARRY_FROM_TAG="${CARRY_FROM_TAG#"${CARRY_FROM_TAG%%[![:space:]]*}"}"
+          CARRY_FROM_TAG="${CARRY_FROM_TAG%"${CARRY_FROM_TAG##*[![:space:]]}"}"
           if [[ ! "$CARRY_FROM_TAG" =~ ^law-[0-9]{8}-[0-9]+$ ]]; then
             echo "::error::Invalid carry_from_tag"
             exit 1
