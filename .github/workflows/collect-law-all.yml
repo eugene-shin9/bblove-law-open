@@ -1,6 +1,11 @@
 name: Collect current laws (law.go.kr DRF)
 on:
   workflow_dispatch:
+    inputs:
+      carry_from_tag:
+        description: 'Older law Release to recover missing addenda from (optional)'
+        type: string
+        default: ''
   schedule:
     # 매주 월요일 01:20 KST (일요일 16:20 UTC)
     - cron: '20 16 * * 0'
@@ -44,6 +49,33 @@ jobs:
           key: official-all-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             official-all-v1-
+      - name: Backfill missing addenda from a checked Release
+        id: backfill_carry
+        if: github.event_name == 'workflow_dispatch' && inputs.carry_from_tag != ''
+        env:
+          CARRY_FROM_TAG: ${{ inputs.carry_from_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$CARRY_FROM_TAG" =~ ^law-[0-9]{8}-[0-9]+$ ]]; then
+            echo "::error::Invalid carry_from_tag"
+            exit 1
+          fi
+          archive=$(mktemp -d)
+          trap 'rm -rf "$archive"' EXIT
+          gh release download "$CARRY_FROM_TAG" --repo "$GITHUB_REPOSITORY" --dir "$archive" --pattern official-all.zip
+          # Releases predating the separate checksum have the same entry in SHA256SUMS.
+          if ! gh release download "$CARRY_FROM_TAG" --repo "$GITHUB_REPOSITORY" --dir "$archive" --pattern official-all.zip.sha256; then
+            gh release download "$CARRY_FROM_TAG" --repo "$GITHUB_REPOSITORY" --dir "$archive" --pattern SHA256SUMS
+            awk '$2 == "official-all.zip" {print}' "$archive/SHA256SUMS" > "$archive/official-all.zip.sha256"
+          fi
+          (
+            cd "$archive"
+            [[ $(wc -l < official-all.zip.sha256) -eq 1 ]]
+            grep -Eq '^[0-9a-f]{64}  official-all[.]zip$' official-all.zip.sha256
+            sha256sum --strict -c official-all.zip.sha256
+            python -m zipfile -e official-all.zip raw
+          )
+          python src/bblove_law_all.py --backfill-carry "$archive/raw/official-all"
       - name: Decide whether the continuation needs API access
         id: resume
         env:
@@ -107,6 +139,7 @@ jobs:
         run: |
           mkdir -p release
           (cd auto && zip -q -r ../release/official-all.zip official-all -x 'official-all/daily-calls.json*')
+          (cd release && sha256sum official-all.zip > official-all.zip.sha256)
           cp official-assets-report.json release/
           cp auto/official-all/manifest.json release/collection-manifest.json
           cp auto/official-all/collection-failures.json release/collection-failures.json
